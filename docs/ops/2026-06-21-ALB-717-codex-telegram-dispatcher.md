@@ -8,6 +8,7 @@ Linear is the control-plane truth. This file is only a local recovery pointer fo
   - Telegram reply/voice proof: https://linear.app/albert-yang/issue/ALB-717/codex-dispatcher-native-telegram-ux-parity-typing-reactions#comment-225093af
   - Mailbox proof: https://linear.app/albert-yang/issue/ALB-717/codex-dispatcher-native-telegram-ux-parity-typing-reactions#comment-0198493b
   - Busy queue + voice + typing + reaction proof: Linear comment `36896549-2ab1-4792-a9b1-e5546963831f`
+  - Post-review THEO proof at `4bee8f1`: Linear comment `6b1c1ffc-3157-40aa-8f67-5f04c97dc20a`
 - Branch: `alb-717-native-telegram-queue`
 - Runtime bot: `@albert_v3_xpx_bot`
 - Runtime launchd label: `com.albert.albert-v3-codex-dispatcher`
@@ -62,6 +63,13 @@ Open items stay in Linear, not here:
 - Validate runtime discipline end to end on THEO/testboard; tracked by ALB-714 / ALB-698.
 - GitHub branch/PR sync and Albert acceptance before closing ALB-717.
 
+ALB-714 discipline mirror:
+
+- The Codex developer discipline must require root-cause fixes, not downstream symptom patches.
+- For any bug or operational failure, Codex must explain why the issue could happen in the first place and place the fix at the earliest reliable boundary: tooling, config, protocol, API contract, or dispatcher layer.
+- Workarounds are allowed only as explicitly labeled temporary containment and must have a Linear follow-up. They are not closure evidence.
+- Closure needs red/green tests where code behavior changed, runtime/live evidence, review, and Linear comments. Loading these words in `AGENTS.md` is not enough; ALB-714 / ALB-698 still need THEO end-to-end discipline lifecycle proof.
+
 2026-06-22 live proof addendum:
 
 - Runtime branch: `alb-717-native-telegram-queue`.
@@ -83,3 +91,16 @@ Open items stay in Linear, not here:
   - `contains_transcript_echo=false`; the voice transcript was not emitted as a standalone visible Telegram message.
   - Full JSON: `/tmp/alb717_live_probe_result.json` on Mac mini.
 - Log note: old `getUpdates 409 Conflict` entries are stale; `telecodex.launchd.err.log` mtime was before current pid start, process check found only one TeleCodex node, and the live proof succeeded after that log timestamp.
+
+2026-06-22 post-review live proof addendum:
+
+- Runtime commit: `4bee8f1` on branch `alb-717-native-telegram-queue`.
+- Runtime launchd state: `com.albert.albert-v3-codex-dispatcher` running, pid `98004`, last exit `0`.
+- Runtime env proof: `CODEX_MODEL=gpt-5.5`, `CODEX_REASONING_EFFORT=xhigh`, `VOICE_TRANSCRIPTION_BACKEND=qwen`, `ENABLE_TELEGRAM_REACTIONS=true`, `STREAM_AGENT_RESPONSES=false`.
+- Fresh THEO live nonce: `ALB717R2_20260622T064800Z`.
+- Sent sequence while first turn was busy: long text `25913`, queued text `25914`, queued voice `25915`, queued text `25916`.
+- Replies arrived FIFO: `ALB717R2_20260622T064800Z_FIRST_DONE`, `ALB717R2_20260622T064800Z_TEXT1_DONE`, `audio okay.`, `ALB717R2_20260622T064800Z_TEXT2_DONE`.
+- Captured 12 typing updates; all four source messages ended with `👍`; `contains_transcript_echo=false`.
+- Direct Qwen ASR check for `/tmp/alb717_voice_probe2.ogg` returned `Please reply audio. Okay.` before the live run.
+- Full JSON: `/tmp/alb717_live_probe_after_restart_result.json` on Mac mini.
+- Both local and Mac mini TeleCodex repos were clean at `4bee8f1` after proof capture.
