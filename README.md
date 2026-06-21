@@ -72,6 +72,13 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES` | — | Comma-separated persona prefixes blocked from direct sends (default `dadamia_`) |
    | `TELEGRAM_TRANSPORT_MCP_STARTUP_TIMEOUT_MS` | — | MCP server startup timeout in milliseconds (default `10000`) |
    | `TELEGRAM_TRANSPORT_MCP_TOOL_TIMEOUT_MS` | — | MCP tool call timeout in milliseconds (default `30000`) |
+   | `LINEAR_CONTROL_MCP_ENABLED` | — | Enable the scoped Albert Linear control MCP server (`false` by default) |
+   | `LINEAR_CONTROL_MCP_SERVER_NAME` | — | MCP server name injected into Codex CLI (default `linear_control`) |
+   | `LINEAR_CONTROL_MCP_AUTO_APPROVE_EVIDENCE` | — | Auto-approve only the typed `add_linear_evidence` tool for unattended control-plane evidence writes. Keep the issue allowlist narrow. |
+   | `LINEAR_CONTROL_ALLOWED_ISSUES` | — | Comma-separated allowlist of writable Albert Linear issue identifiers, e.g. `ALB-714,ALB-722` |
+   | `LINEAR_API_KEY_PATH` | — | Absolute path to a Linear API key file. Raw `LINEAR_API_KEY` is not passed into Codex child processes. |
+   | `LINEAR_CONTROL_MCP_STARTUP_TIMEOUT_MS` | — | Linear control MCP server startup timeout in milliseconds (default `10000`) |
+   | `LINEAR_CONTROL_MCP_TOOL_TIMEOUT_MS` | — | Linear control MCP tool call timeout in milliseconds (default `30000`) |
    | `VOICE_TRANSCRIPTION_BACKEND` | — | Voice backend: `auto`, `qwen`, `parakeet`, or `openai` (`auto` by default) |
    | `QWEN_ASR_SOCKET` | — | Unix socket for the Qwen3-ASR resident server, e.g. `/tmp/qwen_asr.sock` |
    | `QWEN_ASR_CONTEXT` | — | Optional Qwen3-ASR context/hotword prompt for names and domain terms |

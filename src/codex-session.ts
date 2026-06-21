@@ -523,11 +523,17 @@ export class CodexSessionService {
     const configOverrides: CodexConfigObject = {
       approval_policy: this.currentLaunchProfile.approvalPolicy,
     };
+    const mcpServers: CodexConfigObject = {};
     const telegramTransportMcp = buildTelegramTransportMcpConfig(this.config);
     if (telegramTransportMcp) {
-      configOverrides.mcp_servers = {
-        [this.config.telegramTransport.mcpServerName]: telegramTransportMcp,
-      };
+      mcpServers[this.config.telegramTransport.mcpServerName] = telegramTransportMcp;
+    }
+    const linearControlMcp = buildLinearControlMcpConfig(this.config);
+    if (linearControlMcp) {
+      mcpServers[this.config.linearControl.mcpServerName] = linearControlMcp;
+    }
+    if (Object.keys(mcpServers).length > 0) {
+      configOverrides.mcp_servers = mcpServers;
     }
 
     this.codex = new Codex({
@@ -591,6 +597,46 @@ function buildTelegramTransportMcpCommand(): { command: string; args: string[] }
   };
 }
 
+function buildLinearControlMcpConfig(config: TeleCodexConfig): CodexConfigObject | undefined {
+  if (!config.linearControl.enabled) {
+    return undefined;
+  }
+
+  const command = buildLinearControlMcpCommand();
+  const mcpConfig: CodexConfigObject = {
+    command: command.command,
+    args: command.args,
+    env_vars: ["LINEAR_API_KEY_PATH", "LINEAR_CONTROL_ALLOWED_ISSUES"],
+    enabled_tools: ["add_linear_evidence"],
+    startup_timeout_sec: Math.ceil(config.linearControl.startupTimeoutMs / 1000),
+    tool_timeout_sec: Math.ceil(config.linearControl.toolTimeoutMs / 1000),
+  };
+
+  if (config.linearControl.autoApproveEvidence) {
+    mcpConfig.default_tools_approval_mode = "approve";
+  }
+
+  return mcpConfig;
+}
+
+function buildLinearControlMcpCommand(): { command: string; args: string[] } {
+  const modulePath = fileURLToPath(import.meta.url);
+  if (modulePath.endsWith(".ts")) {
+    return {
+      command: process.execPath,
+      args: [
+        fileURLToPath(new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url)),
+        fileURLToPath(new URL("./linear-control-mcp-server.ts", import.meta.url)),
+      ],
+    };
+  }
+
+  return {
+    command: process.execPath,
+    args: [fileURLToPath(new URL("./linear-control-mcp-server.js", import.meta.url))],
+  };
+}
+
 function buildCodexEnv(config: TeleCodexConfig): Record<string, string> {
   const env: Record<string, string> = {};
 
@@ -599,6 +645,7 @@ function buildCodexEnv(config: TeleCodexConfig): Record<string, string> {
       env[key] = value;
     }
   }
+  delete env.LINEAR_API_KEY;
 
   if (config.codexApiKey) {
     env.CODEX_API_KEY = config.codexApiKey;
@@ -608,6 +655,11 @@ function buildCodexEnv(config: TeleCodexConfig): Record<string, string> {
     env.TELEGRAM_BOT_TOKEN = config.telegramBotToken;
     env.TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH = config.telegramTransport.personasStatePath;
     env.TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES = config.telegramTransport.blockedPersonaPrefixes.join(",");
+  }
+
+  if (config.linearControl.enabled) {
+    env.LINEAR_API_KEY_PATH = config.linearControl.apiKeyPath;
+    env.LINEAR_CONTROL_ALLOWED_ISSUES = config.linearControl.allowedIssues.join(",");
   }
 
   return env;

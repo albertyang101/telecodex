@@ -141,6 +141,15 @@ describe("CodexSessionService", () => {
       startupTimeoutMs: 10_000,
       toolTimeoutMs: 30_000,
     },
+    linearControl: {
+      enabled: false,
+      mcpServerName: "linear_control",
+      allowedIssues: [],
+      apiKeyPath: "/Users/albert/.config/linear/api_key",
+      autoApproveEvidence: false,
+      startupTimeoutMs: 10_000,
+      toolTimeoutMs: 30_000,
+    },
     ...overrides,
   });
 
@@ -318,6 +327,107 @@ describe("CodexSessionService", () => {
       enabled_tools: ["send_cross_persona_message"],
     });
     expect(mcpConfig).not.toHaveProperty("default_tools_approval_mode");
+  });
+
+  it("injects the Linear control MCP server when enabled", async () => {
+    await CodexSessionService.create(
+      createConfig({
+        linearControl: {
+          enabled: true,
+          mcpServerName: "linear_control",
+          allowedIssues: ["ALB-714", "ALB-722"],
+          apiKeyPath: "/Users/albert/.config/linear/api_key",
+          autoApproveEvidence: true,
+          startupTimeoutMs: 10_000,
+          toolTimeoutMs: 30_000,
+        },
+      }),
+    );
+
+    expect(mockState.Codex).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({
+          approval_policy: "never",
+          mcp_servers: {
+            linear_control: {
+              command: process.execPath,
+              args: expect.arrayContaining([
+                expect.stringMatching(/linear-control-mcp-server\.(js|ts)$/),
+              ]),
+              env_vars: ["LINEAR_API_KEY_PATH", "LINEAR_CONTROL_ALLOWED_ISSUES"],
+              default_tools_approval_mode: "approve",
+              enabled_tools: ["add_linear_evidence"],
+              startup_timeout_sec: 10,
+              tool_timeout_sec: 30,
+            },
+          },
+        }),
+        env: expect.objectContaining({
+          LINEAR_API_KEY_PATH: "/Users/albert/.config/linear/api_key",
+          LINEAR_CONTROL_ALLOWED_ISSUES: "ALB-714,ALB-722",
+        }),
+      }),
+    );
+  });
+
+  it("keeps Telegram transport and Linear control MCP servers isolated when both are enabled", async () => {
+    await CodexSessionService.create(
+      createConfig({
+        telegramTransport: {
+          enabled: true,
+          mcpServerName: "telegram_transport",
+          personasStatePath: "/Users/albert/code/claude/state/personas.json",
+          blockedPersonaPrefixes: ["dadamia_"],
+          autoApproveSends: true,
+          startupTimeoutMs: 10_000,
+          toolTimeoutMs: 30_000,
+        },
+        linearControl: {
+          enabled: true,
+          mcpServerName: "linear_control",
+          allowedIssues: ["ALB-714"],
+          apiKeyPath: "/Users/albert/.config/linear/api_key",
+          autoApproveEvidence: true,
+          startupTimeoutMs: 10_000,
+          toolTimeoutMs: 30_000,
+        },
+      }),
+    );
+
+    expect(mockState.createdCodexOptions[0].config.mcp_servers).toEqual(
+      expect.objectContaining({
+        telegram_transport: expect.objectContaining({
+          enabled_tools: ["send_cross_persona_message"],
+        }),
+        linear_control: expect.objectContaining({
+          enabled_tools: ["add_linear_evidence"],
+        }),
+      }),
+    );
+  });
+
+  it("does not pass raw LINEAR_API_KEY into the Codex child env when Linear control is enabled", async () => {
+    process.env.LINEAR_API_KEY = "raw-linear-key";
+
+    await CodexSessionService.create(
+      createConfig({
+        linearControl: {
+          enabled: true,
+          mcpServerName: "linear_control",
+          allowedIssues: ["ALB-714"],
+          apiKeyPath: "/Users/albert/.config/linear/api_key",
+          autoApproveEvidence: true,
+          startupTimeoutMs: 10_000,
+          toolTimeoutMs: 30_000,
+        },
+      }),
+    );
+
+    expect(mockState.createdCodexOptions[0].env).not.toHaveProperty("LINEAR_API_KEY");
+    expect(mockState.createdCodexOptions[0].env).toMatchObject({
+      LINEAR_API_KEY_PATH: "/Users/albert/.config/linear/api_key",
+      LINEAR_CONTROL_ALLOWED_ISSUES: "ALB-714",
+    });
   });
 
   it("can defer thread creation so launch settings apply before the first thread starts", async () => {

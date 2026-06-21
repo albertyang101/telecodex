@@ -39,6 +39,16 @@ export interface TelegramTransportConfig {
   toolTimeoutMs: number;
 }
 
+export interface LinearControlConfig {
+  enabled: boolean;
+  mcpServerName: string;
+  allowedIssues: string[];
+  apiKeyPath: string;
+  autoApproveEvidence: boolean;
+  startupTimeoutMs: number;
+  toolTimeoutMs: number;
+}
+
 export interface TeleCodexConfig {
   telegramBotToken: string;
   telegramAllowedUserIds: number[];
@@ -61,6 +71,7 @@ export interface TeleCodexConfig {
   enableTelegramReactions: boolean;
   mailboxBridge: MailboxBridgeConfig;
   telegramTransport: TelegramTransportConfig;
+  linearControl: LinearControlConfig;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -100,6 +111,8 @@ export function loadConfig(): TeleCodexConfig {
   );
   const mailboxBridge = parseMailboxBridgeConfig();
   const telegramTransport = parseTelegramTransportConfig();
+  const linearControl = parseLinearControlConfig();
+  validateMcpServerNames(telegramTransport, linearControl);
   validateMailboxBridgeLaunch(mailboxBridge, launchProfiles, defaultLaunchProfileId);
 
   return {
@@ -124,6 +137,7 @@ export function loadConfig(): TeleCodexConfig {
     enableTelegramReactions,
     mailboxBridge,
     telegramTransport,
+    linearControl,
   };
 }
 
@@ -339,6 +353,66 @@ function parseTelegramTransportConfig(): TelegramTransportConfig {
       "TELEGRAM_TRANSPORT_MCP_TOOL_TIMEOUT_MS",
     ),
   };
+}
+
+function parseLinearControlConfig(): LinearControlConfig {
+  const enabled = parseBooleanEnv(optionalString(process.env.LINEAR_CONTROL_MCP_ENABLED), false);
+  const mcpServerName = optionalString(process.env.LINEAR_CONTROL_MCP_SERVER_NAME) ?? "linear_control";
+  if (!isSafeMcpServerName(mcpServerName)) {
+    throw new Error("LINEAR_CONTROL_MCP_SERVER_NAME must be a safe MCP server name");
+  }
+
+  const allowedIssues = parseCommaList(optionalString(process.env.LINEAR_CONTROL_ALLOWED_ISSUES), [])
+    .map((issue) => issue.toUpperCase());
+  if (enabled && allowedIssues.length === 0) {
+    throw new Error("LINEAR_CONTROL_ALLOWED_ISSUES must list at least one ALB issue");
+  }
+  for (const issue of allowedIssues) {
+    if (!/^ALB-\d+$/.test(issue)) {
+      throw new Error(`Invalid Linear control issue allowlist entry: ${issue}`);
+    }
+  }
+
+  const apiKeyPath =
+    optionalString(process.env.LINEAR_API_KEY_PATH) ??
+    path.join(homedir(), ".config", "linear", "api_key");
+  if (!path.isAbsolute(apiKeyPath)) {
+    throw new Error("LINEAR_API_KEY_PATH must be an absolute path");
+  }
+
+  return {
+    enabled,
+    mcpServerName,
+    allowedIssues,
+    apiKeyPath,
+    autoApproveEvidence: parseBooleanEnv(
+      optionalString(process.env.LINEAR_CONTROL_MCP_AUTO_APPROVE_EVIDENCE),
+      false,
+    ),
+    startupTimeoutMs: parsePositiveIntegerEnv(
+      optionalString(process.env.LINEAR_CONTROL_MCP_STARTUP_TIMEOUT_MS),
+      10_000,
+      "LINEAR_CONTROL_MCP_STARTUP_TIMEOUT_MS",
+    ),
+    toolTimeoutMs: parsePositiveIntegerEnv(
+      optionalString(process.env.LINEAR_CONTROL_MCP_TOOL_TIMEOUT_MS),
+      30_000,
+      "LINEAR_CONTROL_MCP_TOOL_TIMEOUT_MS",
+    ),
+  };
+}
+
+function validateMcpServerNames(
+  telegramTransport: TelegramTransportConfig,
+  linearControl: LinearControlConfig,
+): void {
+  if (
+    telegramTransport.enabled &&
+    linearControl.enabled &&
+    telegramTransport.mcpServerName === linearControl.mcpServerName
+  ) {
+    throw new Error("Enabled MCP server names must be unique");
+  }
 }
 
 function validateMailboxBridgeLaunch(

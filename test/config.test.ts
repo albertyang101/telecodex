@@ -47,6 +47,14 @@ describe("loadConfig", () => {
     delete process.env.TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES;
     delete process.env.TELEGRAM_TRANSPORT_MCP_STARTUP_TIMEOUT_MS;
     delete process.env.TELEGRAM_TRANSPORT_MCP_TOOL_TIMEOUT_MS;
+    delete process.env.LINEAR_CONTROL_MCP_ENABLED;
+    delete process.env.LINEAR_CONTROL_MCP_SERVER_NAME;
+    delete process.env.LINEAR_CONTROL_MCP_AUTO_APPROVE_COMMENTS;
+    delete process.env.LINEAR_CONTROL_MCP_AUTO_APPROVE_EVIDENCE;
+    delete process.env.LINEAR_CONTROL_ALLOWED_ISSUES;
+    delete process.env.LINEAR_API_KEY_PATH;
+    delete process.env.LINEAR_CONTROL_MCP_STARTUP_TIMEOUT_MS;
+    delete process.env.LINEAR_CONTROL_MCP_TOOL_TIMEOUT_MS;
     delete process.env.container;
   });
 
@@ -147,6 +155,15 @@ describe("loadConfig", () => {
         personasStatePath: path.join(homedir(), "code", "claude", "state", "personas.json"),
         blockedPersonaPrefixes: ["dadamia_"],
         autoApproveSends: false,
+        startupTimeoutMs: 10_000,
+        toolTimeoutMs: 30_000,
+      },
+      linearControl: {
+        enabled: false,
+        mcpServerName: "linear_control",
+        allowedIssues: [],
+        apiKeyPath: path.join(homedir(), ".config", "linear", "api_key"),
+        autoApproveEvidence: false,
         startupTimeoutMs: 10_000,
         toolTimeoutMs: 30_000,
       },
@@ -443,6 +460,69 @@ describe("loadConfig", () => {
     process.env.TELEGRAM_TRANSPORT_MCP_SERVER_NAME = "../telegram";
 
     expect(() => loadConfig()).toThrow("TELEGRAM_TRANSPORT_MCP_SERVER_NAME must be a safe MCP server name");
+  });
+
+  it("parses the optional Linear control MCP config", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.LINEAR_CONTROL_MCP_ENABLED = "true";
+    process.env.LINEAR_CONTROL_MCP_SERVER_NAME = "linear_control";
+    process.env.LINEAR_CONTROL_MCP_AUTO_APPROVE_EVIDENCE = "true";
+    process.env.LINEAR_CONTROL_ALLOWED_ISSUES = "ALB-714, ALB-722";
+    process.env.LINEAR_API_KEY_PATH = "/Users/albert/.config/linear/api_key";
+
+    const config = loadConfig();
+
+    expect(config.linearControl).toEqual({
+      enabled: true,
+      mcpServerName: "linear_control",
+      allowedIssues: ["ALB-714", "ALB-722"],
+      apiKeyPath: "/Users/albert/.config/linear/api_key",
+      autoApproveEvidence: true,
+      startupTimeoutMs: 10_000,
+      toolTimeoutMs: 30_000,
+    });
+  });
+
+  it("does not treat the legacy raw-comment auto-approval env as evidence approval", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.LINEAR_CONTROL_MCP_ENABLED = "true";
+    process.env.LINEAR_CONTROL_ALLOWED_ISSUES = "ALB-714";
+    process.env.LINEAR_CONTROL_MCP_AUTO_APPROVE_COMMENTS = "true";
+
+    const config = loadConfig();
+
+    expect(config.linearControl.autoApproveEvidence).toBe(false);
+  });
+
+  it("rejects unsafe Linear control MCP server names", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.LINEAR_CONTROL_MCP_ENABLED = "true";
+    process.env.LINEAR_CONTROL_MCP_SERVER_NAME = "../linear";
+
+    expect(() => loadConfig()).toThrow("LINEAR_CONTROL_MCP_SERVER_NAME must be a safe MCP server name");
+  });
+
+  it("rejects Linear control startup without an allowlist", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.LINEAR_CONTROL_MCP_ENABLED = "true";
+
+    expect(() => loadConfig()).toThrow("LINEAR_CONTROL_ALLOWED_ISSUES must list at least one ALB issue");
+  });
+
+  it("rejects duplicate enabled MCP server names", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_TRANSPORT_MCP_ENABLED = "true";
+    process.env.TELEGRAM_TRANSPORT_MCP_SERVER_NAME = "shared_control";
+    process.env.LINEAR_CONTROL_MCP_ENABLED = "true";
+    process.env.LINEAR_CONTROL_MCP_SERVER_NAME = "shared_control";
+    process.env.LINEAR_CONTROL_ALLOWED_ISSUES = "ALB-714";
+
+    expect(() => loadConfig()).toThrow("Enabled MCP server names must be unique");
   });
 
   it("rejects mailbox bridge startup unless the default Codex launch is read-only and never approval", () => {
