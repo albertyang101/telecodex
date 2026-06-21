@@ -20,6 +20,7 @@ Linear is the control-plane truth. This file is only a local recovery pointer fo
 - `CODEX_PATH` is a launch wrapper boundary, not the primary protocol. The live wrapper adds `--ignore-user-config`; start preflight checks AGENTS markers, model, sandbox, approval, token path, allowed user, and mailbox settings.
 - Mac mini live Codex runtime path `/opt/homebrew/bin/codex` is `codex-cli 0.141.0` when launched with the TeleCodex PATH. `~/.local/bin/codex` is also installed at 0.141.0 for direct shell use.
 - Live preflight with launchd env: `./start-telecodex.sh dry-run --exec-probe` returned `preflight ok` and `discipline_version=ALB-714-hard-discipline-v1`.
+- ALB-749 live rollout: launchd env now has `CODEX_REASONING_EFFORT=xhigh`; launch log shows `Default reasoning effort: xhigh`; `/session` proof message `25782` -> `25783` returned `Model: gpt-5.5` and `Reasoning effort: xhigh`.
 - Successful voice transcription is internal Dispatcher input only; it must not be sent as a visible Telegram `Transcribed:` message.
 - Ordinary Telegram replies default to final answer only: no internal process, no source/link footer, no citation block unless Albert explicitly asks.
 - Telegram queue behavior is FIFO per context. It is not CC native `--replay-user-messages` coalescing; it serializes follow-ups after final reply send. Voice messages get a pending queue slot before transcription, so later text stays behind earlier voice.
@@ -54,7 +55,7 @@ Open items stay in Linear, not here:
 
 - Reaction/read emoji live proof.
 - Richer typing/busy UX proof.
-- Make Theo's default runtime effort `xhigh` using the native Codex reasoning-effort path; tracked by ALB-749.
+- Finish review/closure for Theo's default runtime effort `xhigh`; live rollout proof is on ALB-749.
 - Prove or explicitly scope out GitHub/Notion/Figma/Canva/Gmail runtime access from live TeleCodex sessions; tracked by ALB-748 / ALB-722.
 - Build the CodexBot Agent Skill after the design/spec has closed; tracked by ALB-716.
 - Validate runtime discipline end to end on THEO/testboard; tracked by ALB-714 / ALB-698.
