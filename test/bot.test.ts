@@ -1,4 +1,4 @@
-import { vi } from "vitest";
+import { afterEach, vi } from "vitest";
 
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
 import type { CodexSessionCallbacks } from "../src/codex-session.js";
@@ -97,6 +97,7 @@ vi.mock("@grammyjs/auto-retry", () => ({
 vi.mock("../src/codex-auth.js", () => mockAuth);
 
 import { createBot } from "../src/bot.js";
+import { _resetImportHook, _setDecodeHook, _setImportHook } from "../src/voice.js";
 
 describe("createBot response delivery", () => {
   const createConfig = (overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig => ({
@@ -130,12 +131,14 @@ describe("createBot response delivery", () => {
     ...overrides,
   });
 
-  const createSession = (onPrompt: (callbacks: CodexSessionCallbacks) => Promise<void>) => ({
+  const createSession = (
+    onPrompt: (callbacks: CodexSessionCallbacks, input: unknown) => Promise<void>,
+  ) => ({
     isProcessing: vi.fn(() => false),
     hasActiveThread: vi.fn(() => true),
     newThread: vi.fn(),
-    prompt: vi.fn(async (_input, callbacks: CodexSessionCallbacks) => {
-      await onPrompt(callbacks);
+    prompt: vi.fn(async (input, callbacks: CodexSessionCallbacks) => {
+      await onPrompt(callbacks, input);
     }),
     getInfo: vi.fn(() => ({
       threadId: "thread-1",
@@ -161,6 +164,11 @@ describe("createBot response delivery", () => {
     mockGrammy.bots.length = 0;
     mockGrammy.Bot.mockClear();
     mockAuth.checkAuthStatus.mockClear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    _resetImportHook();
   });
 
   it("can buffer agent deltas and only send the final response to Telegram", async () => {
@@ -221,4 +229,362 @@ describe("createBot response delivery", () => {
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
     expect(bot.api.sendMessage.mock.calls[0][1]).toContain("流式预览。");
   });
+
+  it("queues text follow-ups that arrive while a Codex turn is still running", async () => {
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("第二轮回复。");
+        callbacks.onAgentMessage?.("第二轮回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 10, text: "第一条，先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 11, text: "第二条，必须排队进 Codex" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(session.prompt.mock.calls[1][0]).toBe("第二条，必须排队进 Codex");
+    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).not.toContain(
+      "Still working on previous message",
+    );
+  });
+
+  it("transcribes and queues voice follow-ups that arrive while a Codex turn is still running", async () => {
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("语音后续回复。");
+        callbacks.onAgentMessage?.("语音后续回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "voice/follow-up.ogg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      })),
+    );
+    let transcribeCalls = 0;
+    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          transcribeCalls += 1;
+          return {
+            text: "这是忙时发来的语音转写",
+            durationMs: 1,
+          };
+        }
+      },
+    }));
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 20, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await voiceHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 21, voice: { file_id: "voice-file-1" } },
+      api: bot.api,
+    });
+
+    expect(bot.api.getFile).toHaveBeenCalledWith("voice-file-1");
+    expect(transcribeCalls).toBe(1);
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(session.prompt.mock.calls[1][0]).toBe("这是忙时发来的语音转写");
+  });
+
+  it("preserves Telegram arrival order when a voice transcription finishes after a later text arrives", async () => {
+    const firstTurn = deferred<void>();
+    const transcribeStarted = deferred<void>();
+    const finishTranscription = deferred<{ text: string; durationMs: number }>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
+        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "voice/follow-up.ogg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      })),
+    );
+    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          transcribeStarted.resolve();
+          return await finishTranscription.promise;
+        }
+      },
+    }));
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 30, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const voicePromise = voiceHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 31, voice: { file_id: "voice-file-2" } },
+      api: bot.api,
+    });
+
+    await transcribeStarted.promise;
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 32, text: "语音后面发来的文字" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    finishTranscription.resolve({ text: "稍后完成的语音转写", durationMs: 1 });
+    await voicePromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+    expect(session.prompt.mock.calls[1][0]).toBe("稍后完成的语音转写");
+    expect(session.prompt.mock.calls[2][0]).toBe("语音后面发来的文字");
+  });
+
+  it("drains later queued text after an earlier voice transcription fails", async () => {
+    const firstTurn = deferred<void>();
+    const transcribeStarted = deferred<void>();
+    const failTranscription = deferred<{ text: string; durationMs: number }>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("后续文本回复。");
+        callbacks.onAgentMessage?.("后续文本回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "voice/fail.ogg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      })),
+    );
+    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          transcribeStarted.resolve();
+          return await failTranscription.promise;
+        }
+      },
+    }));
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 40, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const voicePromise = voiceHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 41, voice: { file_id: "voice-file-fail" } },
+      api: bot.api,
+    });
+    await transcribeStarted.promise;
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 42, text: "语音失败后这条也必须进 Codex" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    failTranscription.reject(new Error("transcription failed"));
+    await voicePromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(session.prompt.mock.calls[1][0]).toBe("语音失败后这条也必须进 Codex");
+  });
+
+  it("waits for the final Telegram reply before draining the next queued prompt", async () => {
+    const firstTurn = deferred<void>();
+    const firstSend = deferred<{ message_id: number }>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("第二轮回复。");
+        callbacks.onAgentMessage?.("第二轮回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    let sendCount = 0;
+    bot.api.sendMessage.mockImplementation(async () => {
+      sendCount += 1;
+      if (sendCount === 1) {
+        return await firstSend.promise;
+      }
+      return { message_id: sendCount };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 50, text: "第一条，回复发送要慢一点" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 51, text: "第二条必须等第一条真正发完" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await delay(20);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+
+    firstSend.resolve({ message_id: 101 });
+    await firstPromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(session.prompt.mock.calls[1][0]).toBe("第二条必须等第一条真正发完");
+  });
 });
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value?: T | PromiseLike<T>) => void;
+  reject: (error: unknown) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value?: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

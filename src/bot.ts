@@ -53,6 +53,7 @@ const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
 
 type TelegramChatId = number | string;
+type TelegramChatAction = "typing" | "upload_photo" | "upload_document";
 type TelegramParseMode = "HTML";
 type KeyboardItem = { label: string; callbackData: string };
 
@@ -78,6 +79,20 @@ type RenderedText = {
 
 type RenderedChunk = RenderedText & {
   sourceText: string;
+};
+
+type BusyState = {
+  processing: boolean;
+  switching: boolean;
+  transcribing: number;
+};
+
+type QueuedPrompt = {
+  ctx: Context;
+  chatId: TelegramChatId;
+  session: CodexSessionService;
+  status: "pending" | "ready" | "skipped";
+  input?: CodexPromptInput;
 };
 
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
@@ -111,10 +126,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const bot = new Bot<Context>(config.telegramBotToken);
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
 
-  const contextBusy = new Map<
-    TelegramContextKey,
-    { processing: boolean; switching: boolean; transcribing: boolean }
-  >();
+  const contextBusy = new Map<TelegramContextKey, BusyState>();
   const pendingSessionPicks = new Map<TelegramContextKey, string[]>();
   const pendingWorkspacePicks = new Map<TelegramContextKey, string[]>();
   const pendingSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
@@ -125,6 +137,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
+  const pendingPromptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
+  const drainingPromptQueues = new Set<TelegramContextKey>();
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
@@ -132,14 +146,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
     lastPromptInput.delete(key);
+    pendingPromptQueues.delete(key);
+    drainingPromptQueues.delete(key);
   });
 
-  const getBusyState = (
-    contextKey: TelegramContextKey,
-  ): { processing: boolean; switching: boolean; transcribing: boolean } => {
+  const getBusyState = (contextKey: TelegramContextKey): BusyState => {
     let state = contextBusy.get(contextKey);
     if (!state) {
-      state = { processing: false, switching: false, transcribing: false };
+      state = { processing: false, switching: false, transcribing: 0 };
       contextBusy.set(contextKey, state);
     }
     return state;
@@ -218,6 +232,30 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   };
 
+  const rememberPromptInput = (contextKey: TelegramContextKey, input: CodexPromptInput): void => {
+    if (typeof input === "string") {
+      lastPromptInput.set(contextKey, input);
+      return;
+    }
+
+    if (input.text) {
+      lastPromptInput.set(contextKey, input.text);
+    }
+  };
+
+  const startTranscribing = (contextKey: TelegramContextKey): (() => void) => {
+    const busyState = getBusyState(contextKey);
+    busyState.transcribing += 1;
+    let stopped = false;
+    return () => {
+      if (stopped) {
+        return;
+      }
+      stopped = true;
+      busyState.transcribing = Math.max(0, busyState.transcribing - 1);
+    };
+  };
+
   const setReaction = async (ctx: Context, emoji: "👀" | "👍" | "❤" | "🔥" | "👏"): Promise<void> => {
     if (!config.enableTelegramReactions) {
       return;
@@ -245,6 +283,108 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await ctx.api.setMessageReaction(chatId, messageId, []);
     } catch {
       // Fail silently.
+    }
+  };
+
+  const sendRepeatingChatAction = async <T>(
+    chatId: TelegramChatId,
+    action: TelegramChatAction,
+    task: () => Promise<T>,
+    messageThreadId?: number,
+  ): Promise<T> => {
+    const options = messageThreadId ? { message_thread_id: messageThreadId } : {};
+    const interval = setInterval(() => {
+      void bot.api.sendChatAction(chatId, action, options).catch(() => {});
+    }, TYPING_INTERVAL_MS);
+
+    void bot.api.sendChatAction(chatId, action, options).catch(() => {});
+
+    try {
+      return await task();
+    } finally {
+      clearInterval(interval);
+    }
+  };
+
+  const enqueuePrompt = (
+    contextKey: TelegramContextKey,
+    item: QueuedPrompt,
+  ): QueuedPrompt => {
+    const queue = pendingPromptQueues.get(contextKey) ?? [];
+    queue.push(item);
+    pendingPromptQueues.set(contextKey, queue);
+    return item;
+  };
+
+  const drainQueuedPrompts = async (contextKey: TelegramContextKey): Promise<void> => {
+    if (drainingPromptQueues.has(contextKey) || isBusy(contextKey)) {
+      return;
+    }
+
+    drainingPromptQueues.add(contextKey);
+    try {
+      while (!isBusy(contextKey)) {
+        const queue = pendingPromptQueues.get(contextKey);
+        const next = queue?.[0];
+        if (!next) {
+          pendingPromptQueues.delete(contextKey);
+          return;
+        }
+
+        if (next.status === "pending") {
+          return;
+        }
+
+        queue.shift();
+        if (queue && queue.length === 0) {
+          pendingPromptQueues.delete(contextKey);
+        }
+
+        if (next.status === "skipped") {
+          continue;
+        }
+
+        if (!next.input) {
+          continue;
+        }
+
+        try {
+          await handleUserPrompt(next.ctx, contextKey, next.chatId, next.session, next.input);
+          await setReaction(next.ctx, "👍");
+        } catch {
+          await clearReaction(next.ctx);
+        }
+      }
+    } finally {
+      drainingPromptQueues.delete(contextKey);
+    }
+  };
+
+  const runOrQueuePrompt = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    session: CodexSessionService,
+    input: CodexPromptInput,
+    options?: { reactionAlreadySet?: boolean },
+  ): Promise<void> => {
+    rememberPromptInput(contextKey, input);
+    if (!options?.reactionAlreadySet) {
+      await setReaction(ctx, "👀");
+    }
+
+    const hasQueuedPrompts = (pendingPromptQueues.get(contextKey)?.length ?? 0) > 0;
+    if (isBusy(contextKey) || hasQueuedPrompts) {
+      enqueuePrompt(contextKey, { ctx, chatId, session, status: "ready", input });
+      await drainQueuedPrompts(contextKey);
+      return;
+    }
+
+    try {
+      await handleUserPrompt(ctx, contextKey, chatId, session, input);
+      await setReaction(ctx, "👍");
+    } catch {
+      await clearReaction(ctx);
     }
   };
 
@@ -306,6 +446,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let lastRenderedPlan = "";
     let planMessageSending = false;
     let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
+    let finalizePromise: Promise<void> | undefined;
 
     const typingInterval = setInterval(() => {
       void bot.api
@@ -529,6 +670,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
     };
 
+    const ensureFinalized = (): Promise<void> => {
+      if (!finalizePromise) {
+        finalizePromise = finalizeResponse();
+      }
+      return finalizePromise;
+    };
+
     const callbacks: CodexSessionCallbacks = {
       onTextDelta: (delta: string) => {
         accumulatedText += delta;
@@ -674,7 +822,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         lastTurnUsage = usage;
       },
       onAgentEnd: () => {
-        void finalizeResponse().catch((error) => {
+        void ensureFinalized().catch((error) => {
           console.error("Failed to finalize Telegram response message", error);
         });
       },
@@ -711,7 +859,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
       await session.prompt(userInput, callbacks);
       updateSessionMetadata(contextKey, session);
-      await finalizeResponse();
+      await ensureFinalized();
     } catch (error) {
       stopTyping();
       clearFlushTimer();
@@ -741,6 +889,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       stopTyping();
       clearFlushTimer();
       busyState.processing = false;
+      await drainQueuedPrompts(contextKey);
     }
   };
 
@@ -1902,14 +2051,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const { contextKey, session } = contextSession;
-    lastPromptInput.set(contextKey, userText);
-    await setReaction(ctx, "👀");
-    try {
-      await handleUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
-      await setReaction(ctx, "👍");
-    } catch {
-      await clearReaction(ctx);
-    }
+    await runOrQueuePrompt(ctx, contextKey, ctx.chat.id, session, userText);
   });
 
   bot.on(["message:voice", "message:audio"], async (ctx) => {
@@ -1920,31 +2062,30 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
-    if (isBusy(contextKey)) {
-      await sendBusyReply(ctx);
-      return;
-    }
 
     const fileId = ctx.message.voice?.file_id ?? ctx.message.audio?.file_id;
     if (!fileId) {
       return;
     }
 
-    const busyState = getBusyState(contextKey);
-    busyState.transcribing = true;
+    await setReaction(ctx, "👀");
+    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending" });
+    const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
-    let transcript: string | undefined;
+    const messageThreadId = parseContextKey(contextKey).messageThreadId;
 
     try {
-      await ctx.api.sendChatAction(chatId, "typing");
-      tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, fileId);
+      const result = await sendRepeatingChatAction(chatId, "typing", async () => {
+        tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, fileId);
+        return await transcribeAudio(tempFilePath);
+      }, messageThreadId);
 
-      const result = await transcribeAudio(tempFilePath);
-      transcript = result.text.trim();
+      const transcript = result.text.trim();
       if (!transcript) {
         await safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
           fallbackText: "Transcription was empty. Please try again or send text instead.",
         });
+        queuedPrompt.status = "skipped";
         return;
       }
 
@@ -1954,30 +2095,22 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         `🎙️ <b>Transcribed:</b> ${escapeHTML(preview)} <i>(via ${escapeHTML(result.backend)})</i>`,
         { fallbackText: `🎙️ Transcribed: ${preview} (via ${result.backend})` },
       );
+      queuedPrompt.status = "ready";
+      queuedPrompt.input = transcript;
+      rememberPromptInput(contextKey, transcript);
     } catch (error) {
+      queuedPrompt.status = "skipped";
       const note = "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.";
       await safeReply(ctx, `<b>Transcription failed:</b>\n${escapeHTML(friendlyErrorText(error))}\n\n<i>${escapeHTML(note)}</i>`, {
         fallbackText: `Transcription failed:\n${friendlyErrorText(error)}\n\n${note}`,
       });
       return;
     } finally {
-      busyState.transcribing = false;
+      stopTranscribing();
       if (tempFilePath) {
         await unlink(tempFilePath).catch(() => {});
       }
-    }
-
-    if (!transcript) {
-      return;
-    }
-
-    lastPromptInput.set(contextKey, transcript);
-    await setReaction(ctx, "👀");
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, transcript);
-      await setReaction(ctx, "👍");
-    } catch {
-      await clearReaction(ctx);
+      await drainQueuedPrompts(contextKey);
     }
   });
 
@@ -2000,8 +2133,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const busyState = getBusyState(contextKey);
-    busyState.transcribing = true;
+    const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 
     try {
@@ -2013,7 +2145,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       });
       return;
     } finally {
-      busyState.transcribing = false;
+      stopTranscribing();
       if (!tempFilePath) {
         // Download failed — nothing to clean up further
       }
@@ -2063,8 +2195,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const busyState = getBusyState(contextKey);
-    busyState.transcribing = true;
+    const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 
     try {
@@ -2076,7 +2207,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       });
       return;
     } finally {
-      busyState.transcribing = false;
+      stopTranscribing();
     }
 
     const turnId = randomUUID().slice(0, 12);
