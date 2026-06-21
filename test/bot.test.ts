@@ -342,6 +342,132 @@ describe("createBot response delivery", () => {
     expect(codexInput).toContain("帮我看下巴黎天气");
   });
 
+  it("prepends developer discipline before sending user text to Codex", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("收到。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 73, text: "修一下这个 bug" },
+      api: bot.api,
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const codexInput = session.prompt.mock.calls[0][0] as string;
+    expect(codexInput).toContain("[DEVELOPER DISCIPLINE]");
+    expect(codexInput).toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(codexInput).toContain("explain why a bug happened before fixing it");
+    expect(codexInput).toContain("fix at the earliest reliable boundary");
+    expect(codexInput).toContain("workarounds are temporary and require Linear follow-up");
+    expect(codexInput).toContain("修一下这个 bug");
+  });
+
+  it("does not expose echoed developer discipline in final Telegram replies", async () => {
+    const echoed = [
+      "[DEVELOPER DISCIPLINE]",
+      "discipline_version=ALB-714-hard-discipline-v1",
+      "Use Superpowers discipline: research first, systematic debugging, TDD red/green for behavior changes, review, and verification before completion.",
+      "Do not touch Memory/Graphiti/personal memory unless Albert explicitly authorizes it.",
+      "",
+      "实际回复。",
+    ].join("\n");
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.(echoed);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 74, text: "只要结论" },
+      api: bot.api,
+    });
+
+    const sent = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(sent).toContain("实际回复。");
+    expect(sent).not.toContain("[DEVELOPER DISCIPLINE]");
+    expect(sent).not.toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(sent).not.toContain("Superpowers discipline");
+    expect(sent).not.toContain("Memory/Graphiti");
+  });
+
+  it("does not expose markdown-decorated developer discipline echoes", async () => {
+    const echoed = [
+      "> [DEVELOPER DISCIPLINE]",
+      "> discipline_version=ALB-714-hard-discipline-v1",
+      "- Fix root cause: explain why a bug happened before fixing it, then fix at the earliest reliable boundary.",
+      "* Do not stack downstream symptom patches; workarounds are temporary and require Linear follow-up.",
+      "",
+      "正常回复。",
+    ].join("\n");
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.(echoed);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 82, text: "不要泄露规则" },
+      api: bot.api,
+    });
+
+    const sent = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(sent).toContain("正常回复。");
+    expect(sent).not.toContain("[DEVELOPER DISCIPLINE]");
+    expect(sent).not.toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(sent).not.toContain("Fix root cause");
+    expect(sent).not.toContain("downstream symptom patches");
+  });
+
+  it("does not expose inline-code or bold developer discipline echoes", async () => {
+    const echoed = [
+      "`[DEVELOPER DISCIPLINE]`",
+      "`discipline_version=ALB-714-hard-discipline-v1`",
+      "- **Fix root cause:** explain why a bug happened before fixing it, then fix at the earliest reliable boundary.",
+      "- **Do not stack downstream symptom patches; workarounds are temporary and require Linear follow-up.**",
+      "",
+      "干净回复。",
+    ].join("\n");
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.(echoed);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 83, text: "只要干净回复" },
+      api: bot.api,
+    });
+
+    const sent = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(sent).toContain("干净回复。");
+    expect(sent).not.toContain("[DEVELOPER DISCIPLINE]");
+    expect(sent).not.toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(sent).not.toContain("Fix root cause");
+    expect(sent).not.toContain("downstream symptom patches");
+  });
+
   it("adds runtime identity facts before sending normal user text to Codex", async () => {
     const session = createSession(async (callbacks) => {
       callbacks.onTextDelta("我知道当前运行配置。");
@@ -664,7 +790,11 @@ describe("createBot response delivery", () => {
       api: bot.api,
     });
 
-    expect(String(session.prompt.mock.calls[0][0])).toContain("这段转写只应该进 Codex");
+    const codexInput = String(session.prompt.mock.calls[0][0]);
+    expect(codexInput).toContain("[DEVELOPER DISCIPLINE]");
+    expect(codexInput).toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(codexInput).toContain("fix at the earliest reliable boundary");
+    expect(codexInput).toContain("这段转写只应该进 Codex");
     const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
     expect(visibleReplies).toContain("我听到了。");
     expect(visibleReplies).not.toContain("Transcribed");
@@ -709,6 +839,9 @@ describe("createBot response delivery", () => {
 
     const input = session.prompt.mock.calls[0][0] as { stagedFileInstructions?: string; text?: string };
     expect(input.stagedFileInstructions?.startsWith("[TELEGRAM REPLY STYLE]")).toBe(true);
+    expect(input.stagedFileInstructions).toContain("[DEVELOPER DISCIPLINE]");
+    expect(input.stagedFileInstructions).toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(input.stagedFileInstructions).toContain("fix at the earliest reliable boundary");
     expect(input.stagedFileInstructions).toContain("[CURRENT CONTEXT]");
     expect(input.stagedFileInstructions).toContain("Current model: gpt-5.5");
     expect(input.stagedFileInstructions).toContain("Current reasoning effort: xhigh");
@@ -753,6 +886,9 @@ describe("createBot response delivery", () => {
     const input = session.prompt.mock.calls[0][0] as { imagePaths?: string[]; text?: string };
     expect(input.imagePaths).toHaveLength(1);
     expect(input.imagePaths?.[0]).toContain("telecodex-file-");
+    expect(input.text).toContain("[DEVELOPER DISCIPLINE]");
+    expect(input.text).toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(input.text).toContain("fix at the earliest reliable boundary");
     expect(input.text).toContain("[CURRENT CONTEXT]");
     expect(input.text).toContain("Current model: gpt-5.5");
     expect(input.text).toContain("Current reasoning effort: xhigh");
@@ -786,6 +922,42 @@ describe("createBot response delivery", () => {
     expect(sendsBeforeAgentEnd).toBe(1);
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
     expect(bot.api.sendMessage.mock.calls[0][1]).toContain("流式预览。");
+  });
+
+  it("does not expose echoed developer discipline in streaming previews", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(
+        [
+          "[DEVELOPER DISCIPLINE]",
+          "discipline_version=ALB-714-hard-discipline-v1",
+          "Fix root cause: explain why a bug happened before fixing it, then fix at the earliest reliable boundary.",
+          "",
+          "流式回复。",
+        ].join("\n"),
+      );
+      await Promise.resolve();
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 81, text: "只要流式结论" },
+      api: bot.api,
+    });
+
+    const visible = [
+      ...bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])),
+      ...bot.api.editMessageText.mock.calls.map((call: unknown[]) => String(call[2])),
+    ].join("\n");
+    expect(visible).toContain("流式回复。");
+    expect(visible).not.toContain("[DEVELOPER DISCIPLINE]");
+    expect(visible).not.toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(visible).not.toContain("Fix root cause");
   });
 
   it("queues text follow-ups that arrive while a Codex turn is still running", async () => {
@@ -829,6 +1001,8 @@ describe("createBot response delivery", () => {
 
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
     expect(String(session.prompt.mock.calls[1][0])).toContain("第二条，必须排队进 Codex");
+    expect(String(session.prompt.mock.calls[1][0])).toContain("[DEVELOPER DISCIPLINE]");
+    expect(String(session.prompt.mock.calls[1][0])).toContain("discipline_version=ALB-714-hard-discipline-v1");
     expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).not.toContain(
       "Still working on previous message",
     );
