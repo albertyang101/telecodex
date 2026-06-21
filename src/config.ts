@@ -29,6 +29,15 @@ export interface MailboxBridgeConfig {
   minSentAt?: string;
 }
 
+export interface TelegramTransportConfig {
+  enabled: boolean;
+  mcpServerName: string;
+  personasStatePath: string;
+  blockedPersonaPrefixes: string[];
+  startupTimeoutMs: number;
+  toolTimeoutMs: number;
+}
+
 export interface TeleCodexConfig {
   telegramBotToken: string;
   telegramAllowedUserIds: number[];
@@ -50,6 +59,7 @@ export interface TeleCodexConfig {
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
   mailboxBridge: MailboxBridgeConfig;
+  telegramTransport: TelegramTransportConfig;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -88,6 +98,7 @@ export function loadConfig(): TeleCodexConfig {
     false,
   );
   const mailboxBridge = parseMailboxBridgeConfig();
+  const telegramTransport = parseTelegramTransportConfig();
   validateMailboxBridgeLaunch(mailboxBridge, launchProfiles, defaultLaunchProfileId);
 
   return {
@@ -111,6 +122,7 @@ export function loadConfig(): TeleCodexConfig {
     enableTelegramLogin,
     enableTelegramReactions,
     mailboxBridge,
+    telegramTransport,
   };
 }
 
@@ -295,6 +307,35 @@ function parseMailboxBridgeConfig(): MailboxBridgeConfig {
   };
 }
 
+function parseTelegramTransportConfig(): TelegramTransportConfig {
+  const mcpServerName = optionalString(process.env.TELEGRAM_TRANSPORT_MCP_SERVER_NAME) ?? "telegram_transport";
+  if (!isSafeMcpServerName(mcpServerName)) {
+    throw new Error("TELEGRAM_TRANSPORT_MCP_SERVER_NAME must be a safe MCP server name");
+  }
+
+  return {
+    enabled: parseBooleanEnv(optionalString(process.env.TELEGRAM_TRANSPORT_MCP_ENABLED), false),
+    mcpServerName,
+    personasStatePath:
+      optionalString(process.env.TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH) ??
+      path.join(homedir(), "code", "claude", "state", "personas.json"),
+    blockedPersonaPrefixes: parseCommaList(
+      optionalString(process.env.TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES),
+      ["dadamia_"],
+    ),
+    startupTimeoutMs: parsePositiveIntegerEnv(
+      optionalString(process.env.TELEGRAM_TRANSPORT_MCP_STARTUP_TIMEOUT_MS),
+      10_000,
+      "TELEGRAM_TRANSPORT_MCP_STARTUP_TIMEOUT_MS",
+    ),
+    toolTimeoutMs: parsePositiveIntegerEnv(
+      optionalString(process.env.TELEGRAM_TRANSPORT_MCP_TOOL_TIMEOUT_MS),
+      30_000,
+      "TELEGRAM_TRANSPORT_MCP_TOOL_TIMEOUT_MS",
+    ),
+  };
+}
+
 function validateMailboxBridgeLaunch(
   mailboxBridge: MailboxBridgeConfig,
   launchProfiles: CodexLaunchProfile[],
@@ -343,6 +384,22 @@ function parseMailboxTimestampMs(value: string): number | undefined {
 
 function isSafeMailboxSegment(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value);
+}
+
+function isSafeMcpServerName(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value);
+}
+
+function parseCommaList(raw: string | undefined, defaultValue: string[]): string[] {
+  if (!raw) {
+    return defaultValue;
+  }
+
+  const values = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return values.length > 0 ? values : defaultValue;
 }
 
 function parseSandboxMode(raw: string | undefined): CodexSandboxMode {

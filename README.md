@@ -65,6 +65,12 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
    | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
    | `ENABLE_TELEGRAM_REACTIONS` | — | Enable Telegram emoji reactions like 👀 / 👍 (`false` by default) |
+   | `TELEGRAM_TRANSPORT_MCP_ENABLED` | — | Enable the CC-style `telegram_transport` MCP server for direct cross-persona Telegram sends (`false` by default) |
+   | `TELEGRAM_TRANSPORT_MCP_SERVER_NAME` | — | MCP server name injected into Codex CLI (default `telegram_transport`) |
+   | `TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH` | — | Path to `{chat_id: persona_name}` mapping, default `~/code/claude/state/personas.json` |
+   | `TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES` | — | Comma-separated persona prefixes blocked from direct sends (default `dadamia_`) |
+   | `TELEGRAM_TRANSPORT_MCP_STARTUP_TIMEOUT_MS` | — | MCP server startup timeout in milliseconds (default `10000`) |
+   | `TELEGRAM_TRANSPORT_MCP_TOOL_TIMEOUT_MS` | — | MCP tool call timeout in milliseconds (default `30000`) |
    | `VOICE_TRANSCRIPTION_BACKEND` | — | Voice backend: `auto`, `qwen`, `parakeet`, or `openai` (`auto` by default) |
    | `QWEN_ASR_SOCKET` | — | Unix socket for the Qwen3-ASR resident server, e.g. `/tmp/qwen_asr.sock` |
    | `QWEN_ASR_CONTEXT` | — | Optional Qwen3-ASR context/hotword prompt for names and domain terms |
@@ -189,6 +195,8 @@ Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
                 │     └── ThreadEvents (agent text, commands, file changes,
                 │                       MCP calls, web searches, todo lists,
                 │                       reasoning, errors, token usage)
+                ├── TelegramTransportMCP ─→ direct cross-persona send_message
+                │                         using state/personas.json
                 ├── CodexStateReader  ──→  ~/.codex/state_*.sqlite  (threads)
                 │                    ──→  ~/.codex/models_cache.json (models)
                 ├── CodexAuth        ──→  codex login/logout subprocess
@@ -217,6 +225,8 @@ TeleCodex/
 │   ├── artifacts.ts       — generated file collection and Telegram delivery
 │   ├── error-messages.ts  — SDK/network error → user-friendly translation
 │   ├── voice.ts           — voice transcription (Qwen / parakeet / OpenAI)
+│   ├── telegram-transport.ts — direct cross-persona Telegram transport
+│   ├── telegram-transport-mcp-server.ts — stdio MCP wrapper for Codex CLI
 │   ├── config.ts          — environment loading and validation
 │   └── format.ts          — Markdown → Telegram HTML conversion
 ├── test/                  — 15 test files, 180+ tests (vitest)

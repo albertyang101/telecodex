@@ -8,6 +8,7 @@ import {
   type ThreadEvent,
   type UserInput,
 } from "@openai/codex-sdk";
+import { fileURLToPath } from "node:url";
 
 import type { TeleCodexConfig } from "./config.js";
 import {
@@ -75,6 +76,8 @@ export interface CreateOptions {
 }
 
 export type CodexPromptInput = string | { text?: string; imagePaths?: string[]; stagedFileInstructions?: string };
+type CodexConfigValue = string | number | boolean | CodexConfigValue[] | CodexConfigObject;
+type CodexConfigObject = { [key: string]: CodexConfigValue };
 
 export class CodexSessionService {
   private codex: Codex | null = null;
@@ -517,13 +520,21 @@ export class CodexSessionService {
   }
 
   private resetCodexClient(): void {
+    const configOverrides: CodexConfigObject = {
+      approval_policy: this.currentLaunchProfile.approvalPolicy,
+    };
+    const telegramTransportMcp = buildTelegramTransportMcpConfig(this.config);
+    if (telegramTransportMcp) {
+      configOverrides.mcp_servers = {
+        [this.config.telegramTransport.mcpServerName]: telegramTransportMcp,
+      };
+    }
+
     this.codex = new Codex({
       codexPathOverride: this.config.codexPathOverride,
       apiKey: this.config.codexApiKey,
-      config: {
-        approval_policy: this.currentLaunchProfile.approvalPolicy,
-      },
-      env: buildCodexEnv(this.config.codexApiKey),
+      config: configOverrides,
+      env: buildCodexEnv(this.config),
     });
   }
 }
@@ -536,7 +547,44 @@ function getLaunchProfile(config: TeleCodexConfig, profileId: string): CodexLaun
   return profile;
 }
 
-function buildCodexEnv(apiKey?: string): Record<string, string> {
+function buildTelegramTransportMcpConfig(config: TeleCodexConfig): CodexConfigObject | undefined {
+  if (!config.telegramTransport.enabled) {
+    return undefined;
+  }
+
+  const command = buildTelegramTransportMcpCommand();
+  return {
+    command: command.command,
+    args: command.args,
+    env_vars: [
+      "TELEGRAM_BOT_TOKEN",
+      "TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH",
+      "TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES",
+    ],
+    startup_timeout_sec: Math.ceil(config.telegramTransport.startupTimeoutMs / 1000),
+    tool_timeout_sec: Math.ceil(config.telegramTransport.toolTimeoutMs / 1000),
+  };
+}
+
+function buildTelegramTransportMcpCommand(): { command: string; args: string[] } {
+  const modulePath = fileURLToPath(import.meta.url);
+  if (modulePath.endsWith(".ts")) {
+    return {
+      command: process.execPath,
+      args: [
+        fileURLToPath(new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url)),
+        fileURLToPath(new URL("./telegram-transport-mcp-server.ts", import.meta.url)),
+      ],
+    };
+  }
+
+  return {
+    command: process.execPath,
+    args: [fileURLToPath(new URL("./telegram-transport-mcp-server.js", import.meta.url))],
+  };
+}
+
+function buildCodexEnv(config: TeleCodexConfig): Record<string, string> {
   const env: Record<string, string> = {};
 
   for (const [key, value] of Object.entries(process.env)) {
@@ -545,8 +593,14 @@ function buildCodexEnv(apiKey?: string): Record<string, string> {
     }
   }
 
-  if (apiKey) {
-    env.CODEX_API_KEY = apiKey;
+  if (config.codexApiKey) {
+    env.CODEX_API_KEY = config.codexApiKey;
+  }
+
+  if (config.telegramTransport.enabled) {
+    env.TELEGRAM_BOT_TOKEN = config.telegramBotToken;
+    env.TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH = config.telegramTransport.personasStatePath;
+    env.TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES = config.telegramTransport.blockedPersonaPrefixes.join(",");
   }
 
   return env;

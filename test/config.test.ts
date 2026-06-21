@@ -40,6 +40,12 @@ describe("loadConfig", () => {
     delete process.env.MAILBOX_AUTO_REPLY;
     delete process.env.MAILBOX_MAX_MESSAGES_PER_TICK;
     delete process.env.MAILBOX_MIN_SENT_AT;
+    delete process.env.TELEGRAM_TRANSPORT_MCP_ENABLED;
+    delete process.env.TELEGRAM_TRANSPORT_MCP_SERVER_NAME;
+    delete process.env.TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH;
+    delete process.env.TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES;
+    delete process.env.TELEGRAM_TRANSPORT_MCP_STARTUP_TIMEOUT_MS;
+    delete process.env.TELEGRAM_TRANSPORT_MCP_TOOL_TIMEOUT_MS;
     delete process.env.container;
   });
 
@@ -133,6 +139,14 @@ describe("loadConfig", () => {
         autoReply: false,
         maxMessagesPerTick: 1,
         minSentAt: undefined,
+      },
+      telegramTransport: {
+        enabled: false,
+        mcpServerName: "telegram_transport",
+        personasStatePath: path.join(homedir(), "code", "claude", "state", "personas.json"),
+        blockedPersonaPrefixes: ["dadamia_"],
+        startupTimeoutMs: 10_000,
+        toolTimeoutMs: 30_000,
       },
     });
   });
@@ -394,6 +408,37 @@ describe("loadConfig", () => {
       maxMessagesPerTick: 2,
       minSentAt: "2026-06-21T06:15:00Z",
     });
+  });
+
+  it("enables direct Telegram transport MCP only when explicitly configured", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_TRANSPORT_MCP_ENABLED = "true";
+    process.env.TELEGRAM_TRANSPORT_MCP_SERVER_NAME = "telegram_transport";
+    process.env.TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH = "/Users/albert/code/claude/state/personas.json";
+    process.env.TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES = "dadamia_,paperclip_";
+    process.env.TELEGRAM_TRANSPORT_MCP_STARTUP_TIMEOUT_MS = "15000";
+    process.env.TELEGRAM_TRANSPORT_MCP_TOOL_TIMEOUT_MS = "45000";
+
+    const config = loadConfig();
+
+    expect(config.telegramTransport).toEqual({
+      enabled: true,
+      mcpServerName: "telegram_transport",
+      personasStatePath: "/Users/albert/code/claude/state/personas.json",
+      blockedPersonaPrefixes: ["dadamia_", "paperclip_"],
+      startupTimeoutMs: 15_000,
+      toolTimeoutMs: 45_000,
+    });
+  });
+
+  it("rejects unsafe direct Telegram transport MCP server names", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_TRANSPORT_MCP_ENABLED = "true";
+    process.env.TELEGRAM_TRANSPORT_MCP_SERVER_NAME = "../telegram";
+
+    expect(() => loadConfig()).toThrow("TELEGRAM_TRANSPORT_MCP_SERVER_NAME must be a safe MCP server name");
   });
 
   it("rejects mailbox bridge startup unless the default Codex launch is read-only and never approval", () => {

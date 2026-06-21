@@ -132,6 +132,14 @@ describe("CodexSessionService", () => {
       autoReply: false,
       maxMessagesPerTick: 1,
     },
+    telegramTransport: {
+      enabled: false,
+      mcpServerName: "telegram_transport",
+      personasStatePath: "/Users/albert/code/claude/state/personas.json",
+      blockedPersonaPrefixes: ["dadamia_"],
+      startupTimeoutMs: 10_000,
+      toolTimeoutMs: 30_000,
+    },
     ...overrides,
   });
 
@@ -241,6 +249,49 @@ describe("CodexSessionService", () => {
       modelReasoningEffort: "xhigh",
     });
     expect(service.getInfo().reasoningEffort).toBe("xhigh");
+  });
+
+  it("injects the Telegram transport MCP server when direct cross-persona transport is enabled", async () => {
+    await CodexSessionService.create(
+      createConfig({
+        telegramTransport: {
+          enabled: true,
+          mcpServerName: "telegram_transport",
+          personasStatePath: "/Users/albert/code/claude/state/personas.json",
+          blockedPersonaPrefixes: ["dadamia_"],
+          startupTimeoutMs: 10_000,
+          toolTimeoutMs: 30_000,
+        },
+      }),
+    );
+
+    expect(mockState.Codex).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({
+          approval_policy: "never",
+          mcp_servers: {
+            telegram_transport: {
+              command: process.execPath,
+              args: expect.arrayContaining([
+                expect.stringMatching(/telegram-transport-mcp-server\.(js|ts)$/),
+              ]),
+              env_vars: [
+                "TELEGRAM_BOT_TOKEN",
+                "TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH",
+                "TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES",
+              ],
+              startup_timeout_sec: 10,
+              tool_timeout_sec: 30,
+            },
+          },
+        }),
+        env: expect.objectContaining({
+          CODEX_API_KEY: "codex-key",
+          TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH: "/Users/albert/code/claude/state/personas.json",
+          TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES: "dadamia_",
+        }),
+      }),
+    );
   });
 
   it("can defer thread creation so launch settings apply before the first thread starts", async () => {
