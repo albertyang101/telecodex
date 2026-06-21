@@ -48,6 +48,7 @@ const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
 const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
+const DEFAULT_TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = 60_000;
 const KEYBOARD_PAGE_SIZE = 6;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
@@ -93,6 +94,7 @@ type QueuedPrompt = {
   session: CodexSessionService;
   status: "pending" | "ready" | "skipped";
   input?: CodexPromptInput;
+  receiptReaction?: Promise<void>;
 };
 
 const TELEGRAM_REPLY_STYLE_GUARD = [
@@ -442,6 +444,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   };
 
+  const completeReaction = async (ctx: Context, receiptReaction?: Promise<void>): Promise<void> => {
+    if (receiptReaction) {
+      void receiptReaction.finally(() => {
+        void setReaction(ctx, "👍");
+      }).catch(() => {});
+    }
+    await setReaction(ctx, "👍");
+  };
+
+  const failReaction = async (ctx: Context, receiptReaction?: Promise<void>): Promise<void> => {
+    if (receiptReaction) {
+      void receiptReaction.finally(() => {
+        void clearReaction(ctx);
+      }).catch(() => {});
+    }
+    await clearReaction(ctx);
+  };
+
   const sendRepeatingChatAction = async <T>(
     chatId: TelegramChatId,
     action: TelegramChatAction,
@@ -506,9 +526,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
         try {
           await handleUserPrompt(next.ctx, contextKey, next.chatId, next.session, next.input);
-          await setReaction(next.ctx, "👍");
+          await completeReaction(next.ctx, next.receiptReaction);
         } catch {
-          await clearReaction(next.ctx);
+          await failReaction(next.ctx, next.receiptReaction);
         }
       }
     } finally {
@@ -525,22 +545,20 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     options?: { reactionAlreadySet?: boolean },
   ): Promise<void> => {
     rememberPromptInput(contextKey, input);
-    if (!options?.reactionAlreadySet) {
-      await setReaction(ctx, "👀");
-    }
+    const receiptReaction = options?.reactionAlreadySet ? undefined : setReaction(ctx, "👀");
 
     const hasQueuedPrompts = (pendingPromptQueues.get(contextKey)?.length ?? 0) > 0;
     if (isBusy(contextKey) || hasQueuedPrompts) {
-      enqueuePrompt(contextKey, { ctx, chatId, session, status: "ready", input });
+      enqueuePrompt(contextKey, { ctx, chatId, session, status: "ready", input, receiptReaction });
       await drainQueuedPrompts(contextKey);
       return;
     }
 
     try {
       await handleUserPrompt(ctx, contextKey, chatId, session, input);
-      await setReaction(ctx, "👍");
+      await completeReaction(ctx, receiptReaction);
     } catch {
-      await clearReaction(ctx);
+      await failReaction(ctx, receiptReaction);
     }
   };
 
@@ -590,6 +608,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const toolCounts = new Map<string, number>();
     let accumulatedText = "";
     let completedAgentText = "";
+    let hasCompletedAgentText = false;
     let responseMessageId: number | undefined;
     let responseMessagePromise: Promise<void> | undefined;
     let lastRenderedText = "";
@@ -657,7 +676,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const finalResponseSourceText = (): string => {
-      if (!streamAgentResponses && completedAgentText) {
+      if (!streamAgentResponses && hasCompletedAgentText) {
         return completedAgentText;
       }
       return accumulatedText;
@@ -856,6 +875,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       },
       onAgentMessage: (text: string) => {
         completedAgentText = text;
+        hasCompletedAgentText = true;
       },
       onToolStart: (toolName: string, toolCallId: string) => {
         if (toolVerbosity === "summary") {
@@ -2258,8 +2278,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    await setReaction(ctx, "👀");
-    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending" });
+    const receiptReaction = setReaction(ctx, "👀");
+    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
     const messageThreadId = parseContextKey(contextKey).messageThreadId;
@@ -2731,16 +2751,60 @@ async function downloadTelegramFile(
   }
 
   const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to download Telegram file: ${response.status}`);
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
+  const timeoutMs = getPositiveIntegerEnv(
+    "TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS",
+    DEFAULT_TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS,
+  );
+  const buffer = await withAbortTimeout(timeoutMs, "Telegram file download", async (signal) => {
+    const response = await fetch(url, { signal });
+    if (!response.ok) {
+      throw new Error(`Failed to download Telegram file: ${response.status}`);
+    }
+    return Buffer.from(await response.arrayBuffer());
+  });
   const extension = path.extname(file.file_path) || ".bin";
   const tempPath = path.join(tmpdir(), `telecodex-file-${randomUUID()}${extension}`);
   await writeFile(tempPath, buffer);
   return tempPath;
+}
+
+async function withAbortTimeout<T>(
+  timeoutMs: number,
+  label: string,
+  task: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([task(controller.signal), timeoutPromise]);
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+function getPositiveIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 function splitTelegramText(text: string): string[] {

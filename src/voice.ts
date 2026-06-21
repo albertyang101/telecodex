@@ -36,6 +36,7 @@ const DEFAULT_QWEN_CONTEXT =
   "系统/技术词：Albert、Theo、Codex、Linear、GitHub、Notion、Graphiti、Telegram、Dispatcher、Superpowers。" +
   "佛教/中文专有名词：金刚禅寺、维摩诘经、禅意、禅宗、般若、菩提。";
 const DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
+const DEFAULT_OPENAI_TRANSCRIPTION_TIMEOUT_MS = 120_000;
 const FFMPEG_INSTALL_MESSAGE = "ffmpeg not found. Install it with: brew install ffmpeg";
 const NO_BACKEND_ERROR = `Voice messages require a transcription backend.
 
@@ -293,22 +294,26 @@ async function transcribeWithOpenAI(filePath: string): Promise<TranscriptionResu
   form.append("file", new Blob([audioBuffer], { type: mimeType }), path.basename(filePath) || "audio.ogg");
   form.append("model", getOptionalEnv("OPENAI_TRANSCRIPTION_MODEL") ?? DEFAULT_OPENAI_TRANSCRIPTION_MODEL);
 
-  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: form,
+  const timeoutMs = getOpenAITranscriptionTimeoutMs();
+  const payload = await withAbortTimeout(timeoutMs, "OpenAI transcription", async (signal) => {
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: form,
+      signal,
+    });
+
+    if (!response.ok) {
+      const errorText = (await response.text().catch(() => "")).trim();
+      throw new Error(
+        `OpenAI transcription failed (${response.status}): ${errorText || response.statusText || "Unknown error"}`,
+      );
+    }
+
+    return (await response.json()) as { text?: unknown };
   });
-
-  if (!response.ok) {
-    const errorText = (await response.text().catch(() => "")).trim();
-    throw new Error(
-      `OpenAI transcription failed (${response.status}): ${errorText || response.statusText || "Unknown error"}`,
-    );
-  }
-
-  const payload = (await response.json()) as { text?: unknown };
   if (typeof payload.text !== "string") {
     throw new Error("OpenAI transcription response did not include a text field");
   }
@@ -418,9 +423,48 @@ function getQwenTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_QWEN_TIMEOUT_MS;
 }
 
+function getOpenAITranscriptionTimeoutMs(): number {
+  const raw = getOptionalEnv("OPENAI_TRANSCRIPTION_TIMEOUT_MS");
+  if (!raw) {
+    return DEFAULT_OPENAI_TRANSCRIPTION_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_OPENAI_TRANSCRIPTION_TIMEOUT_MS;
+}
+
 function getOptionalEnv(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value ? value : undefined;
+}
+
+async function withAbortTimeout<T>(
+  timeoutMs: number,
+  label: string,
+  task: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([task(controller.signal), timeoutPromise]);
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function requestQwenAsr(options: {
