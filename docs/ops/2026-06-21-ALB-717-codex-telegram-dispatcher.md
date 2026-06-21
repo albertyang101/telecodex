@@ -3,6 +3,7 @@
 Linear is the control-plane truth. This file is only a local recovery pointer for the isolated TeleCodex/Theo validation line.
 
 - Linear issue: ALB-717
+- Parent parity issue: ALB-742
 - Latest runtime evidence comments:
   - Telegram reply/voice proof: https://linear.app/albert-yang/issue/ALB-717/codex-dispatcher-native-telegram-ux-parity-typing-reactions#comment-225093af
   - Mailbox proof: https://linear.app/albert-yang/issue/ALB-717/codex-dispatcher-native-telegram-ux-parity-typing-reactions#comment-0198493b
@@ -36,10 +37,25 @@ Current access boundary:
 - Live Codex with `--ignore-user-config` can read `code/claude`, `personas`, and the Linear API key path existence under read-only sandbox; key content was not printed.
 - Installed Mac mini Codex plugins are not enough to claim runtime connector parity. `codex mcp list` reports no MCP servers configured for live runtime. Use the Linear GraphQL fallback for reliable control-plane writes until connector write behavior is explicitly proven.
 
+Expanded control-plane queue, mirrored from Linear:
+
+- ALB-742: parent CC-bot system connectivity parity audit.
+- ALB-716: Codex Connected Dispatcher Bot Agent Skill / build factory.
+- ALB-743: standalone Codex Dispatcher Bot specification reference.
+- ALB-714 and ALB-698: runtime discipline and proof that discipline is followed, not only loaded.
+- ALB-722 and ALB-748: runtime control-plane and external app connector parity for Linear, GitHub, Notion, Figma, Canva, Gmail/email.
+- ALB-747: output style / persona parity with CC Theo; no internal self-talk, no visible transcript, no source/footer unless requested.
+- ALB-749: runtime model/effort target, eventually `xhigh`, with launch proof.
+- ALB-750: direct CC-style cross-persona Telegram send parity; separate from the mailbox proof.
+- ALB-700: productionization, launchd/preflight/logs/rollback.
+- ALB-745: auth recovery signal lifecycle.
+
 Open items stay in Linear, not here:
 
 - Reaction/read emoji live proof.
 - Richer typing/busy UX proof.
-- Make Theo's default runtime effort `xhigh` using the native Codex reasoning-effort path; do not add a separate glue layer.
-- Prove or explicitly scope out GitHub/Notion/Figma/Canva/Gmail runtime access from live TeleCodex sessions.
+- Make Theo's default runtime effort `xhigh` using the native Codex reasoning-effort path; tracked by ALB-749.
+- Prove or explicitly scope out GitHub/Notion/Figma/Canva/Gmail runtime access from live TeleCodex sessions; tracked by ALB-748 / ALB-722.
+- Build the CodexBot Agent Skill after the design/spec has closed; tracked by ALB-716.
+- Validate runtime discipline end to end on THEO/testboard; tracked by ALB-714 / ALB-698.
 - GitHub branch/PR sync and Albert acceptance before closing ALB-717.
