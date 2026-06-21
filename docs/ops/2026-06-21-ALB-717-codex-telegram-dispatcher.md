@@ -69,6 +69,7 @@ ALB-714 discipline mirror:
 - For any bug or operational failure, Codex must explain why the issue could happen in the first place and place the fix at the earliest reliable boundary: tooling, config, protocol, API contract, or dispatcher layer.
 - Workarounds are allowed only as explicitly labeled temporary containment and must have a Linear follow-up. They are not closure evidence.
 - Closure needs red/green tests where code behavior changed, runtime/live evidence, review, and Linear comments. Loading these words in `AGENTS.md` is not enough; ALB-714 / ALB-698 still need THEO end-to-end discipline lifecycle proof.
+- 2026-06-22 root-cause update: `AGENTS.md` alone is not enough for existing long-running Telegram threads. TeleCodex now injects a short `[DEVELOPER DISCIPLINE]` block per turn at the existing prompt seam and strips exact injected guard echoes from final/streaming Telegram output.
 
 2026-06-22 live proof addendum:
 
@@ -104,3 +105,26 @@ ALB-714 discipline mirror:
 - Direct Qwen ASR check for `/tmp/alb717_voice_probe2.ogg` returned `Please reply audio. Okay.` before the live run.
 - Full JSON: `/tmp/alb717_live_probe_after_restart_result.json` on Mac mini.
 - Both local and Mac mini TeleCodex repos were clean at `4bee8f1` after proof capture.
+
+2026-06-22 ALB-714 per-turn discipline proof:
+
+- Code commit: `1274ab6 Refs ALB-714 inject dispatcher discipline per turn`.
+- Root cause: runtime `AGENTS.md` is a new-session/project baseline, but the active THEO Telegram context is a long-running Codex thread; updated exact discipline text is not guaranteed to be present in that thread. The earliest reliable boundary for Telegram runtime enforcement is the existing TeleCodex per-turn prompt preamble.
+- Implementation:
+  - `src/bot.ts` adds `[DEVELOPER DISCIPLINE]` to every text/object prompt, including text, voice transcript, document staged instructions, image prompts, and queued prompts.
+  - The block includes exact `discipline_version=ALB-714-hard-discipline-v1`, Linear-first, Superpowers/TDD/review/verification, root-cause earliest-boundary rule, workaround Linear follow-up, subagent verification, and no-Memory boundary.
+  - Output path strips exact injected prompt guard echoes from final replies and streaming previews, including quote/list/inline-code/bold decorated forms.
+- TDD / review evidence:
+  - Red tests first: developer discipline injection for text/voice, output no-leak for final/streaming replies, document/image/queued prompt coverage, markdown-decorated guard echo leak cases.
+  - Reviewer found two rounds of Important no-leak gaps; both were fixed. Final review found no Critical/Important findings.
+  - Mac mini verification: `npm test -- --run test/bot.test.ts` -> 47 tests passed; `npm run build` -> passed; `npm test` -> 19 files / 304 tests passed.
+- Runtime rollout:
+  - Mac mini repo clean at `1274ab6`.
+  - `dist/bot.js` contains `[DEVELOPER DISCIPLINE]` and `ALB-714-hard-discipline-v1`.
+  - launchd restarted from pid `98004` to pid `16835`; env remains `CODEX_MODEL=gpt-5.5`, `CODEX_REASONING_EFFORT=xhigh`, `STREAM_AGENT_RESPONSES=false`, `ENABLE_TELEGRAM_REACTIONS=true`.
+- THEO live proof via Pyrogram:
+  - Version probe file: `/tmp/alb714-turn-discipline-version-live-20260622T0726.json`.
+  - Sent id `25946`, reply id `25947`, final reply `ALB-714-hard-discipline-v1`.
+  - No-leak probe file: `/tmp/alb714-turn-discipline-noleak-live-20260622T0730.json`.
+  - Sent id `25949`, reply id `25950`, final reply `ALB714_NOLEAK_OK`; hidden guard lines were not visible in Telegram.
+- ALB-714 still should not close solely from this injection proof. Remaining closure is a real THEO task lifecycle proving Linear-first behavior, root-cause-first repair, TDD/review/live proof, and Albert acceptance.
