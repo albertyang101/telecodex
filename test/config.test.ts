@@ -171,7 +171,7 @@ describe("loadConfig", () => {
     ]);
     expect(config.defaultLaunchProfileId).toBe("default");
     expect(config.enableUnsafeLaunchProfiles).toBe(false);
-    expect(config.toolVerbosity).toBe("summary");
+    expect(config.toolVerbosity).toBe("none");
     expect(config.streamAgentResponses).toBe(true);
     expect(config.showTurnTokenUsage).toBe(false);
     expect(config.enableTelegramLogin).toBe(true);
@@ -452,7 +452,7 @@ describe("loadConfig", () => {
 
     expect(config.codexSandboxMode).toBe("workspace-write");
     expect(config.codexApprovalPolicy).toBe("never");
-    expect(config.toolVerbosity).toBe("summary");
+    expect(config.toolVerbosity).toBe("none");
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
     expect(warnSpy).toHaveBeenCalledTimes(4);
   });

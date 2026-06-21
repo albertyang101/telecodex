@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { afterEach, vi } from "vitest";
 
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
@@ -103,6 +107,7 @@ describe("createBot response delivery", () => {
   const originalOpenAIKey = process.env.OPENAI_API_KEY;
   const originalVoiceBackend = process.env.VOICE_TRANSCRIPTION_BACKEND;
   const originalQwenSocket = process.env.QWEN_ASR_SOCKET;
+  const tempDirs: string[] = [];
 
   const createConfig = (overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig => ({
     telegramBotToken: "bot-token",
@@ -141,6 +146,7 @@ describe("createBot response delivery", () => {
     isProcessing: vi.fn(() => false),
     hasActiveThread: vi.fn(() => true),
     newThread: vi.fn(),
+    getCurrentWorkspace: vi.fn(() => "/workspace/base"),
     prompt: vi.fn(async (input, callbacks: CodexSessionCallbacks) => {
       await onPrompt(callbacks, input);
     }),
@@ -172,9 +178,10 @@ describe("createBot response delivery", () => {
     process.env.QWEN_ASR_SOCKET = "/tmp/telecodex-test-missing-qwen-asr.sock";
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.unstubAllGlobals();
     _resetImportHook();
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
     if (originalVoiceBackend === undefined) {
       delete process.env.VOICE_TRANSCRIPTION_BACKEND;
     } else {
@@ -280,6 +287,374 @@ describe("createBot response delivery", () => {
     expect(bot.api.sendMessage.mock.calls[0][1]).toContain("真正回复。");
   });
 
+  it("prepends Telegram reply style guard before sending user text to Codex", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("短答。");
+      callbacks.onAgentMessage?.("短答。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 70, text: "帮我看下巴黎天气" },
+      api: bot.api,
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const codexInput = session.prompt.mock.calls[0][0] as string;
+    expect(codexInput).toContain("[TELEGRAM REPLY STYLE]");
+    expect(codexInput).toContain("默认不要贴来源、参考资料、citation、URL 或链接清单");
+    expect(codexInput).toContain("帮我看下巴黎天气");
+  });
+
+  it("removes trailing source footers when the user did not ask for sources", async () => {
+    const session = createSession(async (callbacks) => {
+      const reply = [
+        "巴黎下周会比墨尔本热很多，按夏天准备。",
+        "",
+        "来源：",
+        "Le Monde: https://example.com/heatwave",
+        "Weather: https://example.com/weather",
+      ].join("\n");
+      callbacks.onTextDelta(reply);
+      callbacks.onAgentMessage?.(reply);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 71, text: "巴黎和墨尔本夏天天气差多少" },
+      api: bot.api,
+    });
+
+    const sent = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(sent).toContain("巴黎下周会比墨尔本热很多");
+    expect(sent).not.toContain("来源");
+    expect(sent).not.toContain("https://");
+  });
+
+  it.each([
+    "这个错误来源是什么？",
+    "链接失败怎么修？",
+    "官网挂了怎么办？",
+    "我需要知道这个错误来源是什么？",
+    "需要排查链接失败原因",
+    "需要官网恢复方案",
+  ])(
+    "does not treat source/link wording as a citation request: %s",
+    async (requestText) => {
+      const session = createSession(async (callbacks) => {
+        const reply = ["问题在配置。", "", "来源：", "https://example.com/internal"].join("\n");
+        callbacks.onTextDelta(reply);
+        callbacks.onAgentMessage?.(reply);
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig(), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 78, text: requestText },
+        api: bot.api,
+      });
+
+      const sent = bot.api.sendMessage.mock.calls[0][1] as string;
+      expect(sent).toContain("问题在配置。");
+      expect(sent).not.toContain("来源");
+      expect(sent).not.toContain("https://");
+    },
+  );
+
+  it("removes trailing source footers without URLs", async () => {
+    const session = createSession(async (callbacks) => {
+      const reply = ["结论是配置问题。", "", "来源：OpenAI docs"].join("\n");
+      callbacks.onTextDelta(reply);
+      callbacks.onAgentMessage?.(reply);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 79, text: "这个问题怎么回事" },
+      api: bot.api,
+    });
+
+    const sent = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(sent).toContain("结论是配置问题。");
+    expect(sent).not.toContain("来源");
+    expect(sent).not.toContain("OpenAI docs");
+  });
+
+  it("does not expose partial source headings in streaming previews", async () => {
+    let sendsBeforeAgentEnd = -1;
+    let botInstance: any;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(["结论是配置问题。", "", "来源："].join("\n"));
+      await Promise.resolve();
+      sendsBeforeAgentEnd = botInstance.api.sendMessage.mock.calls.length;
+      callbacks.onAgentMessage?.(["结论是配置问题。", "", "来源：OpenAI docs"].join("\n"));
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    botInstance = mockGrammy.bots[0];
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 80, text: "这个问题怎么回事" },
+      api: bot.api,
+    });
+
+    expect(sendsBeforeAgentEnd).toBe(1);
+    const firstVisible = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(firstVisible).toContain("结论是配置问题。");
+    expect(firstVisible).not.toContain("来源");
+  });
+
+  it("does not expose source footers in streaming previews", async () => {
+    let sendsBeforeAgentEnd = -1;
+    let botInstance: any;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(
+        [
+          "巴黎下周会比墨尔本热很多，按夏天准备。",
+          "",
+          "来源：",
+          "https://example.com/weather",
+        ].join("\n"),
+      );
+      await Promise.resolve();
+      sendsBeforeAgentEnd = botInstance.api.sendMessage.mock.calls.length;
+      callbacks.onAgentMessage?.(
+        [
+          "巴黎下周会比墨尔本热很多，按夏天准备。",
+          "",
+          "来源：",
+          "https://example.com/weather",
+        ].join("\n"),
+      );
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    botInstance = mockGrammy.bots[0];
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 73, text: "巴黎和墨尔本夏天天气差多少" },
+      api: bot.api,
+    });
+
+    expect(sendsBeforeAgentEnd).toBe(1);
+    const firstVisible = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(firstVisible).toContain("巴黎下周会比墨尔本热很多");
+    expect(firstVisible).not.toContain("来源");
+    expect(firstVisible).not.toContain("https://");
+  });
+
+  it("keeps substantive source wording that is not a citation footer", async () => {
+    const session = createSession(async (callbacks) => {
+      const reply = "结论：不是 API 问题。\n\n来源不是 API，而是配置。";
+      callbacks.onTextDelta(reply);
+      callbacks.onAgentMessage?.(reply);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 74, text: "这个问题怎么回事" },
+      api: bot.api,
+    });
+
+    const sent = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(sent).toContain("来源不是 API，而是配置");
+  });
+
+  it("keeps source footers when the user explicitly asks for sources", async () => {
+    const session = createSession(async (callbacks) => {
+      const reply = [
+        "巴黎下周会比墨尔本热很多。",
+        "",
+        "来源：",
+        "https://example.com/weather",
+      ].join("\n");
+      callbacks.onTextDelta(reply);
+      callbacks.onAgentMessage?.(reply);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 72, text: "巴黎和墨尔本夏天天气差多少，带来源" },
+      api: bot.api,
+    });
+
+    const sent = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(sent).toContain("来源");
+    expect(sent).toContain("https://example.com/weather");
+  });
+
+  it.each([
+    "官网网址发我",
+    "不要省略来源",
+    "别忘了给链接",
+    "需要来源",
+    "需要链接",
+    "我需要来源",
+    "需要参考资料",
+    "show me the links",
+    "provide the sources",
+    "include the URLs",
+  ])(
+    "keeps source footers for explicit source/link request: %s",
+    async (requestText) => {
+      const session = createSession(async (callbacks) => {
+        const reply = ["官网在这里。", "", "来源：", "https://example.com/official"].join("\n");
+        callbacks.onTextDelta(reply);
+        callbacks.onAgentMessage?.(reply);
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig(), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 75, text: requestText },
+        api: bot.api,
+      });
+
+      const sent = bot.api.sendMessage.mock.calls[0][1] as string;
+      expect(sent).toContain("来源");
+      expect(sent).toContain("https://example.com/official");
+    },
+  );
+
+  it("does not expose voice transcripts before sending them to Codex", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("我听到了。");
+      callbacks.onAgentMessage?.("我听到了。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "voice/private.ogg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      })),
+    );
+    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          return { text: "这段转写只应该进 Codex", durationMs: 1 };
+        }
+      },
+    }));
+
+    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
+
+    await voiceHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 76, voice: { file_id: "voice-private" } },
+      api: bot.api,
+    });
+
+    expect(String(session.prompt.mock.calls[0][0])).toContain("这段转写只应该进 Codex");
+    const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(visibleReplies).toContain("我听到了。");
+    expect(visibleReplies).not.toContain("Transcribed");
+    expect(visibleReplies).not.toContain("这段转写只应该进 Codex");
+  });
+
+  it("places the style guard before staged file instructions for document prompts", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-bot-doc-"));
+    tempDirs.push(workspace);
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("文件收到了。");
+      callbacks.onAgentMessage?.("文件收到了。");
+      callbacks.onAgentEnd();
+    });
+    session.getCurrentWorkspace.mockReturnValue(workspace);
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace }), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "documents/report.txt",
+      file_size: 5,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
+      })),
+    );
+    const documentHandler = bot.__handlers.on.get("message:document");
+
+    await documentHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 77,
+        document: { file_id: "doc-file", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
+        caption: "帮我总结",
+      },
+      api: bot.api,
+    });
+
+    const input = session.prompt.mock.calls[0][0] as { stagedFileInstructions?: string; text?: string };
+    expect(input.stagedFileInstructions?.startsWith("[TELEGRAM REPLY STYLE]")).toBe(true);
+    expect(input.stagedFileInstructions).toContain("staged on disk");
+    expect(input.text).toBe("帮我总结");
+  });
+
   it("keeps streaming agent deltas when response streaming is enabled", async () => {
     let sendsBeforeAgentEnd = -1;
     let botInstance: any;
@@ -348,7 +723,7 @@ describe("createBot response delivery", () => {
     await firstPromise;
 
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(session.prompt.mock.calls[1][0]).toBe("第二条，必须排队进 Codex");
+    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条，必须排队进 Codex");
     expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).not.toContain(
       "Still working on previous message",
     );
@@ -425,7 +800,7 @@ describe("createBot response delivery", () => {
     await firstPromise;
 
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(session.prompt.mock.calls[1][0]).toBe("这是忙时发来的语音转写");
+    expect(String(session.prompt.mock.calls[1][0])).toContain("这是忙时发来的语音转写");
   });
 
   it("preserves Telegram arrival order when a voice transcription finishes after a later text arrives", async () => {
@@ -506,8 +881,8 @@ describe("createBot response delivery", () => {
     await voicePromise;
 
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
-    expect(session.prompt.mock.calls[1][0]).toBe("稍后完成的语音转写");
-    expect(session.prompt.mock.calls[2][0]).toBe("语音后面发来的文字");
+    expect(String(session.prompt.mock.calls[1][0])).toContain("稍后完成的语音转写");
+    expect(String(session.prompt.mock.calls[2][0])).toContain("语音后面发来的文字");
   });
 
   it("drains later queued text after an earlier voice transcription fails", async () => {
@@ -587,7 +962,7 @@ describe("createBot response delivery", () => {
     await voicePromise;
 
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(session.prompt.mock.calls[1][0]).toBe("语音失败后这条也必须进 Codex");
+    expect(String(session.prompt.mock.calls[1][0])).toContain("语音失败后这条也必须进 Codex");
   });
 
   it("waits for the final Telegram reply before draining the next queued prompt", async () => {
@@ -643,7 +1018,7 @@ describe("createBot response delivery", () => {
     await firstPromise;
 
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(session.prompt.mock.calls[1][0]).toBe("第二条必须等第一条真正发完");
+    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条必须等第一条真正发完");
   });
 });
 

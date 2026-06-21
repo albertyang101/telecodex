@@ -373,7 +373,7 @@ function parseApprovalPolicy(raw: string | undefined): CodexApprovalPolicy {
 
 function parseToolVerbosity(raw: string | undefined): ToolVerbosity {
   if (!raw) {
-    return "summary";
+    return "none";
   }
 
   switch (raw) {
@@ -384,9 +384,9 @@ function parseToolVerbosity(raw: string | undefined): ToolVerbosity {
       return raw;
     default:
       console.warn(
-        `Invalid TOOL_VERBOSITY value: "${raw}". Expected one of: all, summary, errors-only, none. Falling back to "summary".`,
+        `Invalid TOOL_VERBOSITY value: "${raw}". Expected one of: all, summary, errors-only, none. Falling back to "none".`,
       );
-      return "summary";
+      return "none";
   }
 }
 

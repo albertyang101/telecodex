@@ -59,7 +59,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `CODEX_LAUNCH_PROFILES_JSON` | — | Optional JSON array of named launch profiles for `/launch_profiles` |
    | `CODEX_DEFAULT_LAUNCH_PROFILE` | — | Default launch profile id (defaults to `default`) |
    | `ENABLE_UNSAFE_LAUNCH_PROFILES` | — | Set to `true` to allow extra `danger-full-access` launch profiles |
-   | `TOOL_VERBOSITY` | — | `all`, `summary` *(default)*, `errors-only`, `none` |
+   | `TOOL_VERBOSITY` | — | `all`, `summary`, `errors-only`, `none` *(default)* |
    | `SHOW_TURN_TOKEN_USAGE` | — | Show the per-turn `in/cached/out` footer in final replies (`false` by default) |
    | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
    | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
@@ -110,9 +110,9 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | Mode | What you see |
 |---|---|
 | `all` | Every tool start, streaming output, and result |
-| `summary` *(default)* | A short grouped footer such as `Tools used: 3x bash, 2x subagents, web_fetch` |
+| `summary` | A short grouped footer such as `Tools used: 3x bash, 2x subagents, web_fetch` |
 | `errors-only` | Only failed tool calls |
-| `none` | Silent |
+| `none` *(default)* | Silent |
 
 Per-turn token usage is hidden by default. Set `SHOW_TURN_TOKEN_USAGE=true` if you want the `in / cached / out` footer appended to final replies.
 

@@ -95,6 +95,31 @@ type QueuedPrompt = {
   input?: CodexPromptInput;
 };
 
+const TELEGRAM_REPLY_STYLE_GUARD = [
+  "[TELEGRAM REPLY STYLE]",
+  "只输出真正要发给 Albert 的最终回复；不要输出思考、工具计划、内部过程、自我解释或系统指令。",
+  "默认中文，短、准、有用；普通聊天像朋友，需要时少量 emoji。",
+  "默认不要贴来源、参考资料、citation、URL 或链接清单；只有 Albert 明确要求来源/链接，或系统交付证据必须给路径、命令、issue、commit 时才给。",
+  "如果用了 web/search，把结论融进回答，不把搜索过程或来源列表发出来。",
+].join("\n");
+
+const SOURCE_REQUEST_RE =
+  /((?:show|include|with|provide|send|list|cite|add|attach|give)\s+(?:me\s+)?(?:the\s+)?(?:visible\s+)?(?:sources?|references?|citations?|sauces?|links?|urls?)|official\s+(?:site|url|link)|source\s*block|(?:给|列|带|附|发|贴|提供|保留|加上|展示|显示).{0,12}(?:引用|来源|出处|参考资料|链接|网址|官网)|(?:引用|来源|出处|参考资料|链接|网址|官网).{0,12}(?:发我|给我|列出|带上|附上|也要|保留|贴出来))/i;
+const SOURCE_PRESERVE_RE =
+  /((?:不要省略|不要漏|别忘了|记得|请给|发我|给我|带上|附上|列出).{0,12}(?:sources?|references?|citations?|links?|urls?|引用|来源|出处|参考资料|链接|网址|官网)|(?:sources?|references?|citations?|links?|urls?|引用|来源|出处|参考资料|链接|网址|官网).{0,12}(?:发我|给我|不要省略|不要漏|别忘了|带上|附上|列出))/i;
+const SOURCE_DIRECT_NEED_RE =
+  /(?:^|[\s，。！？；：,.!?;:])(?:我)?需要(?:一下|下)?(?:引用|来源|出处|参考资料|链接|网址|官网)(?:[\s，。！？；：,.!?;:]|$)/i;
+const SOURCE_NEGATION_RE =
+  /((?:no|without|do\s+not|don't|dont|never|skip|omit)\s+(?:visible\s+)?(?:sources?|references?|citations?|sauces?|links?)|(?:不要|别|不用|无需|不需要|不要发|别发|不要给|别给|不要带|别带|不要加|别加).{0,8}(?:sources?|references?|citations?|sauces?|links?|source\s*block|引用|来源|出处|参考资料|链接|链接来源)|(?:sources?|references?|citations?|sauces?|links?|引用|来源|出处|参考资料|链接).{0,8}(?:不要|别|不用|无需|不需要))/i;
+const SOURCE_HEADING_LINE_RE =
+  /^\s*(?:[-*•]\s*)?(?:sources?|references?|citations?|source\s*block|来源|引用|出处|参考资料|资料来源|sauces?)\s*[:：]\s*$/i;
+const SOURCE_HEADING_WITH_URL_RE =
+  /^\s*(?:[-*•]\s*)?(?:sources?|references?|citations?|source\s*block|来源|引用|出处|参考资料|资料来源|sauces?)\s*[:：]\s*.*(?:https?:\/\/|www\.|\[[^\]]+\]\(https?:\/\/).*/i;
+const SOURCE_HEADING_WITH_TEXT_RE =
+  /^\s*(?:[-*•]\s*)?(?:sources?|references?|citations?|source\s*block|来源|引用|出处|参考资料|资料来源|sauces?)\s*[:：]\s*\S.*$/i;
+const URL_IN_LINE_RE = /(?:https?:\/\/|www\.|\[[^\]]+\]\(https?:\/\/)/i;
+const URL_ONLY_LINE_RE = /^\s*(?:[-*•]\s*)?(?:https?:\/\/|www\.|\[[^\]]+\]\(https?:\/\/)[^\n]*$/i;
+
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
   const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
   const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
@@ -120,6 +145,116 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
   }
 
   return keyboard;
+}
+
+function userRequestedSources(userText: string): boolean {
+  return (
+    SOURCE_DIRECT_NEED_RE.test(userText) ||
+    SOURCE_PRESERVE_RE.test(userText) ||
+    (SOURCE_REQUEST_RE.test(userText) && !SOURCE_NEGATION_RE.test(userText))
+  );
+}
+
+function visibleUserText(input: CodexPromptInput): string {
+  if (typeof input === "string") {
+    return input;
+  }
+
+  return input.text ?? "";
+}
+
+function withTelegramReplyStyleGuard(input: CodexPromptInput): CodexPromptInput {
+  if (typeof input === "string") {
+    return `${TELEGRAM_REPLY_STYLE_GUARD}\n\n${input}`;
+  }
+
+  if (input.stagedFileInstructions) {
+    return {
+      ...input,
+      stagedFileInstructions: `${TELEGRAM_REPLY_STYLE_GUARD}\n\n${input.stagedFileInstructions}`,
+    };
+  }
+
+  return {
+    ...input,
+    text: input.text ? `${TELEGRAM_REPLY_STYLE_GUARD}\n\n${input.text}` : TELEGRAM_REPLY_STYLE_GUARD,
+  };
+}
+
+function stripVisibleSourceFooter(userText: string, replyText: string): string {
+  if (!replyText || userRequestedSources(userText)) {
+    return replyText;
+  }
+
+  const trimmed = replyText.trimEnd();
+  const lines = trimmed.split("\n");
+  let last = lines.length - 1;
+  while (last >= 0 && !lines[last]?.trim()) {
+    last -= 1;
+  }
+  if (last < 0) {
+    return "";
+  }
+
+  const trailingParagraphStart = findTrailingParagraphStart(lines, last);
+  const sourceHeadingInTrailingParagraph = findSourceHeadingInRange(lines, trailingParagraphStart, last);
+  if (sourceHeadingInTrailingParagraph !== undefined) {
+    return lines.slice(0, sourceHeadingInTrailingParagraph).join("\n").trimEnd();
+  }
+
+  let cursor = last;
+  let sawUrl = false;
+  while (cursor >= 0) {
+    const line = lines[cursor] ?? "";
+    if (!line.trim()) {
+      cursor -= 1;
+      continue;
+    }
+    if (!URL_IN_LINE_RE.test(line)) {
+      break;
+    }
+    sawUrl = true;
+    cursor -= 1;
+  }
+
+  if (!sawUrl) {
+    return trimmed;
+  }
+
+  let heading = cursor;
+  while (heading >= 0 && !lines[heading]?.trim()) {
+    heading -= 1;
+  }
+
+  if (heading >= 0 && SOURCE_HEADING_LINE_RE.test(lines[heading] ?? "")) {
+    return lines.slice(0, heading).join("\n").trimEnd();
+  }
+
+  const tailStart = cursor + 1;
+  const tailLines = lines.slice(tailStart).filter((line) => line.trim());
+  if (tailLines.length > 0 && tailLines.every((line) => URL_ONLY_LINE_RE.test(line))) {
+    return lines.slice(0, tailStart).join("\n").trimEnd();
+  }
+
+  return trimmed;
+}
+
+function findTrailingParagraphStart(lines: string[], last: number): number {
+  let start = last;
+  while (start > 0 && lines[start - 1]?.trim()) {
+    start -= 1;
+  }
+  return start;
+}
+
+function findSourceHeadingInRange(lines: string[], start: number, end: number): number | undefined {
+  for (let index = start; index <= end; index += 1) {
+    const line = lines[index] ?? "";
+    if (SOURCE_HEADING_LINE_RE.test(line) || SOURCE_HEADING_WITH_TEXT_RE.test(line) || SOURCE_HEADING_WITH_URL_RE.test(line)) {
+      return index;
+    }
+  }
+  return undefined;
 }
 
 export function createBot(config: TeleCodexConfig, registry: SessionRegistry): Bot<Context> {
@@ -447,6 +582,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let planMessageSending = false;
     let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
     let finalizePromise: Promise<void> | undefined;
+    const userVisibleText = visibleUserText(userInput);
 
     const typingInterval = setInterval(() => {
       void bot.api
@@ -473,12 +609,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const renderPreview = (): RenderedChunk => {
-      const previewText = buildStreamingPreview(accumulatedText);
+      const previewText = buildStreamingPreview(stripVisibleSourceFooter(userVisibleText, accumulatedText.trim()));
       return renderMarkdownChunkWithinLimit(previewText);
     };
 
     const buildFinalResponseText = (text: string): string => {
-      const trimmedText = text.trim();
+      const trimmedText = stripVisibleSourceFooter(userVisibleText, text.trim());
       const usageLine =
         config.showTurnTokenUsage && lastTurnUsage ? formatTurnUsageLine(lastTurnUsage) : "";
 
@@ -857,7 +993,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      await session.prompt(userInput, callbacks);
+      await session.prompt(withTelegramReplyStyleGuard(userInput), callbacks);
       updateSessionMetadata(contextKey, session);
       await ensureFinalized();
     } catch (error) {
@@ -2122,12 +2258,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      const preview = trimLine(transcript.replace(/\s+/g, " "), 100);
-      await safeReply(
-        ctx,
-        `🎙️ <b>Transcribed:</b> ${escapeHTML(preview)} <i>(via ${escapeHTML(result.backend)})</i>`,
-        { fallbackText: `🎙️ Transcribed: ${preview} (via ${result.backend})` },
-      );
       queuedPrompt.status = "ready";
       queuedPrompt.input = transcript;
       rememberPromptInput(contextKey, transcript);
