@@ -944,6 +944,46 @@ describe("createBot response delivery", () => {
     expect(String(session.prompt.mock.calls[2][0])).toContain("第三条，不能被第二条 reaction 卡住");
   });
 
+  it("keeps the final reaction after a slow receipt reaction settles late", async () => {
+    const slowReceiptReaction = deferred<void>();
+    const finishTurn = deferred<void>();
+    let callCount = 0;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("最终回复。");
+      callbacks.onAgentMessage?.("最终回复。");
+      await finishTurn.promise;
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ enableTelegramReactions: true }), registry as any) as any;
+    bot.api.setMessageReaction.mockImplementation(async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        await slowReceiptReaction.promise;
+      }
+      return true;
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const promptPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 65, text: "只跑一轮" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(bot.api.setMessageReaction).toHaveBeenCalledTimes(1));
+    finishTurn.resolve();
+    await promptPromise;
+
+    expect(reactionEmojiFromCall(bot.api.setMessageReaction.mock.calls.at(-1))).toBe("👍");
+
+    slowReceiptReaction.resolve();
+    await vi.waitFor(() => expect(bot.api.setMessageReaction).toHaveBeenCalledTimes(3));
+    expect(reactionEmojiFromCall(bot.api.setMessageReaction.mock.calls.at(-1))).toBe("👍");
+  });
+
   it("transcribes and queues voice follow-ups that arrive while a Codex turn is still running", async () => {
     const firstTurn = deferred<void>();
     let promptCount = 0;
@@ -1248,6 +1288,62 @@ describe("createBot response delivery", () => {
     expect(String(session.prompt.mock.calls[1][0])).toContain("语音下载超时后这条也必须进 Codex");
   });
 
+  it("drains later queued text after a stuck Telegram getFile times out", async () => {
+    process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = "5";
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("后续文本回复。");
+        callbacks.onAgentMessage?.("后续文本回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn(() => new Promise(() => {}));
+    const textHandler = bot.__handlers.on.get("message:text");
+    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 46, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const voicePromise = voiceHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 47, voice: { file_id: "voice-file-getfile-stuck" } },
+      api: bot.api,
+    });
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 48, text: "getFile 超时后这条也必须进 Codex" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    await expect(Promise.race([voicePromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
+      "resolved",
+    );
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("getFile 超时后这条也必须进 Codex");
+  });
+
   it("waits for the final Telegram reply before draining the next queued prompt", async () => {
     const firstTurn = deferred<void>();
     const firstSend = deferred<{ message_id: number }>();
@@ -1323,4 +1419,9 @@ function deferred<T>(): Deferred<T> {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function reactionEmojiFromCall(call: unknown[] | undefined): string | undefined {
+  const reactions = call?.[2] as Array<{ emoji?: string }> | undefined;
+  return reactions?.[0]?.emoji;
 }

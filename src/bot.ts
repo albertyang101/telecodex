@@ -2739,11 +2739,17 @@ async function downloadTelegramFile(
   fileId: string,
   maxBytes = MAX_AUDIO_FILE_SIZE,
 ): Promise<string> {
-  const file = await api.getFile(fileId);
+  const timeoutMs = getPositiveIntegerEnv(
+    "TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS",
+    DEFAULT_TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS,
+  );
+  const file = await withAbortTimeout(timeoutMs, "Telegram file download", async () => {
+    return await api.getFile(fileId);
+  });
+
   if (!file.file_path) {
     throw new Error("Telegram did not return a file path");
   }
-
   if (file.file_size && file.file_size > maxBytes) {
     throw new Error(
       `Telegram file too large (${Math.round(file.file_size / 1024 / 1024)} MB, max ${Math.round(maxBytes / 1024 / 1024)} MB)`,
@@ -2751,10 +2757,6 @@ async function downloadTelegramFile(
   }
 
   const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-  const timeoutMs = getPositiveIntegerEnv(
-    "TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS",
-    DEFAULT_TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS,
-  );
   const buffer = await withAbortTimeout(timeoutMs, "Telegram file download", async (signal) => {
     const response = await fetch(url, { signal });
     if (!response.ok) {

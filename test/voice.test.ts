@@ -574,6 +574,54 @@ describe("voice transcription", () => {
     expect(result).toContain("OpenAI transcription timed out after 5ms");
   });
 
+  it("times out stuck OpenAI transcription JSON bodies", async () => {
+    process.env.VOICE_TRANSCRIPTION_BACKEND = "openai";
+    process.env.OPENAI_API_KEY = "sk-test";
+    process.env.OPENAI_TRANSCRIPTION_TIMEOUT_MS = "5";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => new Promise(() => {}),
+      }),
+    );
+
+    const result = await Promise.race([
+      transcribeAudio(audioPath).then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      ),
+      delay(50).then(() => "timed-out"),
+    ]);
+
+    expect(result).toContain("OpenAI transcription timed out after 5ms");
+  });
+
+  it("times out stuck OpenAI transcription error bodies", async () => {
+    process.env.VOICE_TRANSCRIPTION_BACKEND = "openai";
+    process.env.OPENAI_API_KEY = "sk-test";
+    process.env.OPENAI_TRANSCRIPTION_TIMEOUT_MS = "5";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        statusText: "Internal Server Error",
+        text: () => new Promise(() => {}),
+      }),
+    );
+
+    const result = await Promise.race([
+      transcribeAudio(audioPath).then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      ),
+      delay(50).then(() => "timed-out"),
+    ]);
+
+    expect(result).toContain("OpenAI transcription timed out after 5ms");
+  });
+
   it("fails closed when VOICE_TRANSCRIPTION_BACKEND=openai but OPENAI_API_KEY is missing", async () => {
     process.env.VOICE_TRANSCRIPTION_BACKEND = "openai";
     _setImportHook(async () => ({
