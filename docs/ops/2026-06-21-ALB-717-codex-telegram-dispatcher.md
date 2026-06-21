@@ -7,6 +7,7 @@ Linear is the control-plane truth. This file is only a local recovery pointer fo
 - Latest runtime evidence comments:
   - Telegram reply/voice proof: https://linear.app/albert-yang/issue/ALB-717/codex-dispatcher-native-telegram-ux-parity-typing-reactions#comment-225093af
   - Mailbox proof: https://linear.app/albert-yang/issue/ALB-717/codex-dispatcher-native-telegram-ux-parity-typing-reactions#comment-0198493b
+  - Busy queue + voice + typing + reaction proof: Linear comment `36896549-2ab1-4792-a9b1-e5546963831f`
 - Branch: `alb-717-native-telegram-queue`
 - Runtime bot: `@albert_v3_xpx_bot`
 - Runtime launchd label: `com.albert.albert-v3-codex-dispatcher`
@@ -60,3 +61,25 @@ Open items stay in Linear, not here:
 - Build the CodexBot Agent Skill after the design/spec has closed; tracked by ALB-716.
 - Validate runtime discipline end to end on THEO/testboard; tracked by ALB-714 / ALB-698.
 - GitHub branch/PR sync and Albert acceptance before closing ALB-717.
+
+2026-06-22 live proof addendum:
+
+- Runtime branch: `alb-717-native-telegram-queue`.
+- Runtime launchd state: `com.albert.albert-v3-codex-dispatcher` running, pid `64147`, last exit `(never exited)`.
+- Runtime env proof: `CODEX_MODEL=gpt-5.5`, `CODEX_REASONING_EFFORT=xhigh`, `VOICE_TRANSCRIPTION_BACKEND=qwen`, `ENABLE_TELEGRAM_REACTIONS=true`, `STREAM_AGENT_RESPONSES=false`.
+- Fresh Mac mini verification:
+  - `npm test -- --run test/bot.test.ts test/voice.test.ts`: 73 tests passed.
+  - `npm run build`: `tsc` passed.
+  - `npm test`: 19 files / 290 tests passed.
+- Isolated ASR probe:
+  - Generated `/tmp/alb717_voice_probe.ogg`.
+  - Qwen via `dist/voice.js` returned `阿尔伯特，忙时语音队列验证，请回复 Voice Queue OK。`, backend `qwen`, duration `459ms`.
+- Live THEO proof via Pyrogram against `@albert_v3_xpx_bot`:
+  - Nonce: `ALB717_20260622T061200Z`.
+  - Sent sequence while first turn was busy: long text requiring real `sleep 25`, then queued text, queued voice, queued text.
+  - Replies arrived in order: `ALB717_20260622T061200Z_FIRST_DONE`, `ALB717_20260622T061200Z_TEXT1_DONE`, `Voice Queue OK`, `ALB717_20260622T061200Z_TEXT2_DONE`.
+  - Captured 13 raw Telegram typing updates.
+  - Captured reaction snapshots moving through receipt and completion states; final queued text/voice snapshots reached thumbs-up.
+  - `contains_transcript_echo=false`; the voice transcript was not emitted as a standalone visible Telegram message.
+  - Full JSON: `/tmp/alb717_live_probe_result.json` on Mac mini.
+- Log note: old `getUpdates 409 Conflict` entries are stale; `telecodex.launchd.err.log` mtime was before current pid start, process check found only one TeleCodex node, and the live proof succeeded after that log timestamp.
