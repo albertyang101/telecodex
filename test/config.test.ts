@@ -41,6 +41,7 @@ describe("loadConfig", () => {
     delete process.env.MAILBOX_MAX_MESSAGES_PER_TICK;
     delete process.env.MAILBOX_MIN_SENT_AT;
     delete process.env.TELEGRAM_TRANSPORT_MCP_ENABLED;
+    delete process.env.TELEGRAM_TRANSPORT_MCP_AUTO_APPROVE_SENDS;
     delete process.env.TELEGRAM_TRANSPORT_MCP_SERVER_NAME;
     delete process.env.TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH;
     delete process.env.TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES;
@@ -145,6 +146,7 @@ describe("loadConfig", () => {
         mcpServerName: "telegram_transport",
         personasStatePath: path.join(homedir(), "code", "claude", "state", "personas.json"),
         blockedPersonaPrefixes: ["dadamia_"],
+        autoApproveSends: false,
         startupTimeoutMs: 10_000,
         toolTimeoutMs: 30_000,
       },
@@ -414,6 +416,7 @@ describe("loadConfig", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
     process.env.TELEGRAM_TRANSPORT_MCP_ENABLED = "true";
+    process.env.TELEGRAM_TRANSPORT_MCP_AUTO_APPROVE_SENDS = "true";
     process.env.TELEGRAM_TRANSPORT_MCP_SERVER_NAME = "telegram_transport";
     process.env.TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH = "/Users/albert/code/claude/state/personas.json";
     process.env.TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES = "dadamia_,paperclip_";
@@ -427,6 +430,7 @@ describe("loadConfig", () => {
       mcpServerName: "telegram_transport",
       personasStatePath: "/Users/albert/code/claude/state/personas.json",
       blockedPersonaPrefixes: ["dadamia_", "paperclip_"],
+      autoApproveSends: true,
       startupTimeoutMs: 15_000,
       toolTimeoutMs: 45_000,
     });

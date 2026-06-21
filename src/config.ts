@@ -34,6 +34,7 @@ export interface TelegramTransportConfig {
   mcpServerName: string;
   personasStatePath: string;
   blockedPersonaPrefixes: string[];
+  autoApproveSends: boolean;
   startupTimeoutMs: number;
   toolTimeoutMs: number;
 }
@@ -322,6 +323,10 @@ function parseTelegramTransportConfig(): TelegramTransportConfig {
     blockedPersonaPrefixes: parseCommaList(
       optionalString(process.env.TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES),
       ["dadamia_"],
+    ),
+    autoApproveSends: parseBooleanEnv(
+      optionalString(process.env.TELEGRAM_TRANSPORT_MCP_AUTO_APPROVE_SENDS),
+      false,
     ),
     startupTimeoutMs: parsePositiveIntegerEnv(
       optionalString(process.env.TELEGRAM_TRANSPORT_MCP_STARTUP_TIMEOUT_MS),

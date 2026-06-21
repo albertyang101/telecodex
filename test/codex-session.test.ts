@@ -137,6 +137,7 @@ describe("CodexSessionService", () => {
       mcpServerName: "telegram_transport",
       personasStatePath: "/Users/albert/code/claude/state/personas.json",
       blockedPersonaPrefixes: ["dadamia_"],
+      autoApproveSends: false,
       startupTimeoutMs: 10_000,
       toolTimeoutMs: 30_000,
     },
@@ -259,6 +260,7 @@ describe("CodexSessionService", () => {
           mcpServerName: "telegram_transport",
           personasStatePath: "/Users/albert/code/claude/state/personas.json",
           blockedPersonaPrefixes: ["dadamia_"],
+          autoApproveSends: true,
           startupTimeoutMs: 10_000,
           toolTimeoutMs: 30_000,
         },
@@ -280,6 +282,8 @@ describe("CodexSessionService", () => {
                 "TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH",
                 "TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES",
               ],
+              default_tools_approval_mode: "approve",
+              enabled_tools: ["send_cross_persona_message"],
               startup_timeout_sec: 10,
               tool_timeout_sec: 30,
             },
@@ -292,6 +296,28 @@ describe("CodexSessionService", () => {
         }),
       }),
     );
+  });
+
+  it("does not auto-approve Telegram transport MCP sends unless explicitly enabled", async () => {
+    await CodexSessionService.create(
+      createConfig({
+        telegramTransport: {
+          enabled: true,
+          mcpServerName: "telegram_transport",
+          personasStatePath: "/Users/albert/code/claude/state/personas.json",
+          blockedPersonaPrefixes: ["dadamia_"],
+          autoApproveSends: false,
+          startupTimeoutMs: 10_000,
+          toolTimeoutMs: 30_000,
+        },
+      }),
+    );
+
+    const mcpConfig = mockState.createdCodexOptions[0].config.mcp_servers.telegram_transport;
+    expect(mcpConfig).toMatchObject({
+      enabled_tools: ["send_cross_persona_message"],
+    });
+    expect(mcpConfig).not.toHaveProperty("default_tools_approval_mode");
   });
 
   it("can defer thread creation so launch settings apply before the first thread starts", async () => {

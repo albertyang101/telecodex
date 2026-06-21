@@ -553,7 +553,7 @@ function buildTelegramTransportMcpConfig(config: TeleCodexConfig): CodexConfigOb
   }
 
   const command = buildTelegramTransportMcpCommand();
-  return {
+  const mcpConfig: CodexConfigObject = {
     command: command.command,
     args: command.args,
     env_vars: [
@@ -561,9 +561,16 @@ function buildTelegramTransportMcpConfig(config: TeleCodexConfig): CodexConfigOb
       "TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH",
       "TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES",
     ],
+    enabled_tools: ["send_cross_persona_message"],
     startup_timeout_sec: Math.ceil(config.telegramTransport.startupTimeoutMs / 1000),
     tool_timeout_sec: Math.ceil(config.telegramTransport.toolTimeoutMs / 1000),
   };
+
+  if (config.telegramTransport.autoApproveSends) {
+    mcpConfig.default_tools_approval_mode = "approve";
+  }
+
+  return mcpConfig;
 }
 
 function buildTelegramTransportMcpCommand(): { command: string; args: string[] } {

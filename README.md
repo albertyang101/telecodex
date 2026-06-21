@@ -66,6 +66,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
    | `ENABLE_TELEGRAM_REACTIONS` | — | Enable Telegram emoji reactions like 👀 / 👍 (`false` by default) |
    | `TELEGRAM_TRANSPORT_MCP_ENABLED` | — | Enable the CC-style `telegram_transport` MCP server for direct cross-persona Telegram sends (`false` by default) |
+   | `TELEGRAM_TRANSPORT_MCP_AUTO_APPROVE_SENDS` | — | Auto-approve the direct Telegram send MCP tool for non-interactive dispatcher runs. This can post real Telegram messages; keep `false` unless the runtime is isolated and explicitly allowed. |
    | `TELEGRAM_TRANSPORT_MCP_SERVER_NAME` | — | MCP server name injected into Codex CLI (default `telegram_transport`) |
    | `TELEGRAM_TRANSPORT_PERSONAS_STATE_PATH` | — | Path to `{chat_id: persona_name}` mapping, default `~/code/claude/state/personas.json` |
    | `TELEGRAM_TRANSPORT_BLOCKED_PERSONA_PREFIXES` | — | Comma-separated persona prefixes blocked from direct sends (default `dadamia_`) |
