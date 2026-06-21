@@ -124,6 +124,34 @@ describe("mailbox bridge", () => {
     });
   });
 
+  it("ignores unsafe frontmatter path segments before processing", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const inboundPath = writeMailboxMessage({
+      personasRoot,
+      sender: "safe-file-sender",
+      frontmatterSender: "../outside",
+      recipient: "albert-v3",
+      msgId: "safe-file-id",
+      frontmatterMsgId: "../escape",
+      subject: "Unsafe path fields",
+      body: "This should not reach Codex or create files outside the mailbox.",
+    });
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("should not run");
+      callbacks.onAgentEnd();
+    });
+
+    const result = await runMailboxDeliveryOnce(createConfig({ personasRoot, workspace }), createRegistry(session) as never);
+
+    expect(result).toEqual({ processed: 0, replied: 0, skipped: 0 });
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(existsSync(inboundPath)).toBe(true);
+    expect(existsSync(path.join(personasRoot, "_shared", "memory", "outside"))).toBe(false);
+    expect(existsSync(path.join(personasRoot, "_shared", "memory", "mailbox", "_receipts", "escape.json"))).toBe(false);
+  });
+
   it("skips historical backlog before MAILBOX_MIN_SENT_AT", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
@@ -328,6 +356,81 @@ describe("mailbox bridge", () => {
     );
   });
 
+  it("uses current time for auto-replies instead of the incoming sent_at", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "reply-time",
+      sentAt: "2026-06-21T00:00:00Z",
+      subject: "Reply time",
+      body: "Reply timestamp should be generated at send time.",
+    });
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("fresh reply time");
+      callbacks.onAgentEnd();
+    });
+
+    const result = await runMailboxDeliveryOnce(createConfig({ personasRoot, workspace }), createRegistry(session) as never);
+
+    expect(result).toEqual({ processed: 1, replied: 1, skipped: 0 });
+    const replies = await readdir(path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox"));
+    const replyText = readFileSync(path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox", replies[0]!), "utf8");
+    expect(replyText).not.toContain("sent_at: 2026-06-21T00:00:00Z");
+  });
+
+  it("keeps the inbox message recoverable if receipt persistence fails after archive copy", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const inboundPath = writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "receipt-fails",
+      subject: "Receipt fails",
+      body: "Inbox should remain if downstream persistence fails.",
+    });
+    const brokenReceiptDir = path.join(
+      personasRoot,
+      "_shared",
+      "memory",
+      "mailbox",
+      "_receipts",
+      "albert-v3",
+    );
+    mkdirRecursive(path.dirname(brokenReceiptDir));
+    writeFileSync(brokenReceiptDir, "not a directory", "utf8");
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("NO_REPLY");
+      callbacks.onAgentEnd();
+    });
+
+    await expect(
+      runMailboxDeliveryOnce(createConfig({ personasRoot, workspace }), createRegistry(session) as never),
+    ).rejects.toThrow();
+
+    expect(existsSync(inboundPath)).toBe(true);
+    expect(
+      existsSync(
+        path.join(
+          personasRoot,
+          "_shared",
+          "memory",
+          "mailbox",
+          "albert-v3",
+          "archive",
+          "2026-06",
+          path.basename(inboundPath),
+        ),
+      ),
+    ).toBe(true);
+    expect(existsSync(path.join(workspace, ".telecodex", "mailbox_seen_albert-v3.json"))).toBe(false);
+  });
+
   it("ignores misfiled messages whose frontmatter recipient does not match the bridge persona", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
@@ -454,8 +557,10 @@ function createRegistry(session: unknown) {
 function writeMailboxMessage(input: {
   personasRoot: string;
   sender: string;
+  frontmatterSender?: string;
   recipient: string;
   msgId: string;
+  frontmatterMsgId?: string;
   sentAt?: string;
   subject: string;
   body: string;
@@ -480,10 +585,10 @@ function writeMailboxMessage(input: {
     file,
     [
       "---",
-      `from: ${input.sender}`,
+      `from: ${input.frontmatterSender ?? input.sender}`,
       `to: ${input.frontmatterRecipient ?? input.recipient}`,
       `sent_at: ${sentAt}`,
-      `msg_id: ${input.msgId}`,
+      `msg_id: ${input.frontmatterMsgId ?? input.msgId}`,
       "status: unread",
       `in_reply_to: ${input.inReplyTo ?? ""}`,
       `subject: ${input.subject}`,

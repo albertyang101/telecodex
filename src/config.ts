@@ -287,7 +287,7 @@ function parseMailboxBridgeConfig(): MailboxBridgeConfig {
       1,
       "MAILBOX_MAX_MESSAGES_PER_TICK",
     ),
-    minSentAt: optionalString(process.env.MAILBOX_MIN_SENT_AT),
+    minSentAt: parseMailboxMinSentAt(optionalString(process.env.MAILBOX_MIN_SENT_AT)),
   };
 }
 
@@ -300,12 +300,45 @@ function validateMailboxBridgeLaunch(
     return;
   }
 
+  if (mailboxBridge.persona && !isSafeMailboxSegment(mailboxBridge.persona)) {
+    throw new Error("MAILBOX_PERSONA must be a safe single path segment");
+  }
+
   const profile = findLaunchProfile(launchProfiles, defaultLaunchProfileId);
   if (profile?.sandboxMode === "read-only" && profile.approvalPolicy === "never") {
     return;
   }
 
   throw new Error("MAILBOX_PERSONA requires the default Codex launch profile to be read-only / never");
+}
+
+function parseMailboxMinSentAt(raw: string | undefined): string | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  if (parseMailboxTimestampMs(raw) === undefined) {
+    throw new Error("MAILBOX_MIN_SENT_AT must be an ISO or compact UTC timestamp");
+  }
+
+  return raw;
+}
+
+function parseMailboxTimestampMs(value: string): number | undefined {
+  const compact = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(value);
+  const isoUtc = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value);
+  if (!compact && !isoUtc) {
+    return undefined;
+  }
+  const normalized = compact
+    ? `${compact[1]}-${compact[2]}-${compact[3]}T${compact[4]}:${compact[5]}:${compact[6]}Z`
+    : value;
+  const parsed = Date.parse(normalized);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+function isSafeMailboxSegment(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value);
 }
 
 function parseSandboxMode(raw: string | undefined): CodexSandboxMode {

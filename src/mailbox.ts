@@ -9,6 +9,7 @@ import type { SessionRegistry } from "./session-registry.js";
 
 const MAILBOX_REL = ["_shared", "memory", "mailbox"] as const;
 const BRIDGE_DELIVERED_BY = "telecodex-mailbox-bridge";
+const SAFE_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 interface MailboxMessage {
   from: string;
@@ -48,6 +49,7 @@ export async function runMailboxDeliveryOnce(
   if (!settings.enabled || !settings.persona) {
     return { processed: 0, replied: 0, skipped: 0 };
   }
+  assertSafeSegment(settings.persona, "MAILBOX_PERSONA");
 
   const contextKey = mailboxContextKey(settings);
   const statePath = mailboxSeenStatePath(config.workspace, settings.persona);
@@ -97,9 +99,10 @@ export async function runMailboxDeliveryOnce(
     seen.messages[message.msgId] = {
       processedAt: new Date().toISOString(),
       from: message.from,
-      path: message.path,
+      path: archivePath,
     };
     await saveSeenState(statePath, seen);
+    await unlink(message.path).catch(() => undefined);
     registry.updateMetadata(contextKey, session);
     processed += 1;
   }
@@ -152,7 +155,7 @@ function mailboxContextKey(settings: MailboxBridgeConfig): TelegramContextKey {
 }
 
 function mailboxRoot(settings: MailboxBridgeConfig): string {
-  return path.join(settings.personasRoot, ...MAILBOX_REL);
+  return path.resolve(settings.personasRoot, ...MAILBOX_REL);
 }
 
 function isAfterMinSentAt(settings: MailboxBridgeConfig, message: MailboxMessage): boolean {
@@ -165,7 +168,7 @@ function isAfterMinSentAt(settings: MailboxBridgeConfig, message: MailboxMessage
     return false;
   }
   if (minTime === undefined) {
-    return true;
+    throw new Error("MAILBOX_MIN_SENT_AT must be an ISO or compact UTC timestamp");
   }
   return messageTime >= minTime;
 }
@@ -195,19 +198,19 @@ async function markHistoricalSkipped(
 }
 
 function inboxDir(settings: MailboxBridgeConfig, persona: string): string {
-  return path.join(mailboxRoot(settings), persona, "inbox");
+  return mailboxPath(settings, safeSegment(persona), "inbox");
 }
 
 function archiveDir(settings: MailboxBridgeConfig, persona: string, month: string): string {
-  return path.join(mailboxRoot(settings), persona, "archive", month);
+  return mailboxPath(settings, safeSegment(persona), "archive", safeSegment(month));
 }
 
 function eventsDir(settings: MailboxBridgeConfig, persona: string): string {
-  return path.join(mailboxRoot(settings), "_events", persona);
+  return mailboxPath(settings, "_events", safeSegment(persona));
 }
 
 function receiptsDir(settings: MailboxBridgeConfig, persona: string): string {
-  return path.join(mailboxRoot(settings), "_receipts", persona);
+  return mailboxPath(settings, "_receipts", safeSegment(persona));
 }
 
 async function listInboxMessages(settings: MailboxBridgeConfig): Promise<MailboxMessage[]> {
@@ -253,9 +256,9 @@ async function readMailboxMessage(file: string): Promise<MailboxMessage | undefi
     return undefined;
   }
 
-  const msgId = parsed.frontmatter.msg_id?.trim();
-  const from = parsed.frontmatter.from?.trim();
-  const to = parsed.frontmatter.to?.trim();
+  const msgId = safeOptionalSegment(parsed.frontmatter.msg_id);
+  const from = safeOptionalSegment(parsed.frontmatter.from);
+  const to = safeOptionalSegment(parsed.frontmatter.to);
   if (!msgId || !from || !to) {
     return undefined;
   }
@@ -315,7 +318,7 @@ async function listDeliveryEvents(settings: MailboxBridgeConfig): Promise<Delive
     const file = path.join(dir, name);
     try {
       const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
-      if (raw.to !== persona || typeof raw.msg_id !== "string") {
+      if (raw.to !== persona || typeof raw.msg_id !== "string" || !isSafeSegment(raw.msg_id)) {
         continue;
       }
       events.push({
@@ -405,7 +408,7 @@ async function sendMailboxReply(
   const sender = incoming.to;
   const recipient = incoming.from;
   const msgId = `reply-${incoming.msgId}`;
-  const sentAt = incoming.sentAt || new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const sentAt = currentMailboxTimestamp();
   const dir = inboxDir(settings, recipient);
   await mkdir(dir, { recursive: true });
   const file = path.join(dir, `${sender}-reply-${safeFilePart(incoming.msgId)}.md`);
@@ -482,7 +485,7 @@ async function writeDeliveryEvent(
   await mkdir(path.join(dir, "archive"), { recursive: true });
   const eventPath = path.join(
     dir,
-    `${safeFilePart(input.sentAt.replace(/[-:]/g, ""))}-${safeFilePart(input.msgId)}.json`,
+    `${safeFilePart(input.msgId)}.json`,
   );
   await writeAtomicJson(eventPath, {
     event_id: `mailbox:${input.msgId}`,
@@ -517,7 +520,6 @@ async function archiveInboxMessage(settings: MailboxBridgeConfig, message: Mailb
       body: stripMailboxTitle(message),
     }),
   );
-  await unlink(message.path).catch(() => undefined);
   return archivePath;
 }
 
@@ -611,6 +613,43 @@ function safeFilePart(value: string): string {
   return value.replace(/[^A-Za-z0-9_.-]/g, "_");
 }
 
+function currentMailboxTimestamp(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function mailboxPath(settings: MailboxBridgeConfig, ...segments: string[]): string {
+  const root = mailboxRoot(settings);
+  const target = path.resolve(root, ...segments);
+  const relative = path.relative(root, target);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("Mailbox path escaped the mailbox root");
+  }
+  return target;
+}
+
+function safeOptionalSegment(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || !isSafeSegment(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+function safeSegment(value: string): string {
+  assertSafeSegment(value, "mailbox path segment");
+  return value;
+}
+
+function assertSafeSegment(value: string, name: string): void {
+  if (!isSafeSegment(value)) {
+    throw new Error(`${name} must be a safe single path segment`);
+  }
+}
+
+function isSafeSegment(value: string): boolean {
+  return SAFE_SEGMENT_RE.test(value);
+}
+
 function optionalMailboxField(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) {
@@ -632,6 +671,10 @@ function parseMailboxTimestampMs(value: string): number | undefined {
   }
 
   const compact = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(trimmed);
+  const isoUtc = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(trimmed);
+  if (!compact && !isoUtc) {
+    return undefined;
+  }
   const normalized = compact
     ? `${compact[1]}-${compact[2]}-${compact[3]}T${compact[4]}:${compact[5]}:${compact[6]}Z`
     : trimmed;

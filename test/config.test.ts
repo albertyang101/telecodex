@@ -404,6 +404,17 @@ describe("loadConfig", () => {
     );
   });
 
+  it("rejects invalid MAILBOX_MIN_SENT_AT values instead of disabling the cutoff", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_SANDBOX_MODE = "read-only";
+    process.env.CODEX_APPROVAL_POLICY = "never";
+    process.env.MAILBOX_PERSONA = "albert-v3";
+    process.env.MAILBOX_MIN_SENT_AT = "not-a-date";
+
+    expect(() => loadConfig()).toThrow("MAILBOX_MIN_SENT_AT must be an ISO or compact UTC timestamp");
+  });
+
   it("parses STREAM_AGENT_RESPONSES boolean values", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
