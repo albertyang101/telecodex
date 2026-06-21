@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -16,6 +16,7 @@ describe("loadConfig", () => {
     delete process.env.TELEGRAM_BOT_TOKEN;
     delete process.env.TELEGRAM_ALLOWED_USER_IDS;
     delete process.env.CODEX_API_KEY;
+    delete process.env.CODEX_PATH;
     delete process.env.CODEX_MODEL;
     delete process.env.CODEX_SANDBOX_MODE;
     delete process.env.CODEX_APPROVAL_POLICY;
@@ -23,6 +24,7 @@ describe("loadConfig", () => {
     delete process.env.CODEX_DEFAULT_LAUNCH_PROFILE;
     delete process.env.ENABLE_UNSAFE_LAUNCH_PROFILES;
     delete process.env.TOOL_VERBOSITY;
+    delete process.env.STREAM_AGENT_RESPONSES;
     delete process.env.SHOW_TURN_TOKEN_USAGE;
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
@@ -52,9 +54,14 @@ describe("loadConfig", () => {
   });
 
   it("parses a valid config correctly", () => {
+    const codexPath = path.join(tempDir, "codex");
+    writeFileSync(codexPath, "#!/bin/sh\n");
+    chmodSync(codexPath, 0o755);
+
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123,456";
     process.env.CODEX_API_KEY = "secret-key";
+    process.env.CODEX_PATH = codexPath;
     process.env.CODEX_MODEL = "o3";
     process.env.CODEX_SANDBOX_MODE = "danger-full-access";
     process.env.CODEX_APPROVAL_POLICY = "on-request";
@@ -69,6 +76,7 @@ describe("loadConfig", () => {
       workspace: process.cwd(),
       maxFileSize: 20 * 1024 * 1024,
       codexApiKey: "secret-key",
+      codexPathOverride: codexPath,
       codexModel: "o3",
       codexSandboxMode: "danger-full-access",
       codexApprovalPolicy: "on-request",
@@ -98,6 +106,7 @@ describe("loadConfig", () => {
       defaultLaunchProfileId: "default",
       enableUnsafeLaunchProfiles: false,
       toolVerbosity: "all",
+      streamAgentResponses: true,
       showTurnTokenUsage: false,
       enableTelegramLogin: true,
       enableTelegramReactions: false,
@@ -111,6 +120,7 @@ describe("loadConfig", () => {
     const config = loadConfig();
 
     expect(config.codexApiKey).toBeUndefined();
+    expect(config.codexPathOverride).toBeUndefined();
     expect(config.codexModel).toBeUndefined();
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
     expect(config.codexSandboxMode).toBe("workspace-write");
@@ -141,10 +151,38 @@ describe("loadConfig", () => {
     expect(config.defaultLaunchProfileId).toBe("default");
     expect(config.enableUnsafeLaunchProfiles).toBe(false);
     expect(config.toolVerbosity).toBe("summary");
+    expect(config.streamAgentResponses).toBe(true);
     expect(config.showTurnTokenUsage).toBe(false);
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
     expect(config.workspace).toBe(process.cwd());
+  });
+
+  it("throws when CODEX_PATH is relative", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_PATH = "codex";
+
+    expect(() => loadConfig()).toThrow("CODEX_PATH must be an absolute path");
+  });
+
+  it("throws when CODEX_PATH does not exist", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_PATH = path.join(tempDir, "missing-codex");
+
+    expect(() => loadConfig()).toThrow("CODEX_PATH does not exist");
+  });
+
+  it("throws when CODEX_PATH is not executable", () => {
+    const codexPath = path.join(tempDir, "codex");
+    writeFileSync(codexPath, "#!/bin/sh\n");
+    chmodSync(codexPath, 0o644);
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_PATH = codexPath;
+
+    expect(() => loadConfig()).toThrow("CODEX_PATH is not executable");
   });
 
   it("throws when a user id is invalid", () => {
@@ -303,6 +341,30 @@ describe("loadConfig", () => {
     delete process.env.SHOW_TURN_TOKEN_USAGE;
     const config = loadConfig();
     expect(config.showTurnTokenUsage).toBe(false);
+  });
+
+  it("parses STREAM_AGENT_RESPONSES boolean values", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+
+    const truthyValues = ["true", "1", "yes"];
+    const falsyValues = ["false", "0", "no"];
+
+    for (const value of truthyValues) {
+      process.env.STREAM_AGENT_RESPONSES = value;
+      const config = loadConfig();
+      expect(config.streamAgentResponses).toBe(true);
+    }
+
+    for (const value of falsyValues) {
+      process.env.STREAM_AGENT_RESPONSES = value;
+      const config = loadConfig();
+      expect(config.streamAgentResponses).toBe(false);
+    }
+
+    delete process.env.STREAM_AGENT_RESPONSES;
+    const config = loadConfig();
+    expect(config.streamAgentResponses).toBe(true);
   });
 
   it("falls back to defaults for invalid optional enum values", () => {

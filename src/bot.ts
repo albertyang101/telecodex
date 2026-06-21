@@ -289,9 +289,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
     const toolVerbosity: ToolVerbosity = config.toolVerbosity;
+    const streamAgentResponses = config.streamAgentResponses;
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
     let accumulatedText = "";
+    let completedAgentText = "";
     let responseMessageId: number | undefined;
     let responseMessagePromise: Promise<void> | undefined;
     let lastRenderedText = "";
@@ -354,6 +356,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
 
       return trimmedText;
+    };
+
+    const finalResponseSourceText = (): string => {
+      if (!streamAgentResponses && completedAgentText) {
+        return completedAgentText;
+      }
+      return accumulatedText;
     };
 
     const ensureResponseMessage = async (): Promise<void> => {
@@ -503,7 +512,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
       }
 
-      const finalText = buildFinalResponseText(accumulatedText);
+      const finalText = buildFinalResponseText(finalResponseSourceText());
       if (!finalText) {
         const html = "<b>✅ Done</b>";
         const plainText = "✅ Done";
@@ -523,6 +532,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const callbacks: CodexSessionCallbacks = {
       onTextDelta: (delta: string) => {
         accumulatedText += delta;
+        if (!streamAgentResponses) {
+          return;
+        }
+
         if (!responseMessageId) {
           void ensureResponseMessage()
             .then(() => {
@@ -535,6 +548,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
 
         scheduleFlush();
+      },
+      onAgentMessage: (text: string) => {
+        completedAgentText = text;
       },
       onToolStart: (toolName: string, toolCallId: string) => {
         if (toolVerbosity === "summary") {
@@ -712,7 +728,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       } else {
         finalized = true;
 
-        const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
+        const failureSourceText = streamAgentResponses ? accumulatedText : completedAgentText;
+        const combinedText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
         const chunks = splitMarkdownForTelegram(combinedText);
         try {
           await deliverRenderedChunks(chunks);

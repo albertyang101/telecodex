@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import {
@@ -22,6 +22,7 @@ export interface TeleCodexConfig {
   workspace: string;
   maxFileSize: number;
   codexApiKey?: string;
+  codexPathOverride?: string;
   codexModel?: string;
   codexSandboxMode: CodexSandboxMode;
   codexApprovalPolicy: CodexApprovalPolicy;
@@ -29,6 +30,7 @@ export interface TeleCodexConfig {
   defaultLaunchProfileId: string;
   enableUnsafeLaunchProfiles: boolean;
   toolVerbosity: ToolVerbosity;
+  streamAgentResponses: boolean;
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
@@ -42,6 +44,7 @@ export function loadConfig(): TeleCodexConfig {
   const workspace = resolveWorkspace();
   const maxFileSize = parseMaxFileSize(optionalString(process.env.MAX_FILE_SIZE));
   const codexApiKey = optionalString(process.env.CODEX_API_KEY);
+  const codexPathOverride = parseCodexPathOverride(optionalString(process.env.CODEX_PATH));
   const codexModel = optionalString(process.env.CODEX_MODEL);
   const codexSandboxMode = parseSandboxMode(optionalString(process.env.CODEX_SANDBOX_MODE));
   const codexApprovalPolicy = parseApprovalPolicy(optionalString(process.env.CODEX_APPROVAL_POLICY));
@@ -60,6 +63,7 @@ export function loadConfig(): TeleCodexConfig {
     launchProfiles,
   );
   const toolVerbosity = parseToolVerbosity(optionalString(process.env.TOOL_VERBOSITY));
+  const streamAgentResponses = parseBooleanEnv(optionalString(process.env.STREAM_AGENT_RESPONSES), true);
   const showTurnTokenUsage = parseBooleanEnv(optionalString(process.env.SHOW_TURN_TOKEN_USAGE), false);
   const enableTelegramLogin = parseBooleanEnv(optionalString(process.env.ENABLE_TELEGRAM_LOGIN), true);
   const enableTelegramReactions = parseBooleanEnv(
@@ -74,6 +78,7 @@ export function loadConfig(): TeleCodexConfig {
     workspace,
     maxFileSize,
     codexApiKey,
+    codexPathOverride,
     codexModel,
     codexSandboxMode,
     codexApprovalPolicy,
@@ -81,6 +86,7 @@ export function loadConfig(): TeleCodexConfig {
     defaultLaunchProfileId,
     enableUnsafeLaunchProfiles,
     toolVerbosity,
+    streamAgentResponses,
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
@@ -150,6 +156,28 @@ function requireEnv(name: string): string {
 function optionalString(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function parseCodexPathOverride(raw: string | undefined): string | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  if (!path.isAbsolute(raw)) {
+    throw new Error("CODEX_PATH must be an absolute path");
+  }
+
+  if (!existsSync(raw)) {
+    throw new Error(`CODEX_PATH does not exist: ${raw}`);
+  }
+
+  try {
+    accessSync(raw, constants.X_OK);
+  } catch {
+    throw new Error(`CODEX_PATH is not executable: ${raw}`);
+  }
+
+  return raw;
 }
 
 function parseAllowedUserIds(raw: string): number[] {

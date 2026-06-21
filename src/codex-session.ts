@@ -29,6 +29,7 @@ export interface CodexSessionCallbacks {
   onToolStart: (toolName: string, toolCallId: string) => void;
   onToolUpdate: (toolCallId: string, partialResult: string) => void;
   onToolEnd: (toolCallId: string, isError: boolean) => void;
+  onAgentMessage?: (text: string) => void;
   onAgentEnd: () => void;
   onTodoUpdate?: (items: Array<{ text: string; completed: boolean }>) => void;
   onTurnComplete?: (usage: {
@@ -226,6 +227,7 @@ export class CodexSessionService {
                 callbacks.onTextDelta(delta);
               }
               lastAgentText = item.text;
+              callbacks.onAgentMessage?.(item.text);
             } else if (item.type === "command_execution") {
               // Pass any output that arrived only in the completion event (e.g. fast
               // commands that never fired item.updated).
@@ -466,6 +468,7 @@ export class CodexSessionService {
 
   private resetCodexClient(): void {
     this.codex = new Codex({
+      codexPathOverride: this.config.codexPathOverride,
       apiKey: this.config.codexApiKey,
       config: {
         approval_policy: this.currentLaunchProfile.approvalPolicy,

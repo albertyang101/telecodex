@@ -117,6 +117,7 @@ describe("CodexSessionService", () => {
     defaultLaunchProfileId: "default",
     enableUnsafeLaunchProfiles: false,
     toolVerbosity: "summary",
+    streamAgentResponses: true,
     showTurnTokenUsage: false,
     enableTelegramLogin: true,
     enableTelegramReactions: false,
@@ -129,6 +130,7 @@ describe("CodexSessionService", () => {
     onToolUpdate: vi.fn(),
     onToolEnd: vi.fn(),
     onAgentEnd: vi.fn(),
+    onAgentMessage: vi.fn(),
     onTodoUpdate: vi.fn(),
     onTurnComplete: vi.fn(),
   });
@@ -146,10 +148,13 @@ describe("CodexSessionService", () => {
   });
 
   it("creates the service and starts an initial thread", async () => {
-    const service = await CodexSessionService.create(createConfig());
+    const service = await CodexSessionService.create(
+      createConfig({ codexPathOverride: "/opt/homebrew/bin/codex" }),
+    );
 
     expect(mockState.Codex).toHaveBeenCalledWith(
       expect.objectContaining({
+        codexPathOverride: "/opt/homebrew/bin/codex",
         apiKey: "codex-key",
         config: { approval_policy: "never" },
         env: expect.objectContaining({ CODEX_API_KEY: "codex-key" }),
@@ -290,8 +295,30 @@ describe("CodexSessionService", () => {
     await service.prompt("hello", callbacks);
 
     expect(callbacks.onTextDelta.mock.calls.map(([delta]) => delta)).toEqual(["Hel", "lo", " world"]);
+    expect(callbacks.onAgentMessage).toHaveBeenCalledWith("Hello world");
     expect(callbacks.onAgentEnd).toHaveBeenCalledTimes(1);
     expect(service.getInfo().threadId).toBe("thread-123");
+  });
+
+  it("reports each completed agent message as a full message snapshot", async () => {
+    const service = await CodexSessionService.create(createConfig());
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+
+    thread.runStreamed.mockResolvedValueOnce({
+      events: streamEvents([
+        { type: "item.completed", item: { id: "msg-1", type: "agent_message", text: "中间草稿" } },
+        { type: "item.completed", item: { id: "msg-2", type: "agent_message", text: "最终回复" } },
+        { type: "turn.completed", usage },
+      ]),
+    });
+
+    await service.prompt("hello", callbacks);
+
+    expect(callbacks.onAgentMessage.mock.calls.map(([text]) => text)).toEqual([
+      "中间草稿",
+      "最终回复",
+    ]);
   });
 
   it("maps command_execution events to tool callbacks", async () => {
