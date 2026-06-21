@@ -154,6 +154,7 @@ describe("createBot response delivery", () => {
       threadId: "thread-1",
       workspace: "/workspace/base",
       model: "gpt-5.5",
+      reasoningEffort: "xhigh",
       launchProfileId: "default",
       launchProfileLabel: "Default",
       launchProfileBehavior: "workspace-write / never",
@@ -310,6 +311,34 @@ describe("createBot response delivery", () => {
     expect(codexInput).toContain("[TELEGRAM REPLY STYLE]");
     expect(codexInput).toContain("默认不要贴来源、参考资料、citation、URL 或链接清单");
     expect(codexInput).toContain("帮我看下巴黎天气");
+  });
+
+  it("adds runtime identity facts before sending normal user text to Codex", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("我知道当前运行配置。");
+      callbacks.onAgentMessage?.("我知道当前运行配置。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 72, text: "你是谁，用的什么模型和 effort？" },
+      api: bot.api,
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const codexInput = String(session.prompt.mock.calls[0][0]);
+    expect(codexInput).toContain("[CURRENT CONTEXT]");
+    expect(codexInput).toContain("You are Albert Codex Dispatcher backend for Telegram.");
+    expect(codexInput).toContain("Current model: gpt-5.5");
+    expect(codexInput).toContain("Current reasoning effort: xhigh");
+    expect(codexInput).not.toMatch(/runtime facts/i);
+    expect(codexInput).toContain("你是谁，用的什么模型和 effort？");
   });
 
   it("removes trailing source footers when the user did not ask for sources", async () => {
@@ -651,8 +680,55 @@ describe("createBot response delivery", () => {
 
     const input = session.prompt.mock.calls[0][0] as { stagedFileInstructions?: string; text?: string };
     expect(input.stagedFileInstructions?.startsWith("[TELEGRAM REPLY STYLE]")).toBe(true);
+    expect(input.stagedFileInstructions).toContain("[CURRENT CONTEXT]");
+    expect(input.stagedFileInstructions).toContain("Current model: gpt-5.5");
+    expect(input.stagedFileInstructions).toContain("Current reasoning effort: xhigh");
+    expect(input.stagedFileInstructions).not.toMatch(/runtime facts/i);
     expect(input.stagedFileInstructions).toContain("staged on disk");
     expect(input.text).toBe("帮我总结");
+  });
+
+  it("adds runtime facts to image prompts while preserving image paths", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("图片收到了。");
+      callbacks.onAgentMessage?.("图片收到了。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "photos/example.jpg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      })),
+    );
+    const photoHandler = bot.__handlers.on.get("message:photo");
+
+    await photoHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 78,
+        photo: [{ file_id: "small-photo" }],
+        caption: "看一下这张图",
+      },
+      api: bot.api,
+    });
+
+    const input = session.prompt.mock.calls[0][0] as { imagePaths?: string[]; text?: string };
+    expect(input.imagePaths).toHaveLength(1);
+    expect(input.imagePaths?.[0]).toContain("telecodex-file-");
+    expect(input.text).toContain("[CURRENT CONTEXT]");
+    expect(input.text).toContain("Current model: gpt-5.5");
+    expect(input.text).toContain("Current reasoning effort: xhigh");
+    expect(input.text).not.toMatch(/runtime facts/i);
+    expect(input.text).toContain("看一下这张图");
   });
 
   it("keeps streaming agent deltas when response streaming is enabled", async () => {

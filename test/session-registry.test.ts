@@ -30,6 +30,8 @@ const mockSessionState = vi.hoisted(() => {
       workspace: string;
       model?: string;
       reasoningEffort?: string;
+      nextModel?: string;
+      nextReasoningEffort?: string;
       launchProfileId: string;
       launchProfileLabel: string;
       launchProfileBehavior: string;
@@ -157,6 +159,8 @@ describe("SessionRegistry", () => {
       workspace?: string;
       model?: string;
       reasoningEffort?: string;
+      nextModel?: string;
+      nextReasoningEffort?: string;
       launchProfileId?: string;
       resumeThreadId?: string;
     }) =>
@@ -165,6 +169,8 @@ describe("SessionRegistry", () => {
         workspace: options?.workspace ?? config.workspace,
         model: options?.model ?? config.codexModel,
         reasoningEffort: options?.reasoningEffort,
+        nextModel: options?.nextModel,
+        nextReasoningEffort: options?.nextReasoningEffort,
         launchProfileId: options?.launchProfileId ?? config.defaultLaunchProfileId,
         launchProfileLabel: options?.launchProfileId === "readonly" ? "Read Only" : "Default",
         launchProfileBehavior: options?.launchProfileId === "readonly" ? "read-only / never" : "workspace-write / never",
@@ -407,6 +413,54 @@ describe("SessionRegistry", () => {
         updatedAt: expect.any(Number),
       },
     ]);
+  });
+
+  it("persists next selected model and effort when they differ from the active thread", async () => {
+    const registry = new SessionRegistry(createConfig());
+    const session = (await registry.getOrCreate("123")) as any;
+
+    session.setInfo({
+      threadId: "thread-a",
+      workspace: "/workspace/a",
+      model: "o3",
+      reasoningEffort: "medium",
+      nextModel: "gpt-5.5",
+      nextReasoningEffort: "xhigh",
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "workspace-write / never",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      unsafeLaunch: false,
+    });
+    registry.updateMetadata("123", session as any);
+
+    expect(registry.listContexts()).toEqual([
+      {
+        contextKey: "123",
+        threadId: "thread-a",
+        workspace: "/workspace/a",
+        model: "o3",
+        reasoningEffort: "medium",
+        nextModel: "gpt-5.5",
+        nextReasoningEffort: "xhigh",
+        launchProfileId: "default",
+        updatedAt: expect.any(Number),
+      },
+    ]);
+
+    const reloaded = new SessionRegistry(createConfig());
+    await reloaded.getOrCreate("123");
+
+    expect(mockSessionState.create).toHaveBeenLastCalledWith(createConfig(), {
+      workspace: "/workspace/a",
+      model: "o3",
+      reasoningEffort: "medium",
+      nextModel: "gpt-5.5",
+      nextReasoningEffort: "xhigh",
+      launchProfileId: "default",
+      resumeThreadId: "thread-a",
+    });
   });
 
   it("removes a context and disposes its session", async () => {

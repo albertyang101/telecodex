@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { findLaunchProfile } from "./codex-launch.js";
-import { CodexSessionService } from "./codex-session.js";
+import { CodexSessionService, type CreateOptions } from "./codex-session.js";
 import type { TeleCodexConfig } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
 
@@ -12,6 +12,8 @@ export interface ContextMetadata {
   workspace: string;
   model?: string;
   reasoningEffort?: string;
+  nextModel?: string;
+  nextReasoningEffort?: string;
   launchProfileId?: string;
   updatedAt: number;
 }
@@ -38,14 +40,21 @@ export class SessionRegistry {
 
     const meta = this.metadata.get(contextKey);
     const launchProfileId = resolveLaunchProfileId(this.config, meta);
-    session = await CodexSessionService.create(this.config, {
+    const createOptions: CreateOptions = {
       workspace: meta?.workspace,
       model: meta?.model,
       reasoningEffort: meta?.reasoningEffort,
       launchProfileId,
       deferThreadStart: options?.deferThreadStart && !meta?.threadId,
       resumeThreadId: meta?.threadId ?? undefined,
-    });
+    };
+    if (meta?.nextModel) {
+      createOptions.nextModel = meta.nextModel;
+    }
+    if (meta?.nextReasoningEffort) {
+      createOptions.nextReasoningEffort = meta.nextReasoningEffort;
+    }
+    session = await CodexSessionService.create(this.config, createOptions);
 
     this.sessions.set(contextKey, session);
     return session;
@@ -71,6 +80,8 @@ export class SessionRegistry {
       workspace: info.workspace,
       model: info.model,
       reasoningEffort: info.reasoningEffort,
+      nextModel: info.nextModel,
+      nextReasoningEffort: info.nextReasoningEffort,
       launchProfileId: info.nextLaunchProfileId ?? info.launchProfileId,
       updatedAt: Date.now(),
     });

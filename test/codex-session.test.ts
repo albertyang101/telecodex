@@ -868,7 +868,8 @@ describe("CodexSessionService", () => {
     const codexInstance = mockState.codexInstances[0];
 
     service.setReasoningEffort("high");
-    expect(service.getInfo().reasoningEffort).toBe("high");
+    expect(service.getInfo().reasoningEffort).toBeUndefined();
+    expect(service.getInfo().nextReasoningEffort).toBe("high");
 
     await service.newThread();
 
@@ -880,13 +881,29 @@ describe("CodexSessionService", () => {
       skipGitRepoCheck: true,
       modelReasoningEffort: "high",
     });
+    expect(service.getInfo().reasoningEffort).toBe("high");
+    expect(service.getInfo().nextReasoningEffort).toBeUndefined();
   });
 
-  it("setModel updates the tracked model returned by getInfo", async () => {
+  it("setModel stores the next model without misreporting the active thread model", async () => {
     const service = await CodexSessionService.create(createConfig());
+    const codexInstance = mockState.codexInstances[0];
 
     expect(service.setModel("o4-mini")).toBe("o4-mini");
+    expect(service.getInfo().model).toBe("o3");
+    expect(service.getInfo().nextModel).toBe("o4-mini");
+
+    await service.newThread();
+
+    expect(codexInstance.startThread).toHaveBeenLastCalledWith({
+      model: "o4-mini",
+      sandboxMode: "workspace-write",
+      workingDirectory: "/workspace/base",
+      approvalPolicy: "never",
+      skipGitRepoCheck: true,
+    });
     expect(service.getInfo().model).toBe("o4-mini");
+    expect(service.getInfo().nextModel).toBeUndefined();
   });
 
   it("passes text plus image inputs through to the SDK", async () => {

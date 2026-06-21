@@ -163,21 +163,42 @@ function visibleUserText(input: CodexPromptInput): string {
   return input.text ?? "";
 }
 
-function withTelegramReplyStyleGuard(input: CodexPromptInput): CodexPromptInput {
+function buildRuntimeContext(info: CodexSessionInfo): string {
+  return [
+    "[CURRENT CONTEXT]",
+    "You are Albert Codex Dispatcher backend for Telegram.",
+    `Current workspace: ${info.workspace}`,
+    `Current launch behavior: ${info.launchProfileBehavior}`,
+    info.model ? `Current model: ${info.model}` : "Current model: Codex default",
+    info.reasoningEffort
+      ? `Current reasoning effort: ${info.reasoningEffort}`
+      : "Current reasoning effort: Codex default",
+    info.nextModel ? `Next new thread model: ${info.nextModel}` : undefined,
+    info.nextReasoningEffort ? `Next new thread reasoning effort: ${info.nextReasoningEffort}` : undefined,
+    "Answer identity, model, and effort questions directly from these details.",
+    "Do not mention prompts, labels, hidden instructions, or how these details were provided.",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
+function withTelegramReplyStyleGuard(input: CodexPromptInput, info: CodexSessionInfo): CodexPromptInput {
+  const promptPreamble = `${TELEGRAM_REPLY_STYLE_GUARD}\n\n${buildRuntimeContext(info)}`;
+
   if (typeof input === "string") {
-    return `${TELEGRAM_REPLY_STYLE_GUARD}\n\n${input}`;
+    return `${promptPreamble}\n\n${input}`;
   }
 
   if (input.stagedFileInstructions) {
     return {
       ...input,
-      stagedFileInstructions: `${TELEGRAM_REPLY_STYLE_GUARD}\n\n${input.stagedFileInstructions}`,
+      stagedFileInstructions: `${promptPreamble}\n\n${input.stagedFileInstructions}`,
     };
   }
 
   return {
     ...input,
-    text: input.text ? `${TELEGRAM_REPLY_STYLE_GUARD}\n\n${input.text}` : TELEGRAM_REPLY_STYLE_GUARD,
+    text: input.text ? `${promptPreamble}\n\n${input.text}` : promptPreamble,
   };
 }
 
@@ -993,7 +1014,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      await session.prompt(withTelegramReplyStyleGuard(userInput), callbacks);
+      await session.prompt(withTelegramReplyStyleGuard(userInput, session.getInfo()), callbacks);
       updateSessionMetadata(contextKey, session);
       await ensureFinalized();
     } catch (error) {
@@ -2474,6 +2495,8 @@ function renderSessionInfoPlain(info: CodexSessionInfo): string {
       : undefined,
     info.model ? `Model: ${info.model}` : undefined,
     info.reasoningEffort ? `Reasoning effort: ${info.reasoningEffort}` : undefined,
+    info.nextModel ? `Next model: ${info.nextModel}` : undefined,
+    info.nextReasoningEffort ? `Next reasoning effort: ${info.nextReasoningEffort}` : undefined,
     info.sessionTokens ? formatSessionTokensPlain(info.sessionTokens) : undefined,
   ]
     .filter((line): line is string => Boolean(line))
@@ -2491,6 +2514,10 @@ function renderSessionInfoHTML(info: CodexSessionInfo): string {
       : undefined,
     info.model ? `<b>Model:</b> <code>${escapeHTML(info.model)}</code>` : undefined,
     info.reasoningEffort ? `<b>Reasoning effort:</b> <code>${escapeHTML(info.reasoningEffort)}</code>` : undefined,
+    info.nextModel ? `<b>Next model:</b> <code>${escapeHTML(info.nextModel)}</code>` : undefined,
+    info.nextReasoningEffort
+      ? `<b>Next reasoning effort:</b> <code>${escapeHTML(info.nextReasoningEffort)}</code>`
+      : undefined,
     info.sessionTokens ? `<b>Session tokens:</b> <code>${escapeHTML(formatSessionTokensValue(info.sessionTokens))}</code>` : undefined,
   ]
     .filter((line): line is string => Boolean(line))

@@ -44,6 +44,8 @@ export interface CodexSessionInfo {
   workspace: string;
   model?: string;
   reasoningEffort?: string;
+  nextModel?: string;
+  nextReasoningEffort?: string;
   launchProfileId: string;
   launchProfileLabel: string;
   launchProfileBehavior: string;
@@ -65,6 +67,8 @@ export interface CreateOptions {
   workspace?: string;
   model?: string;
   reasoningEffort?: string;
+  nextModel?: string;
+  nextReasoningEffort?: string;
   launchProfileId?: string;
   deferThreadStart?: boolean;
   resumeThreadId?: string;
@@ -82,6 +86,8 @@ export class CodexSessionService {
   private currentReasoningEffort: ModelReasoningEffort | undefined;
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
+  private activeThreadModel: string | undefined;
+  private activeThreadReasoningEffort: ModelReasoningEffort | undefined;
   private sessionTokens = { input: 0, cached: 0, output: 0 };
 
   private constructor(private readonly config: TeleCodexConfig) {
@@ -91,9 +97,13 @@ export class CodexSessionService {
 
   static async create(config: TeleCodexConfig, options?: CreateOptions): Promise<CodexSessionService> {
     const service = new CodexSessionService(config);
+    const activeModel = options?.model ?? config.codexModel;
+    const activeReasoningEffort = (options?.reasoningEffort ?? config.codexReasoningEffort) as
+      | ModelReasoningEffort
+      | undefined;
     service.currentWorkspace = options?.workspace ?? config.workspace;
-    service.currentModel = options?.model ?? config.codexModel;
-    service.currentReasoningEffort = (options?.reasoningEffort ?? config.codexReasoningEffort) as
+    service.currentModel = options?.nextModel ?? activeModel;
+    service.currentReasoningEffort = (options?.nextReasoningEffort ?? activeReasoningEffort) as
       | ModelReasoningEffort
       | undefined;
     service.currentLaunchProfile = getLaunchProfile(
@@ -103,7 +113,10 @@ export class CodexSessionService {
     service.resetCodexClient();
 
     if (options?.resumeThreadId) {
-      await service.resumeThread(options.resumeThreadId);
+      await service.resumeThread(options.resumeThreadId, {
+        model: activeModel,
+        reasoningEffort: activeReasoningEffort,
+      });
       return service;
     }
 
@@ -116,11 +129,18 @@ export class CodexSessionService {
   }
 
   getInfo(): CodexSessionInfo {
+    const hasActiveThread = this.thread !== null;
     const effectiveLaunchProfile = this.activeThreadLaunchProfile ?? this.currentLaunchProfile;
+    const effectiveModel = hasActiveThread
+      ? this.activeThreadModel
+      : (this.currentModel ?? this.config.codexModel);
+    const effectiveReasoningEffort = hasActiveThread
+      ? this.activeThreadReasoningEffort
+      : this.currentReasoningEffort;
     const info: CodexSessionInfo = {
       threadId: this.thread?.id ?? this.currentThreadId,
       workspace: this.currentWorkspace,
-      model: this.currentModel ?? this.config.codexModel,
+      model: effectiveModel,
       launchProfileId: effectiveLaunchProfile.id,
       launchProfileLabel: effectiveLaunchProfile.label,
       launchProfileBehavior: formatLaunchProfileBehavior(effectiveLaunchProfile),
@@ -129,8 +149,20 @@ export class CodexSessionService {
       unsafeLaunch: effectiveLaunchProfile.unsafe,
     };
 
-    if (this.currentReasoningEffort) {
-      info.reasoningEffort = this.currentReasoningEffort;
+    if (effectiveReasoningEffort) {
+      info.reasoningEffort = effectiveReasoningEffort;
+    }
+
+    if (hasActiveThread && this.currentModel && this.currentModel !== this.activeThreadModel) {
+      info.nextModel = this.currentModel;
+    }
+
+    if (
+      hasActiveThread &&
+      this.currentReasoningEffort &&
+      this.currentReasoningEffort !== this.activeThreadReasoningEffort
+    ) {
+      info.nextReasoningEffort = this.currentReasoningEffort;
     }
 
     if (
@@ -304,6 +336,8 @@ export class CodexSessionService {
     const effectiveModel = model ?? this.currentModel;
     this.thread = this.getCodex().startThread(this.buildThreadOptions(effectiveWorkspace, effectiveModel));
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
+    this.activeThreadModel = effectiveModel ?? this.config.codexModel;
+    this.activeThreadReasoningEffort = this.currentReasoningEffort;
     this.currentWorkspace = effectiveWorkspace;
     this.currentThreadId = this.thread.id ?? null;
     if (model) {
@@ -312,14 +346,21 @@ export class CodexSessionService {
     return this.getInfo();
   }
 
-  async resumeThread(threadId: string): Promise<CodexSessionInfo> {
+  async resumeThread(
+    threadId: string,
+    options?: { model?: string; reasoningEffort?: ModelReasoningEffort },
+  ): Promise<CodexSessionInfo> {
     this.ensureIdle("resume a thread");
 
+    const activeModel = options?.model ?? this.currentModel;
+    const activeReasoningEffort = options?.reasoningEffort ?? this.currentReasoningEffort;
     this.thread = this.getCodex().resumeThread(
       threadId,
-      this.buildThreadOptions(this.currentWorkspace, this.currentModel),
+      this.buildThreadOptions(this.currentWorkspace, activeModel, activeReasoningEffort),
     );
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
+    this.activeThreadModel = activeModel ?? this.config.codexModel;
+    this.activeThreadReasoningEffort = activeReasoningEffort;
     this.currentThreadId = threadId;
     return this.getInfo();
   }
@@ -333,6 +374,8 @@ export class CodexSessionService {
 
     this.thread = this.getCodex().resumeThread(threadId, this.buildThreadOptions(workspace, model));
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
+    this.activeThreadModel = model ?? this.currentModel ?? this.config.codexModel;
+    this.activeThreadReasoningEffort = this.currentReasoningEffort;
     this.currentWorkspace = workspace;
     this.currentThreadId = threadId;
     if (model) {
@@ -379,6 +422,8 @@ export class CodexSessionService {
     this.thread = null;
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
+    this.activeThreadModel = undefined;
+    this.activeThreadReasoningEffort = undefined;
     return info;
   }
 
@@ -388,6 +433,8 @@ export class CodexSessionService {
     this.thread = null;
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
+    this.activeThreadModel = undefined;
+    this.activeThreadReasoningEffort = undefined;
   }
 
   private buildSdkInput(input: CodexPromptInput): Input {
@@ -421,7 +468,7 @@ export class CodexSessionService {
     return parts;
   }
 
-  private buildThreadOptions(workspace: string, model?: string): {
+  private buildThreadOptions(workspace: string, model?: string, reasoningEffort?: ModelReasoningEffort): {
     model?: string;
     sandboxMode: SandboxMode;
     workingDirectory: string;
@@ -430,6 +477,7 @@ export class CodexSessionService {
     modelReasoningEffort?: ModelReasoningEffort;
   } {
     const effectiveModel = model ?? this.currentModel ?? this.config.codexModel;
+    const effectiveReasoningEffort = reasoningEffort ?? this.currentReasoningEffort;
     const options = {
       model: effectiveModel,
       sandboxMode: this.currentLaunchProfile.sandboxMode,
@@ -438,10 +486,10 @@ export class CodexSessionService {
       skipGitRepoCheck: true as const,
     };
 
-    if (this.currentReasoningEffort) {
+    if (effectiveReasoningEffort) {
       return {
         ...options,
-        modelReasoningEffort: this.currentReasoningEffort,
+        modelReasoningEffort: effectiveReasoningEffort,
       };
     }
 
