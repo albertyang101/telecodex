@@ -103,6 +103,7 @@ describe("CodexSessionService", () => {
     maxFileSize: 20 * 1024 * 1024,
     codexApiKey: "codex-key",
     codexModel: "o3",
+    codexReasoningEffort: undefined,
     codexSandboxMode: "workspace-write",
     codexApprovalPolicy: "never",
     launchProfiles: [
@@ -224,6 +225,22 @@ describe("CodexSessionService", () => {
       approvalPolicy: "never",
       unsafeLaunch: false,
     });
+  });
+
+  it("applies the configured default reasoning effort to new threads", async () => {
+    const service = await CodexSessionService.create(
+      createConfig({ codexReasoningEffort: "xhigh" }),
+    );
+
+    expect(mockState.codexInstances[0].startThread).toHaveBeenCalledWith({
+      model: "o3",
+      sandboxMode: "workspace-write",
+      workingDirectory: "/workspace/base",
+      approvalPolicy: "never",
+      skipGitRepoCheck: true,
+      modelReasoningEffort: "xhigh",
+    });
+    expect(service.getInfo().reasoningEffort).toBe("xhigh");
   });
 
   it("can defer thread creation so launch settings apply before the first thread starts", async () => {

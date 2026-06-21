@@ -26,6 +26,9 @@ try {
   if (config.codexModel) {
     console.log(`Default model: ${config.codexModel}`);
   }
+  if (config.codexReasoningEffort) {
+    console.log(`Default reasoning effort: ${config.codexReasoningEffort}`);
+  }
   const defaultLaunchProfile = findLaunchProfile(config.launchProfiles, config.defaultLaunchProfileId);
   if (defaultLaunchProfile) {
     console.log(

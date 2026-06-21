@@ -15,6 +15,7 @@ import {
 } from "./codex-launch.js";
 
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
+export type CodexReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export interface MailboxBridgeConfig {
   enabled: boolean;
@@ -37,6 +38,7 @@ export interface TeleCodexConfig {
   codexApiKey?: string;
   codexPathOverride?: string;
   codexModel?: string;
+  codexReasoningEffort?: CodexReasoningEffort;
   codexSandboxMode: CodexSandboxMode;
   codexApprovalPolicy: CodexApprovalPolicy;
   launchProfiles: CodexLaunchProfile[];
@@ -60,6 +62,7 @@ export function loadConfig(): TeleCodexConfig {
   const codexApiKey = optionalString(process.env.CODEX_API_KEY);
   const codexPathOverride = parseCodexPathOverride(optionalString(process.env.CODEX_PATH));
   const codexModel = optionalString(process.env.CODEX_MODEL);
+  const codexReasoningEffort = parseReasoningEffort(optionalString(process.env.CODEX_REASONING_EFFORT));
   const codexSandboxMode = parseSandboxMode(optionalString(process.env.CODEX_SANDBOX_MODE));
   const codexApprovalPolicy = parseApprovalPolicy(optionalString(process.env.CODEX_APPROVAL_POLICY));
   const enableUnsafeLaunchProfiles = parseBooleanEnv(
@@ -96,6 +99,7 @@ export function loadConfig(): TeleCodexConfig {
     codexApiKey,
     codexPathOverride,
     codexModel,
+    codexReasoningEffort,
     codexSandboxMode,
     codexApprovalPolicy,
     launchProfiles,
@@ -387,6 +391,25 @@ function parseToolVerbosity(raw: string | undefined): ToolVerbosity {
         `Invalid TOOL_VERBOSITY value: "${raw}". Expected one of: all, summary, errors-only, none. Falling back to "none".`,
       );
       return "none";
+  }
+}
+
+function parseReasoningEffort(raw: string | undefined): CodexReasoningEffort | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  switch (raw) {
+    case "minimal":
+    case "low":
+    case "medium":
+    case "high":
+    case "xhigh":
+      return raw;
+    default:
+      throw new Error(
+        `Invalid CODEX_REASONING_EFFORT: ${raw}. Expected one of minimal, low, medium, high, xhigh`,
+      );
   }
 }
 

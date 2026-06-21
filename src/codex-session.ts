@@ -93,7 +93,9 @@ export class CodexSessionService {
     const service = new CodexSessionService(config);
     service.currentWorkspace = options?.workspace ?? config.workspace;
     service.currentModel = options?.model ?? config.codexModel;
-    service.currentReasoningEffort = options?.reasoningEffort as ModelReasoningEffort | undefined;
+    service.currentReasoningEffort = (options?.reasoningEffort ?? config.codexReasoningEffort) as
+      | ModelReasoningEffort
+      | undefined;
     service.currentLaunchProfile = getLaunchProfile(
       config,
       options?.launchProfileId ?? config.defaultLaunchProfileId,

@@ -18,6 +18,7 @@ describe("loadConfig", () => {
     delete process.env.CODEX_API_KEY;
     delete process.env.CODEX_PATH;
     delete process.env.CODEX_MODEL;
+    delete process.env.CODEX_REASONING_EFFORT;
     delete process.env.CODEX_SANDBOX_MODE;
     delete process.env.CODEX_APPROVAL_POLICY;
     delete process.env.CODEX_LAUNCH_PROFILES_JSON;
@@ -73,6 +74,7 @@ describe("loadConfig", () => {
     process.env.CODEX_API_KEY = "secret-key";
     process.env.CODEX_PATH = codexPath;
     process.env.CODEX_MODEL = "o3";
+    process.env.CODEX_REASONING_EFFORT = "xhigh";
     process.env.CODEX_SANDBOX_MODE = "danger-full-access";
     process.env.CODEX_APPROVAL_POLICY = "on-request";
     process.env.TOOL_VERBOSITY = "all";
@@ -88,6 +90,7 @@ describe("loadConfig", () => {
       codexApiKey: "secret-key",
       codexPathOverride: codexPath,
       codexModel: "o3",
+      codexReasoningEffort: "xhigh",
       codexSandboxMode: "danger-full-access",
       codexApprovalPolicy: "on-request",
       launchProfiles: [
@@ -143,6 +146,7 @@ describe("loadConfig", () => {
     expect(config.codexApiKey).toBeUndefined();
     expect(config.codexPathOverride).toBeUndefined();
     expect(config.codexModel).toBeUndefined();
+    expect(config.codexReasoningEffort).toBeUndefined();
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
     expect(config.codexSandboxMode).toBe("workspace-write");
     expect(config.codexApprovalPolicy).toBe("never");
@@ -534,6 +538,16 @@ describe("loadConfig", () => {
     process.env.CODEX_DEFAULT_LAUNCH_PROFILE = "missing";
 
     expect(() => loadConfig()).toThrow("Unknown CODEX_DEFAULT_LAUNCH_PROFILE: missing");
+  });
+
+  it("throws when CODEX_REASONING_EFFORT is invalid", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_REASONING_EFFORT = "maximum";
+
+    expect(() => loadConfig()).toThrow(
+      "Invalid CODEX_REASONING_EFFORT: maximum. Expected one of minimal, low, medium, high, xhigh",
+    );
   });
 
   it("throws when unsafe extra launch profiles are configured without enabling them", () => {
