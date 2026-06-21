@@ -117,6 +117,16 @@ describe("createBot response delivery", () => {
     enableTelegramLogin: true,
     enableTelegramReactions: false,
     streamAgentResponses: false,
+    mailboxBridge: {
+      enabled: false,
+      persona: undefined,
+      personasRoot: "/Users/albert/personas",
+      contextKey: undefined,
+      pollMs: 500,
+      fullScanMs: 10_000,
+      autoReply: false,
+      maxMessagesPerTick: 1,
+    },
     ...overrides,
   });
 

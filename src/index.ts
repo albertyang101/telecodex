@@ -2,15 +2,18 @@ import { createBot, registerCommands } from "./bot.js";
 import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
 import { loadConfig } from "./config.js";
+import { startMailboxBridge } from "./mailbox.js";
 import { SessionRegistry } from "./session-registry.js";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
+let stopMailboxBridge: (() => void) | undefined;
 
 try {
   const config = loadConfig();
   registry = new SessionRegistry(config);
   bot = createBot(config, registry);
+  stopMailboxBridge = startMailboxBridge(config, registry);
   await registerCommands(bot);
 
   console.log("TeleCodex running");
@@ -33,6 +36,9 @@ try {
     }
   }
   console.log("Session mode: per Telegram context");
+  if (config.mailboxBridge.enabled) {
+    console.log(`Mailbox bridge: ${config.mailboxBridge.persona} (${config.mailboxBridge.contextKey ?? `mailbox:${config.mailboxBridge.persona}`})`);
+  }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Failed to start TeleCodex: ${message}`);
@@ -49,6 +55,7 @@ const shutdown = (signal: NodeJS.Signals) => {
 
   console.log(`Received ${signal}, shutting down TeleCodex...`);
   if (bot) bot.stop();
+  stopMailboxBridge?.();
 
   setTimeout(() => {
     registry?.disposeAll();

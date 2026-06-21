@@ -121,6 +121,16 @@ describe("CodexSessionService", () => {
     showTurnTokenUsage: false,
     enableTelegramLogin: true,
     enableTelegramReactions: false,
+    mailboxBridge: {
+      enabled: false,
+      persona: undefined,
+      personasRoot: "/Users/albert/personas",
+      contextKey: undefined,
+      pollMs: 500,
+      fullScanMs: 10_000,
+      autoReply: false,
+      maxMessagesPerTick: 1,
+    },
     ...overrides,
   });
 

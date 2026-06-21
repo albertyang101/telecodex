@@ -1,5 +1,5 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 import { loadConfig } from "../src/config.js";
@@ -29,6 +29,16 @@ describe("loadConfig", () => {
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
+    delete process.env.MAILBOX_ENABLED;
+    delete process.env.MAILBOX_PERSONA;
+    delete process.env.PERSONAS_ROOT;
+    delete process.env.CLAUDE_PERSONAS_ROOT;
+    delete process.env.MAILBOX_CONTEXT_KEY;
+    delete process.env.MAILBOX_POLL_MS;
+    delete process.env.MAILBOX_FULL_SCAN_MS;
+    delete process.env.MAILBOX_AUTO_REPLY;
+    delete process.env.MAILBOX_MAX_MESSAGES_PER_TICK;
+    delete process.env.MAILBOX_MIN_SENT_AT;
     delete process.env.container;
   });
 
@@ -110,6 +120,17 @@ describe("loadConfig", () => {
       showTurnTokenUsage: false,
       enableTelegramLogin: true,
       enableTelegramReactions: false,
+      mailboxBridge: {
+        enabled: false,
+        persona: undefined,
+        personasRoot: path.join(homedir(), "personas"),
+        contextKey: undefined,
+        pollMs: 500,
+        fullScanMs: 10_000,
+        autoReply: false,
+        maxMessagesPerTick: 1,
+        minSentAt: undefined,
+      },
     });
   });
 
@@ -341,6 +362,46 @@ describe("loadConfig", () => {
     delete process.env.SHOW_TURN_TOKEN_USAGE;
     const config = loadConfig();
     expect(config.showTurnTokenUsage).toBe(false);
+  });
+
+  it("enables the mailbox bridge when MAILBOX_PERSONA is configured", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_SANDBOX_MODE = "read-only";
+    process.env.MAILBOX_PERSONA = "albert-v3";
+    process.env.PERSONAS_ROOT = "/Users/albert/personas";
+    process.env.MAILBOX_CONTEXT_KEY = "mailbox:theo";
+    process.env.MAILBOX_POLL_MS = "750";
+    process.env.MAILBOX_FULL_SCAN_MS = "30000";
+    process.env.MAILBOX_AUTO_REPLY = "true";
+    process.env.MAILBOX_MAX_MESSAGES_PER_TICK = "2";
+    process.env.MAILBOX_MIN_SENT_AT = "2026-06-21T06:15:00Z";
+
+    const config = loadConfig();
+
+    expect(config.mailboxBridge).toEqual({
+      enabled: true,
+      persona: "albert-v3",
+      personasRoot: "/Users/albert/personas",
+      contextKey: "mailbox:theo",
+      pollMs: 750,
+      fullScanMs: 30_000,
+      autoReply: true,
+      maxMessagesPerTick: 2,
+      minSentAt: "2026-06-21T06:15:00Z",
+    });
+  });
+
+  it("rejects mailbox bridge startup unless the default Codex launch is read-only and never approval", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.MAILBOX_PERSONA = "albert-v3";
+    process.env.CODEX_SANDBOX_MODE = "workspace-write";
+    process.env.CODEX_APPROVAL_POLICY = "never";
+
+    expect(() => loadConfig()).toThrow(
+      "MAILBOX_PERSONA requires the default Codex launch profile to be read-only / never",
+    );
   });
 
   it("parses STREAM_AGENT_RESPONSES boolean values", () => {

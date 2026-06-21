@@ -1,4 +1,5 @@
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 
 import {
@@ -14,6 +15,18 @@ import {
 } from "./codex-launch.js";
 
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
+
+export interface MailboxBridgeConfig {
+  enabled: boolean;
+  persona?: string;
+  personasRoot: string;
+  contextKey?: string;
+  pollMs: number;
+  fullScanMs: number;
+  autoReply: boolean;
+  maxMessagesPerTick: number;
+  minSentAt?: string;
+}
 
 export interface TeleCodexConfig {
   telegramBotToken: string;
@@ -34,6 +47,7 @@ export interface TeleCodexConfig {
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
+  mailboxBridge: MailboxBridgeConfig;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -70,6 +84,8 @@ export function loadConfig(): TeleCodexConfig {
     optionalString(process.env.ENABLE_TELEGRAM_REACTIONS),
     false,
   );
+  const mailboxBridge = parseMailboxBridgeConfig();
+  validateMailboxBridgeLaunch(mailboxBridge, launchProfiles, defaultLaunchProfileId);
 
   return {
     telegramBotToken,
@@ -90,6 +106,7 @@ export function loadConfig(): TeleCodexConfig {
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
+    mailboxBridge,
   };
 }
 
@@ -229,6 +246,66 @@ function parseMaxFileSize(raw: string | undefined): number {
   }
 
   return parsed;
+}
+
+function parsePositiveIntegerEnv(raw: string | undefined, defaultValue: number, name: string): number {
+  if (!raw) {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.warn(`Invalid ${name} value: "${raw}". Falling back to ${defaultValue}.`);
+    return defaultValue;
+  }
+
+  return parsed;
+}
+
+function parseMailboxBridgeConfig(): MailboxBridgeConfig {
+  const persona = optionalString(process.env.MAILBOX_PERSONA);
+  const enabled = Boolean(persona) && parseBooleanEnv(optionalString(process.env.MAILBOX_ENABLED), true);
+  const personasRoot =
+    optionalString(process.env.PERSONAS_ROOT) ??
+    optionalString(process.env.CLAUDE_PERSONAS_ROOT) ??
+    path.join(homedir(), "personas");
+
+  return {
+    enabled,
+    persona,
+    personasRoot,
+    contextKey: optionalString(process.env.MAILBOX_CONTEXT_KEY),
+    pollMs: parsePositiveIntegerEnv(optionalString(process.env.MAILBOX_POLL_MS), 500, "MAILBOX_POLL_MS"),
+    fullScanMs: parsePositiveIntegerEnv(
+      optionalString(process.env.MAILBOX_FULL_SCAN_MS),
+      10_000,
+      "MAILBOX_FULL_SCAN_MS",
+    ),
+    autoReply: parseBooleanEnv(optionalString(process.env.MAILBOX_AUTO_REPLY), false),
+    maxMessagesPerTick: parsePositiveIntegerEnv(
+      optionalString(process.env.MAILBOX_MAX_MESSAGES_PER_TICK),
+      1,
+      "MAILBOX_MAX_MESSAGES_PER_TICK",
+    ),
+    minSentAt: optionalString(process.env.MAILBOX_MIN_SENT_AT),
+  };
+}
+
+function validateMailboxBridgeLaunch(
+  mailboxBridge: MailboxBridgeConfig,
+  launchProfiles: CodexLaunchProfile[],
+  defaultLaunchProfileId: string,
+): void {
+  if (!mailboxBridge.enabled) {
+    return;
+  }
+
+  const profile = findLaunchProfile(launchProfiles, defaultLaunchProfileId);
+  if (profile?.sandboxMode === "read-only" && profile.approvalPolicy === "never") {
+    return;
+  }
+
+  throw new Error("MAILBOX_PERSONA requires the default Codex launch profile to be read-only / never");
 }
 
 function parseSandboxMode(raw: string | undefined): CodexSandboxMode {
