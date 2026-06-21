@@ -1,15 +1,25 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
+import { createConnection } from "node:net";
 import path from "node:path";
-import { readFile } from "node:fs/promises";
+import { copyFile, readFile, unlink } from "node:fs/promises";
 
 export interface TranscriptionResult {
   text: string;
-  backend: "parakeet" | "openai";
+  backend: "qwen" | "parakeet" | "openai";
   durationMs: number;
 }
 
-export type TranscriptionBackend = "parakeet" | "openai";
+export type TranscriptionBackend = "qwen" | "parakeet" | "openai";
+type RequestedTranscriptionBackend = TranscriptionBackend | "auto";
+type ParakeetAvailability = "available" | "missing" | "broken";
+
+export interface TranscriptionBackendStatus {
+  requested: RequestedTranscriptionBackend;
+  active: TranscriptionBackend | null;
+  available: TranscriptionBackend[];
+}
 
 // Minimal interface for the parakeet-coreml engine instance.
 interface ParakeetEngine {
@@ -18,19 +28,31 @@ interface ParakeetEngine {
 }
 
 const PARAKEET_SPECIFIER = "parakeet-coreml";
+const DEFAULT_QWEN_SOCKET_PATH = "/tmp/qwen_asr.sock";
+const QWEN_SOCKET_PROBE_TIMEOUT_MS = 250;
+const DEFAULT_QWEN_TIMEOUT_MS = 270_000;
+const DEFAULT_QWEN_CONTEXT =
+  "人名：王静。" +
+  "系统/技术词：Albert、Theo、Codex、Linear、GitHub、Notion、Graphiti、Telegram、Dispatcher、Superpowers。" +
+  "佛教/中文专有名词：金刚禅寺、维摩诘经、禅意、禅宗、般若、菩提。";
+const DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 const FFMPEG_INSTALL_MESSAGE = "ffmpeg not found. Install it with: brew install ffmpeg";
 const NO_BACKEND_ERROR = `Voice messages require a transcription backend.
 
-Option 1: Install Parakeet for local transcription (free, private, ~1.5GB download):
+Option 1: Use the Qwen3-ASR resident server for Chinese transcription:
+  Set VOICE_TRANSCRIPTION_BACKEND=qwen and QWEN_ASR_SOCKET=/tmp/qwen_asr.sock
+
+Option 2: Install Parakeet for local transcription (free, private, ~1.5GB download):
   npm install parakeet-coreml
 Also requires ffmpeg: brew install ffmpeg
 
-Option 2: Set OPENAI_API_KEY for cloud transcription (~$0.006/min):
+Option 3: Set OPENAI_API_KEY for OpenAI transcription:
   Add OPENAI_API_KEY=sk-... to your .env file`;
 
 const _require = createRequire(import.meta.url);
 let _importModule: (specifier: string) => Promise<unknown> = async (specifier) => _require(specifier);
 let _decodeAudio: (filePath: string) => Promise<Float32Array> = decodeAudioToSamples;
+let _defaultQwenSocketPath = DEFAULT_QWEN_SOCKET_PATH;
 let _engine: ParakeetEngine | null = null;
 
 export function _setImportHook(hook: (specifier: string) => Promise<unknown>): void {
@@ -41,13 +63,37 @@ export function _setDecodeHook(hook: (filePath: string) => Promise<Float32Array>
   _decodeAudio = hook;
 }
 
+export function _setDefaultQwenSocketPathForTest(socketPath: string): void {
+  _defaultQwenSocketPath = socketPath;
+}
+
 export function _resetImportHook(): void {
   _importModule = async (specifier) => _require(specifier);
   _decodeAudio = decodeAudioToSamples;
+  _defaultQwenSocketPath = DEFAULT_QWEN_SOCKET_PATH;
   _engine = null;
 }
 
 export async function transcribeAudio(filePath: string): Promise<TranscriptionResult> {
+  const requestedBackend = getRequestedTranscriptionBackend();
+
+  if (requestedBackend === "qwen") {
+    return await transcribeWithQwen(filePath);
+  }
+
+  if (requestedBackend === "openai") {
+    return await transcribeWithOpenAI(filePath);
+  }
+
+  if (requestedBackend === "parakeet") {
+    const parakeetMod = await _importModule(PARAKEET_SPECIFIER);
+    return await transcribeWithParakeet(filePath, parakeetMod);
+  }
+
+  if (await isQwenAutoConfigured()) {
+    return await transcribeWithQwen(filePath);
+  }
+
   try {
     const parakeetMod = await _importModule(PARAKEET_SPECIFIER);
     return await transcribeWithParakeet(filePath, parakeetMod);
@@ -67,11 +113,12 @@ export async function transcribeAudio(filePath: string): Promise<TranscriptionRe
 export async function getAvailableBackends(): Promise<TranscriptionBackend[]> {
   const backends: TranscriptionBackend[] = [];
 
-  try {
-    await _importModule(PARAKEET_SPECIFIER);
+  if (await isQwenSocketAvailable()) {
+    backends.push("qwen");
+  }
+
+  if ((await getParakeetAvailability()) === "available") {
     backends.push("parakeet");
-  } catch {
-    // Treat import failures as unavailable so /start can still work.
   }
 
   if (hasOpenAIApiKey()) {
@@ -79,6 +126,106 @@ export async function getAvailableBackends(): Promise<TranscriptionBackend[]> {
   }
 
   return backends;
+}
+
+export async function getTranscriptionBackendStatus(): Promise<TranscriptionBackendStatus> {
+  const requested = getRequestedTranscriptionBackend();
+  const parakeetAvailability = await getParakeetAvailability();
+  const available = await buildAvailableBackends(parakeetAvailability);
+  return {
+    requested,
+    active: resolveActiveBackend(requested, available, parakeetAvailability),
+    available,
+  };
+}
+
+async function buildAvailableBackends(parakeetAvailability: ParakeetAvailability): Promise<TranscriptionBackend[]> {
+  const backends: TranscriptionBackend[] = [];
+  if (await isQwenSocketAvailable()) {
+    backends.push("qwen");
+  }
+  if (parakeetAvailability === "available") {
+    backends.push("parakeet");
+  }
+  if (hasOpenAIApiKey()) {
+    backends.push("openai");
+  }
+  return backends;
+}
+
+function resolveActiveBackend(
+  requested: RequestedTranscriptionBackend,
+  available: TranscriptionBackend[],
+  parakeetAvailability: ParakeetAvailability,
+): TranscriptionBackend | null {
+  if (requested === "auto") {
+    if (available.includes("qwen")) {
+      return "qwen";
+    }
+    if (parakeetAvailability === "available") {
+      return "parakeet";
+    }
+    if (parakeetAvailability === "broken") {
+      return null;
+    }
+    return available.includes("openai") ? "openai" : null;
+  }
+  return available.includes(requested) ? requested : null;
+}
+
+async function getParakeetAvailability(): Promise<ParakeetAvailability> {
+  try {
+    await _importModule(PARAKEET_SPECIFIER);
+    return "available";
+  } catch (error) {
+    return isModuleNotFoundError(error, PARAKEET_SPECIFIER) ? "missing" : "broken";
+  }
+}
+
+async function transcribeWithQwen(filePath: string): Promise<TranscriptionResult> {
+  const startedAt = Date.now();
+  const preparedFilePath = await prepareQwenAudioPath(filePath);
+  let response: Record<string, unknown>;
+  try {
+    response = await requestQwenAsr({
+      socketPath: getQwenSocketPath(),
+      request: {
+        audio_path: preparedFilePath,
+        language: getOptionalEnv("QWEN_ASR_LANGUAGE") ?? null,
+        context: getOptionalEnv("QWEN_ASR_CONTEXT") ?? DEFAULT_QWEN_CONTEXT,
+      },
+      timeoutMs: getQwenTimeoutMs(),
+    });
+  } finally {
+    if (preparedFilePath !== filePath) {
+      await unlink(preparedFilePath).catch(() => {});
+    }
+  }
+
+  if (!response.ok) {
+    const error = typeof response.error === "string" ? response.error : "unknown error";
+    throw new Error(`Qwen ASR failed: ${error}`);
+  }
+
+  if (typeof response.text !== "string") {
+    throw new Error("Qwen ASR response did not include a text field");
+  }
+
+  return {
+    text: response.text,
+    backend: "qwen",
+    durationMs: Date.now() - startedAt,
+  };
+}
+
+async function prepareQwenAudioPath(filePath: string): Promise<string> {
+  if (path.extname(filePath).toLowerCase() !== ".oga") {
+    return filePath;
+  }
+
+  const canonicalPath = `${filePath}.ogg`;
+  await copyFile(filePath, canonicalPath);
+  return canonicalPath;
 }
 
 async function transcribeWithParakeet(filePath: string, parakeetMod: unknown): Promise<TranscriptionResult> {
@@ -144,7 +291,7 @@ async function transcribeWithOpenAI(filePath: string): Promise<TranscriptionResu
   const mimeType = mimeTypes[ext] ?? "audio/ogg";
   const form = new FormData();
   form.append("file", new Blob([audioBuffer], { type: mimeType }), path.basename(filePath) || "audio.ogg");
-  form.append("model", "whisper-1");
+  form.append("model", getOptionalEnv("OPENAI_TRANSCRIPTION_MODEL") ?? DEFAULT_OPENAI_TRANSCRIPTION_MODEL);
 
   const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
@@ -235,6 +382,130 @@ function decodeAudioToSamples(filePath: string): Promise<Float32Array> {
 
 function hasOpenAIApiKey(): boolean {
   return Boolean(process.env.OPENAI_API_KEY?.trim());
+}
+
+function getRequestedTranscriptionBackend(): RequestedTranscriptionBackend {
+  const raw = (process.env.VOICE_TRANSCRIPTION_BACKEND ?? "auto").trim().toLowerCase();
+  const value = raw || "auto";
+  if (value === "auto" || value === "qwen" || value === "parakeet" || value === "openai") {
+    return value;
+  }
+  throw new Error("VOICE_TRANSCRIPTION_BACKEND must be one of: auto, qwen, parakeet, openai");
+}
+
+function getQwenSocketPath(): string {
+  return getOptionalEnv("QWEN_ASR_SOCKET") ?? _defaultQwenSocketPath;
+}
+
+async function isQwenAutoConfigured(): Promise<boolean> {
+  return await isQwenSocketAvailable();
+}
+
+async function isQwenSocketAvailable(): Promise<boolean> {
+  const socketPath = getQwenSocketPath();
+  if (!existsSync(socketPath)) {
+    return false;
+  }
+  return await canConnectToUnixSocket(socketPath, QWEN_SOCKET_PROBE_TIMEOUT_MS);
+}
+
+function getQwenTimeoutMs(): number {
+  const raw = getOptionalEnv("QWEN_ASR_TIMEOUT_MS");
+  if (!raw) {
+    return DEFAULT_QWEN_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_QWEN_TIMEOUT_MS;
+}
+
+function getOptionalEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}
+
+function requestQwenAsr(options: {
+  socketPath: string;
+  request: Record<string, unknown>;
+  timeoutMs: number;
+}): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    let settled = false;
+    const socket = createConnection(options.socketPath);
+    socket.setEncoding("utf8");
+
+    const timer = setTimeout(() => {
+      settle(new Error(`Qwen ASR timed out after ${options.timeoutMs}ms`));
+      socket.destroy();
+    }, options.timeoutMs);
+
+    const settle = (error?: Error, payload?: Record<string, unknown>): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(payload ?? {});
+    };
+
+    socket.once("connect", () => {
+      socket.write(`${JSON.stringify(options.request)}\n`);
+    });
+
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+      if (!buffer.includes("\n")) {
+        return;
+      }
+      const line = buffer.split("\n", 1)[0]?.trim() ?? "";
+      try {
+        const payload = JSON.parse(line) as unknown;
+        if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+          settle(new Error(`Qwen ASR returned non-object response: ${typeof payload}`));
+          return;
+        }
+        settle(undefined, payload as Record<string, unknown>);
+      } catch (error) {
+        settle(error instanceof Error ? error : new Error(String(error)));
+      } finally {
+        socket.end();
+      }
+    });
+
+    socket.once("error", (error) => {
+      settle(error);
+    });
+
+    socket.once("close", () => {
+      if (!settled) {
+        settle(new Error("Qwen ASR closed the socket without a response"));
+      }
+    });
+  });
+}
+
+function canConnectToUnixSocket(socketPath: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = createConnection(socketPath);
+    const timer = setTimeout(() => {
+      settle(false);
+      socket.destroy();
+    }, timeoutMs);
+
+    const settle = (available: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(available);
+    };
+
+    socket.once("connect", () => settle(true));
+    socket.once("error", () => settle(false));
+  });
 }
 
 function extractTranscribedText(result: unknown): string | undefined {

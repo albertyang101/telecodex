@@ -6,6 +6,16 @@ type FakeChildProcess = EventEmitter & {
   stderr: EventEmitter;
 };
 
+const originalEnv = {
+  OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  VOICE_TRANSCRIPTION_BACKEND: process.env.VOICE_TRANSCRIPTION_BACKEND,
+  QWEN_ASR_SOCKET: process.env.QWEN_ASR_SOCKET,
+  QWEN_ASR_CONTEXT: process.env.QWEN_ASR_CONTEXT,
+  QWEN_ASR_LANGUAGE: process.env.QWEN_ASR_LANGUAGE,
+  QWEN_ASR_TIMEOUT_MS: process.env.QWEN_ASR_TIMEOUT_MS,
+  OPENAI_TRANSCRIPTION_MODEL: process.env.OPENAI_TRANSCRIPTION_MODEL,
+};
+
 function createSpawnMock(onSpawn: (child: FakeChildProcess) => void) {
   return vi.fn(() => {
     const child = new EventEmitter() as FakeChildProcess;
@@ -19,6 +29,8 @@ function createSpawnMock(onSpawn: (child: FakeChildProcess) => void) {
 async function importVoiceWithSpawn(spawnMock: ReturnType<typeof createSpawnMock>) {
   vi.resetModules();
   vi.doMock("node:child_process", () => ({ spawn: spawnMock }));
+  process.env.VOICE_TRANSCRIPTION_BACKEND = "parakeet";
+  process.env.QWEN_ASR_SOCKET = "/tmp/telecodex-test-missing-qwen-asr.sock";
   return await import("../src/voice.js");
 }
 
@@ -26,8 +38,23 @@ afterEach(() => {
   vi.doUnmock("node:child_process");
   vi.resetModules();
   vi.unstubAllGlobals();
-  delete process.env.OPENAI_API_KEY;
+  restoreEnv("OPENAI_API_KEY");
+  restoreEnv("VOICE_TRANSCRIPTION_BACKEND");
+  restoreEnv("QWEN_ASR_SOCKET");
+  restoreEnv("QWEN_ASR_CONTEXT");
+  restoreEnv("QWEN_ASR_LANGUAGE");
+  restoreEnv("QWEN_ASR_TIMEOUT_MS");
+  restoreEnv("OPENAI_TRANSCRIPTION_MODEL");
 });
+
+function restoreEnv(name: keyof typeof originalEnv): void {
+  const value = originalEnv[name];
+  if (value === undefined) {
+    delete process.env[name];
+    return;
+  }
+  process.env[name] = value;
+}
 
 describe("voice decoding", () => {
   it("decodes ffmpeg float32 output into samples for parakeet", async () => {

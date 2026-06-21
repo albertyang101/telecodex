@@ -39,7 +39,7 @@ import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramCon
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { SessionRegistry } from "./session-registry.js";
-import { getAvailableBackends, transcribeAudio } from "./voice.js";
+import { getTranscriptionBackendStatus, transcribeAudio } from "./voice.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
@@ -1108,7 +1108,26 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const backends = await getAvailableBackends().catch(() => []);
+    let status: Awaited<ReturnType<typeof getTranscriptionBackendStatus>> | null = null;
+    let statusError: unknown;
+    try {
+      status = await getTranscriptionBackendStatus();
+    } catch (error) {
+      statusError = error;
+    }
+
+    if (statusError) {
+      await safeReply(
+        ctx,
+        `<b>Voice transcription configuration error:</b>\n${escapeHTML(friendlyErrorText(statusError))}`,
+        {
+          fallbackText: `Voice transcription configuration error:\n${friendlyErrorText(statusError)}`,
+        },
+      );
+      return;
+    }
+
+    const backends = status?.available ?? [];
 
     if (backends.length === 0) {
       await safeReply(
@@ -1116,15 +1135,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         [
           "<b>Voice transcription is not available.</b>",
           "",
-          "Install <code>parakeet-coreml</code> + ffmpeg, or set <code>OPENAI_API_KEY</code>.",
-          "<i>Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.</i>",
+          "Set <code>VOICE_TRANSCRIPTION_BACKEND=qwen</code> with <code>QWEN_ASR_SOCKET</code>, install <code>parakeet-coreml</code> + ffmpeg, or set <code>OPENAI_API_KEY</code>.",
+          "<i>Note: voice transcription is separate from CODEX_API_KEY.</i>",
         ].join("\n"),
         {
           fallbackText: [
             "Voice transcription is not available.",
             "",
-            "Install parakeet-coreml + ffmpeg, or set OPENAI_API_KEY.",
-            "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.",
+            "Set VOICE_TRANSCRIPTION_BACKEND=qwen with QWEN_ASR_SOCKET, install parakeet-coreml + ffmpeg, or set OPENAI_API_KEY.",
+            "Note: voice transcription is separate from CODEX_API_KEY.",
           ].join("\n"),
         },
       );
@@ -1132,9 +1151,23 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const joined = backends.join(" + ");
-    await safeReply(ctx, `<b>Voice backends:</b> <code>${escapeHTML(joined)}</code>`, {
-      fallbackText: `Voice backends: ${joined}`,
-    });
+    const active = status?.active ?? `${status?.requested ?? "unknown"} (not available)`;
+    const requested = status?.requested ?? "unknown";
+    await safeReply(
+      ctx,
+      [
+        `<b>Active backend:</b> <code>${escapeHTML(active)}</code>`,
+        `<b>Requested:</b> <code>${escapeHTML(requested)}</code>`,
+        `<b>Available:</b> <code>${escapeHTML(joined)}</code>`,
+      ].join("\n"),
+      {
+        fallbackText: [
+          `Active backend: ${active}`,
+          `Requested: ${requested}`,
+          `Available: ${joined}`,
+        ].join("\n"),
+      },
+    );
   });
 
   bot.command("new", async (ctx) => {
@@ -2100,7 +2133,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       rememberPromptInput(contextKey, transcript);
     } catch (error) {
       queuedPrompt.status = "skipped";
-      const note = "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.";
+      const note = "Note: voice transcription is separate from CODEX_API_KEY.";
       await safeReply(ctx, `<b>Transcription failed:</b>\n${escapeHTML(friendlyErrorText(error))}\n\n<i>${escapeHTML(note)}</i>`, {
         fallbackText: `Transcription failed:\n${friendlyErrorText(error)}\n\n${note}`,
       });

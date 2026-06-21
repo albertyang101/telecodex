@@ -8,7 +8,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 - **Streaming responses** — agent text edits in-place as Codex generates it
 - **Full tool visibility** — shell commands, file changes, web searches, MCP calls, and error items shown with configurable verbosity
 - **Live plan display** — Codex's todo list rendered as a separate message and updated as steps complete
-- **Voice transcription** — send a voice message or audio file; TeleCodex transcribes it (local parakeet-coreml or OpenAI Whisper) and forwards the text to Codex
+- **Voice transcription** — send a voice message or audio file; TeleCodex transcribes it with a configured backend (Qwen3-ASR resident server, parakeet-coreml, or OpenAI transcription) and forwards the text to Codex
 - **Image input** — send a photo (with optional caption) to pass screenshots or images directly to Codex
 - **File ingest & artifacts** — send a document to stage it for Codex; generated files are delivered back as Telegram documents
 - **Session browser** — `/sessions` lists recent threads from `~/.codex`, grouped by workspace; tap to switch
@@ -30,8 +30,9 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 - The Codex CLI installed and authenticated on the host:
   - API key auth: set `CODEX_API_KEY`
   - ChatGPT login: `codex login` on the machine, or use `/login` from Telegram
+- *(Optional)* Qwen3-ASR resident server — recommended for Chinese voice; set `VOICE_TRANSCRIPTION_BACKEND=qwen` and `QWEN_ASR_SOCKET=/tmp/qwen_asr.sock`
 - *(Optional)* `ffmpeg` — required for local voice transcription via parakeet-coreml
-- *(Optional)* `OPENAI_API_KEY` — enables OpenAI Whisper as a voice transcription fallback
+- *(Optional)* `OPENAI_API_KEY` — enables OpenAI transcription fallback
 
 ## Setup
 
@@ -63,7 +64,13 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
    | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
    | `ENABLE_TELEGRAM_REACTIONS` | — | Enable Telegram emoji reactions like 👀 / 👍 (`false` by default) |
-   | `OPENAI_API_KEY` | — | Enables OpenAI Whisper voice transcription fallback |
+   | `VOICE_TRANSCRIPTION_BACKEND` | — | Voice backend: `auto`, `qwen`, `parakeet`, or `openai` (`auto` by default) |
+   | `QWEN_ASR_SOCKET` | — | Unix socket for the Qwen3-ASR resident server, e.g. `/tmp/qwen_asr.sock` |
+   | `QWEN_ASR_CONTEXT` | — | Optional Qwen3-ASR context/hotword prompt for names and domain terms |
+   | `QWEN_ASR_LANGUAGE` | — | Optional Qwen3-ASR language hint |
+   | `QWEN_ASR_TIMEOUT_MS` | — | Qwen3-ASR socket timeout in milliseconds (default `270000`) |
+   | `OPENAI_API_KEY` | — | Enables OpenAI voice transcription |
+   | `OPENAI_TRANSCRIPTION_MODEL` | — | OpenAI transcription model (default `gpt-4o-transcribe`) |
 
 4. Start the bot:
    ```bash
@@ -94,7 +101,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 
 ### Voice, image & file input
 
-- **Voice / audio** — send any voice message or audio file; TeleCodex transcribes it and sends the result to Codex
+- **Voice / audio** — send any voice message or audio file; TeleCodex transcribes it and sends the result to Codex. For Chinese production use, prefer `VOICE_TRANSCRIPTION_BACKEND=qwen` with the resident Qwen3-ASR socket; parakeet-coreml is not the Chinese-accuracy path.
 - **Photos** — send a photo with an optional caption; the image is forwarded to Codex as visual input
 - **Documents** — send a file (with optional caption); TeleCodex stages it in the workspace, runs Codex, and delivers any generated files back as Telegram documents
 
@@ -186,8 +193,9 @@ Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
                 ├── CodexAuth        ──→  codex login/logout subprocess
                 ├── Attachments      ──→  .telecodex/inbox/<turnId>/ (staged files)
                 ├── Artifacts        ──→  .telecodex/outbox/<turnId>/ (generated files)
-                └── VoiceTranscriber  ──→  parakeet-coreml (local)
-                                     ──→  OpenAI Whisper (cloud fallback)
+                └── VoiceTranscriber  ──→  Qwen3-ASR resident server (Chinese)
+                                     ──→  parakeet-coreml (local fallback)
+                                     ──→  OpenAI transcription (cloud fallback)
 ```
 
 ## Project Layout
@@ -207,7 +215,7 @@ TeleCodex/
 │   ├── attachments.ts     — file staging (sanitization, size limits)
 │   ├── artifacts.ts       — generated file collection and Telegram delivery
 │   ├── error-messages.ts  — SDK/network error → user-friendly translation
-│   ├── voice.ts           — voice transcription (parakeet / Whisper)
+│   ├── voice.ts           — voice transcription (Qwen / parakeet / OpenAI)
 │   ├── config.ts          — environment loading and validation
 │   └── format.ts          — Markdown → Telegram HTML conversion
 ├── test/                  — 15 test files, 180+ tests (vitest)
@@ -259,7 +267,7 @@ That playbook covers:
 - The built-in `Full Access` profile and any extra `danger-full-access` launch profiles are opt-in via `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
 - Default approval policy is `never` — suited for headless/automated use
 - `/launch_profiles` only selects from validated configured profiles; Telegram users cannot submit arbitrary sandbox or approval values
-- `CODEX_API_KEY` (agent auth) and `OPENAI_API_KEY` (voice transcription) are separate credentials
+- `CODEX_API_KEY` (agent auth) and `OPENAI_API_KEY` (OpenAI voice fallback) are separate credentials
 - `/login` and `/logout` can be disabled by setting `ENABLE_TELEGRAM_LOGIN=false`
 - Files uploaded via Telegram are sanitized (name, size, type) before staging in the workspace
 - All Markdown output is sanitized before being sent as Telegram HTML

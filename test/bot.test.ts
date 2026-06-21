@@ -100,6 +100,10 @@ import { createBot } from "../src/bot.js";
 import { _resetImportHook, _setDecodeHook, _setImportHook } from "../src/voice.js";
 
 describe("createBot response delivery", () => {
+  const originalOpenAIKey = process.env.OPENAI_API_KEY;
+  const originalVoiceBackend = process.env.VOICE_TRANSCRIPTION_BACKEND;
+  const originalQwenSocket = process.env.QWEN_ASR_SOCKET;
+
   const createConfig = (overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig => ({
     telegramBotToken: "bot-token",
     telegramAllowedUserIds: [123],
@@ -164,11 +168,85 @@ describe("createBot response delivery", () => {
     mockGrammy.bots.length = 0;
     mockGrammy.Bot.mockClear();
     mockAuth.checkAuthStatus.mockClear();
+    process.env.VOICE_TRANSCRIPTION_BACKEND = "parakeet";
+    process.env.QWEN_ASR_SOCKET = "/tmp/telecodex-test-missing-qwen-asr.sock";
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
     _resetImportHook();
+    if (originalVoiceBackend === undefined) {
+      delete process.env.VOICE_TRANSCRIPTION_BACKEND;
+    } else {
+      process.env.VOICE_TRANSCRIPTION_BACKEND = originalVoiceBackend;
+    }
+    if (originalQwenSocket === undefined) {
+      delete process.env.QWEN_ASR_SOCKET;
+    } else {
+      process.env.QWEN_ASR_SOCKET = originalQwenSocket;
+    }
+    if (originalOpenAIKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = originalOpenAIKey;
+    }
+  });
+
+  it("shows the active voice backend separately from available backends", async () => {
+    process.env.VOICE_TRANSCRIPTION_BACKEND = "openai";
+    process.env.OPENAI_API_KEY = "sk-test";
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          return { text: "unused", durationMs: 1 };
+        }
+      },
+    }));
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const voiceCommand = bot.__handlers.commands.get("voice");
+
+    await voiceCommand({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 9, text: "/voice" },
+      api: bot.api,
+    });
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+    const html = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(html).toContain("Active backend:");
+    expect(html).toContain("<code>openai</code>");
+    expect(html).toContain("Available:");
+    expect(html).toContain("parakeet + openai");
+  });
+
+  it("shows voice backend configuration errors in /voice", async () => {
+    process.env.VOICE_TRANSCRIPTION_BACKEND = "qwne";
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const voiceCommand = bot.__handlers.commands.get("voice");
+
+    await voiceCommand({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 9, text: "/voice" },
+      api: bot.api,
+    });
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+    const html = bot.api.sendMessage.mock.calls[0][1] as string;
+    expect(html).toContain("Voice transcription configuration error");
+    expect(html).toContain("VOICE_TRANSCRIPTION_BACKEND");
   });
 
   it("can buffer agent deltas and only send the final response to Telegram", async () => {
