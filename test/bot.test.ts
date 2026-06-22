@@ -108,6 +108,7 @@ describe("createBot response delivery", () => {
   const originalVoiceBackend = process.env.VOICE_TRANSCRIPTION_BACKEND;
   const originalQwenSocket = process.env.QWEN_ASR_SOCKET;
   const originalTelegramFileDownloadTimeoutMs = process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS;
+  const originalVoiceTranscriptionTimeoutMs = process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS;
   const tempDirs: string[] = [];
 
   const createConfig = (overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig => ({
@@ -203,6 +204,11 @@ describe("createBot response delivery", () => {
       delete process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS;
     } else {
       process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = originalTelegramFileDownloadTimeoutMs;
+    }
+    if (originalVoiceTranscriptionTimeoutMs === undefined) {
+      delete process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS;
+    } else {
+      process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = originalVoiceTranscriptionTimeoutMs;
     }
   });
 
@@ -1314,6 +1320,175 @@ describe("createBot response delivery", () => {
     expect(String(session.prompt.mock.calls[2][0])).toContain("语音后面发来的文字");
   });
 
+  it("queues photo follow-ups by Telegram arrival order while a Codex turn is running", async () => {
+    const firstTurn = deferred<void>();
+    const photoDownloadStarted = deferred<void>();
+    const finishPhotoDownload = deferred<ArrayBuffer>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
+        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "photos/follow-up.jpg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        photoDownloadStarted.resolve();
+        return {
+          ok: true,
+          arrayBuffer: async () => finishPhotoDownload.promise,
+        };
+      }),
+    );
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const photoHandler = bot.__handlers.on.get("message:photo");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 49, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const photoPromise = photoHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 50,
+        photo: [{ file_id: "photo-file-queued" }],
+        caption: "先看这张图",
+      },
+      api: bot.api,
+    });
+    await expect(
+      Promise.race([photoDownloadStarted.promise.then(() => "started"), delay(50).then(() => "not-started")]),
+    ).resolves.toBe("started");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 51, text: "图片后面发来的文字" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    finishPhotoDownload.resolve(new Uint8Array([1, 2, 3]).buffer);
+    await photoPromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+    const photoInput = session.prompt.mock.calls[1][0] as { imagePaths?: string[]; text?: string };
+    expect(photoInput.imagePaths).toHaveLength(1);
+    expect(photoInput.text).toContain("先看这张图");
+    expect(String(session.prompt.mock.calls[2][0])).toContain("图片后面发来的文字");
+  });
+
+  it("queues document follow-ups by Telegram arrival order while a Codex turn is running", async () => {
+    const firstTurn = deferred<void>();
+    const documentDownloadStarted = deferred<void>();
+    const finishDocumentDownload = deferred<ArrayBuffer>();
+    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-queue-"));
+    tempDirs.push(workspace);
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
+        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
+      }
+      callbacks.onAgentEnd();
+    });
+    session.getCurrentWorkspace.mockReturnValue(workspace);
+    session.getInfo.mockReturnValue({
+      ...session.getInfo(),
+      workspace,
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace }), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "documents/follow-up.txt",
+      file_size: 5,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        documentDownloadStarted.resolve();
+        return {
+          ok: true,
+          arrayBuffer: async () => finishDocumentDownload.promise,
+        };
+      }),
+    );
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const documentHandler = bot.__handlers.on.get("message:document");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 52, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const documentPromise = documentHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 53,
+        document: { file_id: "doc-file-queued", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
+        caption: "先总结这个文档",
+      },
+      api: bot.api,
+    });
+    await expect(
+      Promise.race([documentDownloadStarted.promise.then(() => "started"), delay(50).then(() => "not-started")]),
+    ).resolves.toBe("started");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 54, text: "文档后面发来的文字" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    finishDocumentDownload.resolve(new TextEncoder().encode("hello").buffer);
+    await documentPromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+    const documentInput = session.prompt.mock.calls[1][0] as { stagedFileInstructions?: string; text?: string };
+    expect(documentInput.stagedFileInstructions).toContain("report.txt");
+    expect(documentInput.text).toBe("先总结这个文档");
+    expect(String(session.prompt.mock.calls[2][0])).toContain("文档后面发来的文字");
+  });
+
   it("drains later queued text after an earlier voice transcription fails", async () => {
     const firstTurn = deferred<void>();
     const transcribeStarted = deferred<void>();
@@ -1460,6 +1635,83 @@ describe("createBot response delivery", () => {
     );
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
     expect(String(session.prompt.mock.calls[1][0])).toContain("语音下载超时后这条也必须进 Codex");
+  });
+
+  it("drains later queued text after a stuck voice transcription times out", async () => {
+    process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = "5";
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("后续文本回复。");
+        callbacks.onAgentMessage?.("后续文本回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "voice/stuck-transcription.ogg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      })),
+    );
+    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          return await new Promise(() => {});
+        }
+      },
+    }));
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 146, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const voicePromise = voiceHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 147, voice: { file_id: "voice-file-stuck-transcription" } },
+      api: bot.api,
+    });
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 148, text: "语音转写超时后这条也必须进 Codex" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    await expect(Promise.race([voicePromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
+      "resolved",
+    );
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("语音转写超时后这条也必须进 Codex");
   });
 
   it("drains later queued text after a stuck Telegram getFile times out", async () => {

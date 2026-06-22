@@ -31,6 +31,7 @@ const PARAKEET_SPECIFIER = "parakeet-coreml";
 const DEFAULT_QWEN_SOCKET_PATH = "/tmp/qwen_asr.sock";
 const QWEN_SOCKET_PROBE_TIMEOUT_MS = 250;
 const DEFAULT_QWEN_TIMEOUT_MS = 270_000;
+const DEFAULT_VOICE_TRANSCRIPTION_TIMEOUT_MS = 270_000;
 const DEFAULT_QWEN_CONTEXT =
   "人名：王静。" +
   "系统/技术词：Albert、Theo、Codex、Linear、GitHub、Notion、Graphiti、Telegram、Dispatcher、Superpowers。" +
@@ -61,7 +62,8 @@ export function _setImportHook(hook: (specifier: string) => Promise<unknown>): v
 }
 
 export function _setDecodeHook(hook: (filePath: string) => Promise<Float32Array>): void {
-  _decodeAudio = hook;
+  _decodeAudio = async (filePath) =>
+    await withPromiseTimeout(getVoiceTranscriptionTimeoutMs(), "Parakeet audio decode", () => hook(filePath));
 }
 
 export function _setDefaultQwenSocketPathForTest(socketPath: string): void {
@@ -231,6 +233,7 @@ async function prepareQwenAudioPath(filePath: string): Promise<string> {
 
 async function transcribeWithParakeet(filePath: string, parakeetMod: unknown): Promise<TranscriptionResult> {
   const startedAt = Date.now();
+  const timeoutMs = getVoiceTranscriptionTimeoutMs();
   const samples = await _decodeAudio(filePath);
 
   if (!_engine) {
@@ -253,11 +256,24 @@ async function transcribeWithParakeet(filePath: string, parakeetMod: unknown): P
       throw new Error("parakeet-coreml was loaded but the engine does not expose transcribe(samples)");
     }
 
-    await (engine.initialize as () => Promise<void>)();
-    _engine = engine as unknown as ParakeetEngine;
+    try {
+      await withPromiseTimeout(timeoutMs, "Parakeet engine initialization", () =>
+        (engine.initialize as () => Promise<void>)(),
+      );
+      _engine = engine as unknown as ParakeetEngine;
+    } catch (error) {
+      _engine = null;
+      throw error;
+    }
   }
 
-  const result = await _engine.transcribe(samples);
+  let result: unknown;
+  try {
+    result = await withPromiseTimeout(timeoutMs, "Parakeet transcription", () => _engine!.transcribe(samples));
+  } catch (error) {
+    _engine = null;
+    throw error;
+  }
   const text = extractTranscribedText(result);
   if (text === undefined) {
     throw new Error("parakeet-coreml returned an unsupported transcription result");
@@ -330,6 +346,8 @@ function decodeAudioToSamples(filePath: string): Promise<Float32Array> {
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutMs = getVoiceTranscriptionTimeoutMs();
 
     const ffmpeg = spawn("ffmpeg", ["-i", filePath, "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1"], {
       stdio: ["ignore", "pipe", "pipe"],
@@ -338,8 +356,22 @@ function decodeAudioToSamples(filePath: string): Promise<Float32Array> {
     const finish = (callback: () => void): void => {
       if (settled) return;
       settled = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
       callback();
     };
+
+    timeout = setTimeout(() => {
+      finish(() => {
+        try {
+          ffmpeg.kill("SIGKILL");
+        } catch {
+          // Best effort: the promise must still unblock even if the child already exited.
+        }
+        reject(new Error(`ffmpeg audio decode timed out after ${timeoutMs}ms`));
+      });
+    }, timeoutMs);
 
     ffmpeg.stdout.on("data", (chunk: Buffer | string) => {
       stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -432,6 +464,15 @@ function getOpenAITranscriptionTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_OPENAI_TRANSCRIPTION_TIMEOUT_MS;
 }
 
+function getVoiceTranscriptionTimeoutMs(): number {
+  const raw = getOptionalEnv("VOICE_TRANSCRIPTION_TIMEOUT_MS");
+  if (!raw) {
+    return DEFAULT_VOICE_TRANSCRIPTION_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_VOICE_TRANSCRIPTION_TIMEOUT_MS;
+}
+
 function getOptionalEnv(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value ? value : undefined;
@@ -455,6 +496,30 @@ async function withAbortTimeout<T>(
 
   try {
     return await Promise.race([task(controller.signal), timeoutPromise]);
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+async function withPromiseTimeout<T>(timeoutMs: number, label: string, task: () => Promise<T>): Promise<T> {
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([Promise.resolve().then(task), timeoutPromise]);
   } catch (error) {
     if (timedOut) {
       throw new Error(`${label} timed out after ${timeoutMs}ms`);

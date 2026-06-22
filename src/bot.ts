@@ -95,6 +95,7 @@ type QueuedPrompt = {
   status: "pending" | "ready" | "skipped";
   input?: CodexPromptInput;
   receiptReaction?: Promise<void>;
+  afterPrompt?: () => Promise<void>;
 };
 
 const TELEGRAM_REPLY_STYLE_GUARD = [
@@ -599,10 +600,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
 
         if (next.status === "skipped") {
+          await failReaction(next.ctx, next.receiptReaction);
+          if (next.afterPrompt) {
+            await next.afterPrompt();
+          }
           continue;
         }
 
         if (!next.input) {
+          if (next.afterPrompt) {
+            await next.afterPrompt();
+          }
           continue;
         }
 
@@ -611,6 +619,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           await completeReaction(next.ctx, next.receiptReaction);
         } catch {
           await failReaction(next.ctx, next.receiptReaction);
+        } finally {
+          if (next.afterPrompt) {
+            await next.afterPrompt();
+          }
         }
       }
     } finally {
@@ -2410,10 +2422,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
-    if (isBusy(contextKey)) {
-      await sendBusyReply(ctx);
-      return;
-    }
 
     const photos = ctx.message.photo;
     const photo = photos[photos.length - 1];
@@ -2421,6 +2429,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
+    const receiptReaction = setReaction(ctx, "👀");
+    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 
@@ -2428,32 +2438,28 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await ctx.api.sendChatAction(chatId, "upload_photo");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, photo.file_id, 20 * 1024 * 1024);
     } catch (error) {
+      queuedPrompt.status = "skipped";
       await safeReply(ctx, `<b>Failed to download photo:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Failed to download photo: ${friendlyErrorText(error)}`,
       });
       return;
     } finally {
       stopTranscribing();
-      if (!tempFilePath) {
-        // Download failed — nothing to clean up further
-      }
+      await drainQueuedPrompts(contextKey);
     }
 
     const caption = ctx.message.caption?.trim();
     const promptInput: { text?: string; imagePaths: string[] } = { imagePaths: [tempFilePath] };
     if (caption) {
       promptInput.text = caption;
-      lastPromptInput.set(contextKey, caption);
     }
-    await setReaction(ctx, "👀");
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
-      await setReaction(ctx, "👍");
-    } catch {
-      await clearReaction(ctx);
-    } finally {
+    rememberPromptInput(contextKey, promptInput);
+    queuedPrompt.status = "ready";
+    queuedPrompt.input = promptInput;
+    queuedPrompt.afterPrompt = async () => {
       await unlink(tempFilePath).catch(() => {});
-    }
+    };
+    await drainQueuedPrompts(contextKey);
   });
 
   bot.on("message:document", async (ctx) => {
@@ -2464,10 +2470,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
-    if (isBusy(contextKey)) {
-      await sendBusyReply(ctx);
-      return;
-    }
 
     const doc = ctx.message.document;
     if (!doc) {
@@ -2483,6 +2485,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
+    const receiptReaction = setReaction(ctx, "👀");
+    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 
@@ -2490,12 +2494,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await ctx.api.sendChatAction(chatId, "typing");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, doc.file_id, config.maxFileSize);
     } catch (error) {
+      queuedPrompt.status = "skipped";
       await safeReply(ctx, `<b>Failed to download file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Failed to download file: ${friendlyErrorText(error)}`,
       });
       return;
     } finally {
       stopTranscribing();
+      await drainQueuedPrompts(contextKey);
     }
 
     const turnId = randomUUID().slice(0, 12);
@@ -2512,9 +2518,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         maxFileSize: config.maxFileSize,
       });
     } catch (error) {
+      queuedPrompt.status = "skipped";
       await safeReply(ctx, `<b>Failed to stage file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Failed to stage file: ${friendlyErrorText(error)}`,
       });
+      await drainQueuedPrompts(contextKey);
       return;
     } finally {
       if (tempFilePath) {
@@ -2538,16 +2546,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const caption = ctx.message.caption?.trim();
     if (caption) {
       promptInput.text = caption;
-      lastPromptInput.set(contextKey, caption);
     }
+    rememberPromptInput(contextKey, promptInput);
 
-    await setReaction(ctx, "👀");
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
-      await setReaction(ctx, "👍");
-    } catch {
-      await clearReaction(ctx);
-    } finally {
+    queuedPrompt.status = "ready";
+    queuedPrompt.input = promptInput;
+    queuedPrompt.afterPrompt = async () => {
       try {
         await deliverArtifacts(ctx, chatId, outDir, parseContextKey(contextKey).messageThreadId);
       } catch (artifactError) {
@@ -2556,7 +2560,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         await cleanupInbox(workspace, turnId);
         // TODO: prune old outbox turn folders by age or count to avoid unbounded growth
       }
-    }
+    };
+    await drainQueuedPrompts(contextKey);
   });
 
   bot.catch((error) => {

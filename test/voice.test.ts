@@ -23,6 +23,7 @@ describe("voice transcription", () => {
   const originalOpenAITranscriptionModel = process.env.OPENAI_TRANSCRIPTION_MODEL;
   const originalQwenTimeoutMs = process.env.QWEN_ASR_TIMEOUT_MS;
   const originalOpenAITranscriptionTimeoutMs = process.env.OPENAI_TRANSCRIPTION_TIMEOUT_MS;
+  const originalVoiceTranscriptionTimeoutMs = process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS;
   let tempDir: string;
   let audioPath: string;
 
@@ -38,6 +39,7 @@ describe("voice transcription", () => {
     delete process.env.OPENAI_TRANSCRIPTION_MODEL;
     delete process.env.QWEN_ASR_TIMEOUT_MS;
     delete process.env.OPENAI_TRANSCRIPTION_TIMEOUT_MS;
+    delete process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS;
     _resetImportHook();
     vi.unstubAllGlobals();
   });
@@ -85,6 +87,11 @@ describe("voice transcription", () => {
       delete process.env.OPENAI_TRANSCRIPTION_TIMEOUT_MS;
     } else {
       process.env.OPENAI_TRANSCRIPTION_TIMEOUT_MS = originalOpenAITranscriptionTimeoutMs;
+    }
+    if (originalVoiceTranscriptionTimeoutMs === undefined) {
+      delete process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS;
+    } else {
+      process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = originalVoiceTranscriptionTimeoutMs;
     }
   });
 
@@ -660,6 +667,80 @@ describe("voice transcription", () => {
       backend: "parakeet",
     });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("times out stuck parakeet audio decode", async () => {
+    process.env.VOICE_TRANSCRIPTION_BACKEND = "parakeet";
+    process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = "5";
+    _setDecodeHook(async () => new Promise(() => {}));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          return { text: "unused", durationMs: 5 };
+        }
+      },
+    }));
+
+    const result = await Promise.race([
+      transcribeAudio(audioPath).then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      ),
+      delay(50).then(() => "timed-out"),
+    ]);
+
+    expect(result).toContain("Parakeet audio decode timed out after 5ms");
+  });
+
+  it("times out stuck parakeet engine initialization", async () => {
+    process.env.VOICE_TRANSCRIPTION_BACKEND = "parakeet";
+    process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = "5";
+    _setDecodeHook(async () => new Float32Array(100));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {
+          return await new Promise(() => {});
+        }
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          return { text: "unused", durationMs: 5 };
+        }
+      },
+    }));
+
+    const result = await Promise.race([
+      transcribeAudio(audioPath).then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      ),
+      delay(50).then(() => "timed-out"),
+    ]);
+
+    expect(result).toContain("Parakeet engine initialization timed out after 5ms");
+  });
+
+  it("times out stuck parakeet transcription calls", async () => {
+    process.env.VOICE_TRANSCRIPTION_BACKEND = "parakeet";
+    process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = "5";
+    _setDecodeHook(async () => new Float32Array(100));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          return await new Promise(() => {});
+        }
+      },
+    }));
+
+    const result = await Promise.race([
+      transcribeAudio(audioPath).then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      ),
+      delay(50).then(() => "timed-out"),
+    ]);
+
+    expect(result).toContain("Parakeet transcription timed out after 5ms");
   });
 
   it("throws a helpful error when no backend is available", async () => {

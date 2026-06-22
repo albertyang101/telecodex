@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 type FakeChildProcess = EventEmitter & {
   stdout: EventEmitter;
   stderr: EventEmitter;
+  kill: ReturnType<typeof vi.fn>;
 };
 
 const originalEnv = {
@@ -14,6 +15,7 @@ const originalEnv = {
   QWEN_ASR_LANGUAGE: process.env.QWEN_ASR_LANGUAGE,
   QWEN_ASR_TIMEOUT_MS: process.env.QWEN_ASR_TIMEOUT_MS,
   OPENAI_TRANSCRIPTION_MODEL: process.env.OPENAI_TRANSCRIPTION_MODEL,
+  VOICE_TRANSCRIPTION_TIMEOUT_MS: process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS,
 };
 
 function createSpawnMock(onSpawn: (child: FakeChildProcess) => void) {
@@ -21,6 +23,7 @@ function createSpawnMock(onSpawn: (child: FakeChildProcess) => void) {
     const child = new EventEmitter() as FakeChildProcess;
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
+    child.kill = vi.fn();
     process.nextTick(() => onSpawn(child));
     return child;
   });
@@ -45,6 +48,7 @@ afterEach(() => {
   restoreEnv("QWEN_ASR_LANGUAGE");
   restoreEnv("QWEN_ASR_TIMEOUT_MS");
   restoreEnv("OPENAI_TRANSCRIPTION_MODEL");
+  restoreEnv("VOICE_TRANSCRIPTION_TIMEOUT_MS");
 });
 
 function restoreEnv(name: keyof typeof originalEnv): void {
@@ -148,4 +152,37 @@ describe("voice decoding", () => {
 
     await expect(voice.transcribeAudio("/tmp/missing.ogg")).rejects.toThrow("brew install ffmpeg");
   });
+
+  it("kills ffmpeg when parakeet audio decode times out", async () => {
+    process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = "5";
+    let childProcess: FakeChildProcess | undefined;
+    const spawnMock = createSpawnMock((child) => {
+      childProcess = child;
+    });
+    const voice = await importVoiceWithSpawn(spawnMock);
+
+    voice._setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          return { text: "unused", durationMs: 7 };
+        }
+      },
+    }));
+
+    const result = await Promise.race([
+      voice.transcribeAudio("/tmp/stuck.ogg").then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      ),
+      delay(50).then(() => "timed-out"),
+    ]);
+
+    expect(result).toContain("ffmpeg audio decode timed out after 5ms");
+    expect(childProcess?.kill).toHaveBeenCalledWith("SIGKILL");
+  });
 });
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

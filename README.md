@@ -80,6 +80,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `LINEAR_CONTROL_MCP_STARTUP_TIMEOUT_MS` | — | Linear control MCP server startup timeout in milliseconds (default `10000`) |
    | `LINEAR_CONTROL_MCP_TOOL_TIMEOUT_MS` | — | Linear control MCP tool call timeout in milliseconds (default `30000`) |
    | `VOICE_TRANSCRIPTION_BACKEND` | — | Voice backend: `auto`, `qwen`, `parakeet`, or `openai` (`auto` by default) |
+   | `VOICE_TRANSCRIPTION_TIMEOUT_MS` | — | Local/parakeet decode, initialization, and transcription timeout in milliseconds (default `270000`) |
    | `QWEN_ASR_SOCKET` | — | Unix socket for the Qwen3-ASR resident server, e.g. `/tmp/qwen_asr.sock` |
    | `QWEN_ASR_CONTEXT` | — | Optional Qwen3-ASR context/hotword prompt for names and domain terms |
    | `QWEN_ASR_LANGUAGE` | — | Optional Qwen3-ASR language hint |
