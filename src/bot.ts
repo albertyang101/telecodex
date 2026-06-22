@@ -533,7 +533,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         void setReaction(ctx, "👍");
       }).catch(() => {});
     }
-    await setReaction(ctx, "👍");
+    void setReaction(ctx, "👍").catch(() => {});
   };
 
   const failReaction = async (ctx: Context, receiptReaction?: Promise<void>): Promise<void> => {
@@ -542,7 +542,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         void clearReaction(ctx);
       }).catch(() => {});
     }
-    await clearReaction(ctx);
+    void clearReaction(ctx).catch(() => {});
   };
 
   const sendRepeatingChatAction = async <T>(
@@ -2401,9 +2401,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     } catch (error) {
       queuedPrompt.status = "skipped";
       const note = "Note: voice transcription is separate from CODEX_API_KEY.";
-      await safeReply(ctx, `<b>Transcription failed:</b>\n${escapeHTML(friendlyErrorText(error))}\n\n<i>${escapeHTML(note)}</i>`, {
+      void safeReply(ctx, `<b>Transcription failed:</b>\n${escapeHTML(friendlyErrorText(error))}\n\n<i>${escapeHTML(note)}</i>`, {
         fallbackText: `Transcription failed:\n${friendlyErrorText(error)}\n\n${note}`,
-      });
+      }).catch(() => {});
       return;
     } finally {
       stopTranscribing();
@@ -2439,9 +2439,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, photo.file_id, 20 * 1024 * 1024);
     } catch (error) {
       queuedPrompt.status = "skipped";
-      await safeReply(ctx, `<b>Failed to download photo:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+      void safeReply(ctx, `<b>Failed to download photo:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Failed to download photo: ${friendlyErrorText(error)}`,
-      });
+      }).catch(() => {});
       return;
     } finally {
       stopTranscribing();
@@ -2495,9 +2495,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, doc.file_id, config.maxFileSize);
     } catch (error) {
       queuedPrompt.status = "skipped";
-      await safeReply(ctx, `<b>Failed to download file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+      void safeReply(ctx, `<b>Failed to download file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Failed to download file: ${friendlyErrorText(error)}`,
-      });
+      }).catch(() => {});
       return;
     } finally {
       stopTranscribing();
@@ -2519,9 +2519,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       });
     } catch (error) {
       queuedPrompt.status = "skipped";
-      await safeReply(ctx, `<b>Failed to stage file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+      void safeReply(ctx, `<b>Failed to stage file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Failed to stage file: ${friendlyErrorText(error)}`,
-      });
+      }).catch(() => {});
       await drainQueuedPrompts(contextKey);
       return;
     } finally {
@@ -2542,7 +2542,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await ensureOutDir(outDir);
     } catch (error) {
       queuedPrompt.status = "skipped";
-      await safeReply(ctx, `<b>Failed to prepare output folder:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+      void safeReply(ctx, `<b>Failed to prepare output folder:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Failed to prepare output folder: ${friendlyErrorText(error)}`,
       }).catch(() => {});
       await cleanupInbox(workspace, turnId).catch(() => {});
