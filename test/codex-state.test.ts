@@ -20,6 +20,7 @@ type ThreadFixture = {
 
 type LoadOptions = {
   home?: string;
+  codexHome?: string;
   files?: string[];
   stats?: Record<string, number>;
   threads?: ThreadFixture[];
@@ -31,6 +32,7 @@ type LoadOptions = {
 };
 
 const originalHome = process.env.HOME;
+const originalCodexHome = process.env.CODEX_HOME;
 
 afterEach(() => {
   vi.doUnmock("node:fs");
@@ -43,16 +45,28 @@ afterEach(() => {
   } else {
     process.env.HOME = originalHome;
   }
+
+  if (originalCodexHome === undefined) {
+    delete process.env.CODEX_HOME;
+  } else {
+    process.env.CODEX_HOME = originalCodexHome;
+  }
 });
 
 async function loadCodexState(options: LoadOptions = {}) {
   const home = options.home ?? "/Users/tester";
-  const codexDir = path.join(home, ".codex");
+  const configuredCodexHome = options.codexHome?.trim();
+  const codexDir = configuredCodexHome || path.join(home, ".codex");
   const modelsPath = path.join(codexDir, "models_cache.json");
   const files = options.files ?? [];
   const stats = options.stats ?? {};
   const threads = options.threads ?? [];
   process.env.HOME = home;
+  if (options.codexHome === undefined) {
+    delete process.env.CODEX_HOME;
+  } else {
+    process.env.CODEX_HOME = options.codexHome;
+  }
 
   vi.resetModules();
   mockExecFileSync.mockReset();
@@ -168,6 +182,38 @@ describe("codex-state", () => {
     });
 
     expect(state.findLatestDatabase()).toBe(newer);
+  });
+
+  it("findLatestDatabase prefers CODEX_HOME over HOME .codex", async () => {
+    const home = "/Users/tester";
+    const codexHome = "/runtime/codex-home";
+    const statePath = path.join(codexHome, "state_runtime.sqlite");
+    const state = await loadCodexState({
+      home,
+      codexHome,
+      files: ["state_runtime.sqlite"],
+      stats: {
+        [statePath]: 100,
+      },
+    });
+
+    expect(state.findLatestDatabase()).toBe(statePath);
+  });
+
+  it("findLatestDatabase falls back to HOME .codex when CODEX_HOME is blank", async () => {
+    const home = "/Users/tester";
+    const codexDir = path.join(home, ".codex");
+    const statePath = path.join(codexDir, "state_home.sqlite");
+    const state = await loadCodexState({
+      home,
+      codexHome: "   ",
+      files: ["state_home.sqlite"],
+      stats: {
+        [statePath]: 100,
+      },
+    });
+
+    expect(state.findLatestDatabase()).toBe(statePath);
   });
 
   it("listThreads returns an empty array when better-sqlite3 is unavailable", async () => {
