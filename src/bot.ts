@@ -2389,7 +2389,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const transcript = result.text.trim();
       if (!transcript) {
         queuedPrompt.status = "skipped";
-        await safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
+        void safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
           fallbackText: "Transcription was empty. Please try again or send text instead.",
         }).catch(() => {});
         return;
@@ -2530,7 +2530,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     }
 
-    await safeReply(ctx, `📎 <b>Received:</b> <code>${escapeHTML(stagedFile.safeName)}</code>`, {
+    void safeReply(ctx, `📎 <b>Received:</b> <code>${escapeHTML(stagedFile.safeName)}</code>`, {
       fallbackText: `📎 Received: ${stagedFile.safeName}`,
     }).catch(() => {});
 
