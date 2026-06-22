@@ -72,6 +72,36 @@ Open items stay in Linear, not here:
 - Output format: append-only `YYYY-MM-DD.md` blocks tagged `[user-raw]` and `[bot-raw]` with `message_id`, `context_key`, and `thread_id` metadata comments. Graphiti owns owner routing and lane markers.
 - This does not close ALB-833 until the launchd env is deployed, live Telegram proof creates a source Sessions turn, health reports `codex_dispatcher_memory_lane OK`, and the next Graphiti ingest advances `.graphiti_session_state.albert-v3.json`.
 
+2026-06-22 ALB-833 deployment/live proof addendum:
+
+- Local code commit: `eb27785 fix(memory): write telecodex turns to transcript root` (`Refs ALB-833`) on branch `alb-717-native-telegram-queue`.
+- GitHub push status: blocked. Mac mini GitHub HTTPS and SSH both authenticate as `albertyang101`; GitHub denied write access to `benedict2310/telecodex`. Local production rollout used the committed Mac mini working tree.
+- TDD / verification:
+  - Target bot tests for Graphiti source format, empty final fallback, and append failure behavior: 3 passed.
+  - Target config tests for `TRANSCRIPT_ROOT` parse, relative-path rejection, and `MEMORY_TRANSCRIPT_ROOT` alias rejection: 3 passed.
+  - Full `npm test`: 21 files / 358 tests passed.
+  - `npm run build`: `tsc` passed.
+  - `git diff --check`: passed.
+  - Independent review: Critical 0 / Important 0 / Minor 0.
+- LaunchAgent rollout:
+  - Plist backup: `/Users/albertyang0888/Library/LaunchAgents/com.albert.albert-v3-codex-dispatcher.plist.pre-alb833-20260622T183625.bak`.
+  - Runtime env after `bootout`/`bootstrap`: `TRANSCRIPT_ROOT=/Users/albertyang0888/personas/albert-v3/memory/Sessions`, `TELECODEX_ROOT=/Users/albertyang0888/code/codex-telegram-research/telecodex`, `CODEX_MODEL=gpt-5.5`, `MAILBOX_PERSONA=albert-v3`.
+  - Runtime pid after reload: `92164`; process list showed one TeleCodex `dist/index.js` process.
+- Memory health:
+  - `tools/memory_health_check.py --json` after rollout: exit `0`, summary `54 OK / 1 WARN / 0 FAIL`.
+  - `codex_dispatcher_memory_lane`: `OK`, run id `mem-health-20260622T184213+1000`.
+- Live Telegram proof via Pyrogram against `@albert_v3_xpx_bot`:
+  - Nonce: `ALB833_MEMORY_LANE_20260622T184013`.
+  - User message id `26368`; bot reply id `26369`; reply count `1`; final reply matched the nonce.
+  - Source transcript file: `/Users/albertyang0888/personas/albert-v3/memory/Sessions/2026-06-22.md`.
+  - File grew from `589` bytes to `974` bytes and contained the nonce under `[user-raw]` / `[bot-raw]` blocks.
+  - Checks found no `session_id=`, no `Albert:` / `Assistant:` prefixes, and no nonce in `/Users/albertyang0888/personas/albert/memory/Sessions`.
+- Graph state handling:
+  - Dry-run detected ALB system-development probe content and failed safe for personal graph routing rather than ingesting the proof into Albert's graph.
+  - Used `graphiti_session_ingest.py --persona albert-v3 --mark-current --apply` to advance the albert-v3 source high-water ledger without opening Graphiti, calling a provider, or writing graph data.
+  - State after mark-current: `2026-06-21.md: 45`, `2026-06-22.md: 4`; follow-up dry-run reported `0 with NEW turns`.
+  - `strings graphiti.kuzu | grep ALB833_MEMORY_LANE_20260622T184013` returned no hit.
+
 ALB-714 discipline mirror:
 
 - The Codex developer discipline must require root-cause fixes, not downstream symptom patches.
