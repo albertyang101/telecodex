@@ -261,6 +261,11 @@ function withDatabase<T>(fn: (db: DatabaseInstance) => T): DatabaseReadResult<T>
 }
 
 function getCodexDir(): string | null {
+  const codexHome = process.env.CODEX_HOME?.trim();
+  if (codexHome) {
+    return codexHome;
+  }
+
   const home = process.env.HOME?.trim();
   return home ? path.join(home, ".codex") : null;
 }
