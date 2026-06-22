@@ -60,6 +60,7 @@ export interface TeleCodexConfig {
   codexPathOverride?: string;
   codexModel?: string;
   codexReasoningEffort?: CodexReasoningEffort;
+  codexTurnTimeoutMs?: number;
   codexSandboxMode: CodexSandboxMode;
   codexApprovalPolicy: CodexApprovalPolicy;
   launchProfiles: CodexLaunchProfile[];
@@ -86,6 +87,10 @@ export function loadConfig(): TeleCodexConfig {
   const codexPathOverride = parseCodexPathOverride(optionalString(process.env.CODEX_PATH));
   const codexModel = optionalString(process.env.CODEX_MODEL);
   const codexReasoningEffort = parseReasoningEffort(optionalString(process.env.CODEX_REASONING_EFFORT));
+  const codexTurnTimeoutMs = parseOptionalPositiveIntegerEnv(
+    optionalString(process.env.CODEX_TURN_TIMEOUT_MS),
+    "CODEX_TURN_TIMEOUT_MS",
+  );
   const codexSandboxMode = parseSandboxMode(optionalString(process.env.CODEX_SANDBOX_MODE));
   const codexApprovalPolicy = parseApprovalPolicy(optionalString(process.env.CODEX_APPROVAL_POLICY));
   const enableUnsafeLaunchProfiles = parseBooleanEnv(
@@ -126,6 +131,7 @@ export function loadConfig(): TeleCodexConfig {
     codexPathOverride,
     codexModel,
     codexReasoningEffort,
+    codexTurnTimeoutMs,
     codexSandboxMode,
     codexApprovalPolicy,
     launchProfiles,

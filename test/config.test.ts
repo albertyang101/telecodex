@@ -19,6 +19,7 @@ describe("loadConfig", () => {
     delete process.env.CODEX_PATH;
     delete process.env.CODEX_MODEL;
     delete process.env.CODEX_REASONING_EFFORT;
+    delete process.env.CODEX_TURN_TIMEOUT_MS;
     delete process.env.CODEX_SANDBOX_MODE;
     delete process.env.CODEX_APPROVAL_POLICY;
     delete process.env.CODEX_LAUNCH_PROFILES_JSON;
@@ -107,6 +108,7 @@ describe("loadConfig", () => {
       codexPathOverride: codexPath,
       codexModel: "o3",
       codexReasoningEffort: "xhigh",
+      codexTurnTimeoutMs: undefined,
       codexSandboxMode: "danger-full-access",
       codexApprovalPolicy: "on-request",
       launchProfiles: [
@@ -182,6 +184,7 @@ describe("loadConfig", () => {
     expect(config.codexPathOverride).toBeUndefined();
     expect(config.codexModel).toBeUndefined();
     expect(config.codexReasoningEffort).toBeUndefined();
+    expect((config as any).codexTurnTimeoutMs).toBeUndefined();
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
     expect(config.codexSandboxMode).toBe("workspace-write");
     expect(config.codexApprovalPolicy).toBe("never");
@@ -693,6 +696,22 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(
       "Invalid CODEX_REASONING_EFFORT: maximum. Expected one of minimal, low, medium, high, xhigh",
     );
+  });
+
+  it("parses CODEX_TURN_TIMEOUT_MS when configured", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_TURN_TIMEOUT_MS = "600000";
+
+    expect((loadConfig() as any).codexTurnTimeoutMs).toBe(600000);
+  });
+
+  it("throws when CODEX_TURN_TIMEOUT_MS is invalid", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_TURN_TIMEOUT_MS = "0";
+
+    expect(() => loadConfig()).toThrow("CODEX_TURN_TIMEOUT_MS must be a positive integer");
   });
 
   it("throws when unsafe extra launch profiles are configured without enabling them", () => {

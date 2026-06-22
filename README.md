@@ -55,6 +55,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `CODEX_API_KEY` | — | API key for Codex (alternative to ChatGPT login) |
    | `CODEX_MODEL` | — | Default model, e.g. `gpt-5.4`, `o3` |
    | `CODEX_REASONING_EFFORT` | — | Default reasoning effort for new threads: `minimal`, `low`, `medium`, `high`, or `xhigh` |
+   | `CODEX_TURN_TIMEOUT_MS` | — | Optional foreground Telegram turn lease in milliseconds; on timeout TeleCodex aborts the current Codex turn, sends a timeout reply, and drains queued follow-ups. Unset by default. |
    | `CODEX_SANDBOX_MODE` | — | `read-only`, `workspace-write` *(default)*, `danger-full-access` |
    | `CODEX_APPROVAL_POLICY` | — | `never` *(default)*, `on-request`, `on-failure`, `untrusted` |
    | `CODEX_LAUNCH_PROFILES_JSON` | — | Optional JSON array of named launch profiles for `/launch_profiles` |
