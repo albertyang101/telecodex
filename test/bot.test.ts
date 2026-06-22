@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -1489,6 +1489,194 @@ describe("createBot response delivery", () => {
     expect(String(session.prompt.mock.calls[2][0])).toContain("文档后面发来的文字");
   });
 
+  it("queues a document prompt even when the received acknowledgement fails to send", async () => {
+    const firstTurn = deferred<void>();
+    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-ack-fail-"));
+    tempDirs.push(workspace);
+    let promptCount = 0;
+    let messageId = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
+        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
+      }
+      callbacks.onAgentEnd();
+    });
+    session.getCurrentWorkspace.mockReturnValue(workspace);
+    session.getInfo.mockReturnValue({
+      ...session.getInfo(),
+      workspace,
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace }), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "documents/ack-fail.txt",
+      file_size: 5,
+    });
+    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
+      if (String(text).includes("Received:")) {
+        throw new Error("document acknowledgement failed");
+      }
+      messageId += 1;
+      return { message_id: messageId };
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
+      })),
+    );
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const documentHandler = bot.__handlers.on.get("message:document");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 58, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const documentPromise = documentHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 59,
+        document: { file_id: "doc-file-ack-fail", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
+        caption: "先总结这个文档",
+      },
+      api: bot.api,
+    });
+
+    await expect(
+      Promise.race([
+        documentPromise.then(
+          () => "resolved",
+          () => "rejected",
+        ),
+        delay(50).then(() => "timed-out"),
+      ]),
+    ).resolves.toBe("resolved");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 60, text: "文档确认失败后这条也必须进 Codex" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+    const documentInput = session.prompt.mock.calls[1][0] as { stagedFileInstructions?: string; text?: string };
+    expect(documentInput.stagedFileInstructions).toContain("report.txt");
+    expect(documentInput.text).toBe("先总结这个文档");
+    expect(String(session.prompt.mock.calls[2][0])).toContain("文档确认失败后这条也必须进 Codex");
+  });
+
+  it("drains later queued text after document outbox preparation fails", async () => {
+    const firstTurn = deferred<void>();
+    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-outbox-fail-"));
+    tempDirs.push(workspace);
+    let promptCount = 0;
+    let messageId = 0;
+    let blockedOutboxParent = false;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("后续文本回复。");
+        callbacks.onAgentMessage?.("后续文本回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    session.getCurrentWorkspace.mockReturnValue(workspace);
+    session.getInfo.mockReturnValue({
+      ...session.getInfo(),
+      workspace,
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace }), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "documents/outbox-fail.txt",
+      file_size: 5,
+    });
+    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
+      if (String(text).includes("Received:") && !blockedOutboxParent) {
+        await writeFile(path.join(workspace, ".telecodex", "turns"), "not a directory");
+        blockedOutboxParent = true;
+      }
+      messageId += 1;
+      return { message_id: messageId };
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
+      })),
+    );
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const documentHandler = bot.__handlers.on.get("message:document");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 61, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const documentPromise = documentHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 62,
+        document: { file_id: "doc-file-outbox-fail", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
+      },
+      api: bot.api,
+    });
+
+    await expect(
+      Promise.race([
+        documentPromise.then(
+          () => "resolved",
+          () => "rejected",
+        ),
+        delay(50).then(() => "timed-out"),
+      ]),
+    ).resolves.toBe("resolved");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 63, text: "文档 outbox 失败后这条也必须进 Codex" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("文档 outbox 失败后这条也必须进 Codex");
+  });
+
   it("drains later queued text after an earlier voice transcription fails", async () => {
     const firstTurn = deferred<void>();
     const transcribeStarted = deferred<void>();
@@ -1567,6 +1755,90 @@ describe("createBot response delivery", () => {
 
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
     expect(String(session.prompt.mock.calls[1][0])).toContain("语音失败后这条也必须进 Codex");
+  });
+
+  it("drains later queued text after an empty voice transcript notice fails to send", async () => {
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    let messageId = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("后续文本回复。");
+        callbacks.onAgentMessage?.("后续文本回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "voice/empty.ogg",
+      file_size: 3,
+    });
+    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
+      if (String(text).includes("Transcription was empty")) {
+        throw new Error("empty notice send failed");
+      }
+      messageId += 1;
+      return { message_id: messageId };
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      })),
+    );
+    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          return { text: "   ", durationMs: 1 };
+        }
+      },
+    }));
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 64, text: "先跑一个长任务" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const voicePromise = voiceHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 65, voice: { file_id: "voice-file-empty" } },
+      api: bot.api,
+    });
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 66, text: "空语音后这条也必须进 Codex" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await firstPromise;
+    await voicePromise;
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("空语音后这条也必须进 Codex");
+    const replies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(replies).not.toContain("Transcription failed");
   });
 
   it("drains later queued text after a stuck voice download times out", async () => {

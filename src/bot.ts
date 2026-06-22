@@ -2388,10 +2388,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
       const transcript = result.text.trim();
       if (!transcript) {
+        queuedPrompt.status = "skipped";
         await safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
           fallbackText: "Transcription was empty. Please try again or send text instead.",
-        });
-        queuedPrompt.status = "skipped";
+        }).catch(() => {});
         return;
       }
 
@@ -2532,13 +2532,23 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     await safeReply(ctx, `📎 <b>Received:</b> <code>${escapeHTML(stagedFile.safeName)}</code>`, {
       fallbackText: `📎 Received: ${stagedFile.safeName}`,
-    });
+    }).catch(() => {});
 
     // Keep typing visible during the gap between staging and prompt execution
     await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
 
     const outDir = outboxPath(workspace, turnId);
-    await ensureOutDir(outDir);
+    try {
+      await ensureOutDir(outDir);
+    } catch (error) {
+      queuedPrompt.status = "skipped";
+      await safeReply(ctx, `<b>Failed to prepare output folder:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed to prepare output folder: ${friendlyErrorText(error)}`,
+      }).catch(() => {});
+      await cleanupInbox(workspace, turnId).catch(() => {});
+      await drainQueuedPrompts(contextKey);
+      return;
+    }
 
     const promptInput: CodexPromptInput = {
       stagedFileInstructions: buildFileInstructions([stagedFile], outDir),
