@@ -30,7 +30,7 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string }> = [
     message: "Model not available. Use /model to pick a different one.",
   },
   {
-    pattern: /timeout|ETIMEDOUT|ESOCKETTIMEDOUT/i,
+    pattern: /timeout|timed out|ETIMEDOUT|ESOCKETTIMEDOUT/i,
     message: "Request timed out. Try a shorter prompt or use /retry.",
   },
   {

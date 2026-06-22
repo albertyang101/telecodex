@@ -116,6 +116,13 @@ const DEVELOPER_DISCIPLINE_GUARD = [
   "Do not trust subagents/tool output without first-hand verification. Do not touch Memory/Graphiti/personal memory unless Albert explicitly authorizes it.",
 ].join("\n");
 
+class CodexTurnTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Codex turn timed out after ${timeoutMs}ms`);
+    this.name = "CodexTurnTimeoutError";
+  }
+}
+
 const SOURCE_REQUEST_RE =
   /((?:show|include|with|provide|send|list|cite|add|attach|give)\s+(?:me\s+)?(?:the\s+)?(?:visible\s+)?(?:sources?|references?|citations?|sauces?|links?|urls?)|official\s+(?:site|url|link)|source\s*block|(?:给|列|带|附|发|贴|提供|保留|加上|展示|显示).{0,12}(?:引用|来源|出处|参考资料|链接|网址|官网)|(?:引用|来源|出处|参考资料|链接|网址|官网).{0,12}(?:发我|给我|列出|带上|附上|也要|保留|贴出来))/i;
 const SOURCE_PRESERVE_RE =
@@ -174,6 +181,66 @@ function visibleUserText(input: CodexPromptInput): string {
   }
 
   return input.text ?? "";
+}
+
+async function waitForCodexPrompt(
+  session: CodexSessionService,
+  promptPromise: Promise<void>,
+  timeoutMs: number | undefined,
+  onSettledAfterTimeout?: () => Promise<void>,
+): Promise<void> {
+  if (!timeoutMs) {
+    await promptPromise;
+    return;
+  }
+
+  let timedOut = false;
+  let notifiedPostTimeoutSettle = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const notifyPromptSettledAfterTimeout = (error?: unknown): void => {
+    if (!timedOut || notifiedPostTimeoutSettle) {
+      return;
+    }
+    notifiedPostTimeoutSettle = true;
+
+    if (error && !isAbortLikeError(error)) {
+      console.error("Codex prompt error after timeout abort:", formatError(error));
+    }
+
+    if (!onSettledAfterTimeout) {
+      return;
+    }
+
+    void onSettledAfterTimeout().catch((callbackError) => {
+      console.error("Failed to drain queued prompts after timeout abort:", formatError(callbackError));
+    });
+  };
+  const observedPromptPromise = promptPromise.catch((error) => {
+    if (timedOut) {
+      notifyPromptSettledAfterTimeout(error);
+      return;
+    }
+    throw error;
+  }).then(() => {
+    notifyPromptSettledAfterTimeout();
+  });
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      void session.abort().catch((error) => {
+        console.error("Failed to abort timed-out Codex turn:", formatError(error));
+      });
+      reject(new CodexTurnTimeoutError(timeoutMs));
+    }, timeoutMs);
+  });
+
+  try {
+    await Promise.race([observedPromptPromise, timeoutPromise]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function normalizePotentialPromptGuardLine(line: string): string {
@@ -1130,7 +1197,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      await session.prompt(withTelegramReplyStyleGuard(userInput, session.getInfo()), callbacks);
+      await waitForCodexPrompt(
+        session,
+        session.prompt(withTelegramReplyStyleGuard(userInput, session.getInfo()), callbacks),
+        config.codexTurnTimeoutMs,
+        () => drainQueuedPrompts(contextKey),
+      );
       updateSessionMetadata(contextKey, session);
       await ensureFinalized();
     } catch (error) {
@@ -3097,6 +3169,10 @@ function isTelegramParseError(error: unknown): boolean {
 function renderPromptFailure(accumulatedText: string, error: unknown): string {
   const message = friendlyErrorText(error);
   return accumulatedText.trim() ? `${accumulatedText.trim()}\n\n⚠️ ${message}` : `⚠️ ${message}`;
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  return /AbortError|aborted|operation was aborted/i.test(formatError(error));
 }
 
 function formatError(error: unknown): string {

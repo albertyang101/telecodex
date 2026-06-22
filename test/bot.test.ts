@@ -152,6 +152,7 @@ describe("createBot response delivery", () => {
     prompt: vi.fn(async (input, callbacks: CodexSessionCallbacks) => {
       await onPrompt(callbacks, input);
     }),
+    abort: vi.fn(async () => undefined),
     getInfo: vi.fn(() => ({
       threadId: "thread-1",
       workspace: "/workspace/base",
@@ -1011,6 +1012,71 @@ describe("createBot response delivery", () => {
     expect(String(session.prompt.mock.calls[1][0])).toContain("discipline_version=ALB-714-hard-discipline-v1");
     expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).not.toContain(
       "Still working on previous message",
+    );
+  });
+
+  it("aborts a stuck foreground Codex turn after the configured timeout and drains queued prompts", async () => {
+    const abortCalled = deferred<void>();
+    const releaseAbortedTurn = deferred<void>();
+    const abortedTurnSettled = deferred<void>();
+    let promptCount = 0;
+    let processing = false;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      processing = true;
+      if (promptCount === 1) {
+        await abortCalled.promise;
+        await releaseAbortedTurn.promise;
+        processing = false;
+        abortedTurnSettled.resolve();
+        throw new Error("The operation was aborted");
+      }
+
+      try {
+        callbacks.onTextDelta("第二轮回复。");
+        callbacks.onAgentMessage?.("第二轮回复。");
+        callbacks.onAgentEnd();
+      } finally {
+        processing = false;
+      }
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockImplementation(async () => {
+      abortCalled.resolve();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ codexTurnTimeoutMs: 5 } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 12, text: "第一条会卡住" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 13, text: "第二条必须在超时后继续进 Codex" },
+      api: bot.api,
+    });
+
+    await expect(Promise.race([firstPromise.then(() => "resolved"), delay(100).then(() => "timed-out")])).resolves.toBe(
+      "resolved",
+    );
+
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    releaseAbortedTurn.resolve();
+    await abortedTurnSettled.promise;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条必须在超时后继续进 Codex");
+    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).toContain(
+      "Request timed out. Try a shorter prompt or use /retry.",
     );
   });
 

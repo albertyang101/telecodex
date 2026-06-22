@@ -50,6 +50,11 @@ describe("error-messages", () => {
       expect(result.userMessage).toContain("timed out");
     });
 
+    it("translates timed out", () => {
+      const result = translateError(new Error("Codex turn timed out after 5ms"));
+      expect(result.userMessage).toBe("Request timed out. Try a shorter prompt or use /retry.");
+    });
+
     it("translates abort", () => {
       const result = translateError(new Error("The operation was aborted"));
       expect(result.userMessage).toBe("⏹ Aborted");
