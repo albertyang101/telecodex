@@ -27,6 +27,7 @@ export interface MailboxBridgeConfig {
   autoReply: boolean;
   maxMessagesPerTick: number;
   minSentAt?: string;
+  promptTimeoutMs?: number;
 }
 
 export interface TelegramTransportConfig {
@@ -319,6 +320,10 @@ function parseMailboxBridgeConfig(): MailboxBridgeConfig {
       "MAILBOX_MAX_MESSAGES_PER_TICK",
     ),
     minSentAt: parseMailboxMinSentAt(optionalString(process.env.MAILBOX_MIN_SENT_AT)),
+    promptTimeoutMs: parseOptionalPositiveIntegerEnv(
+      optionalString(process.env.MAILBOX_PROMPT_TIMEOUT_MS),
+      "MAILBOX_PROMPT_TIMEOUT_MS",
+    ),
   };
 }
 
@@ -446,6 +451,18 @@ function parseMailboxMinSentAt(raw: string | undefined): string | undefined {
   }
 
   return raw;
+}
+
+function parseOptionalPositiveIntegerEnv(raw: string | undefined, name: string): number | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
 }
 
 function parseMailboxTimestampMs(value: string): number | undefined {

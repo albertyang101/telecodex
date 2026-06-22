@@ -41,6 +41,8 @@ export interface MailboxDeliveryResult {
   skipped: number;
 }
 
+const MAILBOX_PROMPT_TIMEOUT_STATUS = "failed_prompt_timeout";
+
 export async function runMailboxDeliveryOnce(
   config: TeleCodexConfig,
   registry: Pick<SessionRegistry, "getOrCreate" | "updateMetadata">,
@@ -87,7 +89,19 @@ export async function runMailboxDeliveryOnce(
       await session.newThread();
     }
 
-    const finalText = await promptMailboxMessage(session, message);
+    let finalText: string;
+    try {
+      finalText = await promptMailboxMessage(session, message, settings.promptTimeoutMs);
+    } catch (error) {
+      if (!(error instanceof MailboxPromptTimeoutError)) {
+        throw error;
+      }
+      await quarantineTimedOutMailboxMessage(settings, statePath, seen, message);
+      registry.updateMetadata(contextKey, session);
+      skipped += 1;
+      break;
+    }
+
     if (shouldWriteReply(settings, message, finalText)) {
       await sendMailboxReply(settings, message, finalText.trim());
       replied += 1;
@@ -335,7 +349,11 @@ async function listDeliveryEvents(settings: MailboxBridgeConfig): Promise<Delive
   return events;
 }
 
-async function promptMailboxMessage(session: CodexSessionService, message: MailboxMessage): Promise<string> {
+async function promptMailboxMessage(
+  session: CodexSessionService,
+  message: MailboxMessage,
+  timeoutMs?: number,
+): Promise<string> {
   let accumulatedText = "";
   let completedAgentText = "";
   const callbacks: CodexSessionCallbacks = {
@@ -351,8 +369,62 @@ async function promptMailboxMessage(session: CodexSessionService, message: Mailb
     onAgentEnd: () => undefined,
   };
 
-  await session.prompt(renderCodexMailboxPrompt(message), callbacks);
+  const promptPromise = session.prompt(renderCodexMailboxPrompt(message), callbacks);
+  await awaitMailboxPrompt(session, promptPromise, timeoutMs);
   return completedAgentText || accumulatedText;
+}
+
+async function awaitMailboxPrompt(
+  session: CodexSessionService,
+  promptPromise: Promise<void>,
+  timeoutMs?: number,
+): Promise<void> {
+  if (!timeoutMs) {
+    await promptPromise;
+    return;
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      void session.abort().catch((error) => {
+        console.error("mailbox bridge abort after prompt timeout failed:", error instanceof Error ? error.message : String(error));
+      });
+      reject(new MailboxPromptTimeoutError(timeoutMs));
+    }, timeoutMs);
+  });
+
+  try {
+    await Promise.race([promptPromise, timeoutPromise]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+class MailboxPromptTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Mailbox Codex turn timed out after ${timeoutMs}ms`);
+    this.name = "MailboxPromptTimeoutError";
+  }
+}
+
+async function quarantineTimedOutMailboxMessage(
+  settings: MailboxBridgeConfig,
+  statePath: string,
+  seen: SeenState,
+  message: MailboxMessage,
+): Promise<void> {
+  await recordDeliveryReceipt(settings, message, MAILBOX_PROMPT_TIMEOUT_STATUS, message.path);
+  seen.messages[message.msgId] = {
+    processedAt: new Date().toISOString(),
+    from: message.from,
+    path: message.path,
+    status: MAILBOX_PROMPT_TIMEOUT_STATUS,
+  };
+  await saveSeenState(statePath, seen);
+  await ackDeliveryEvents(settings, message.msgId);
 }
 
 function ensureMailboxSessionIsReadOnly(session: CodexSessionService): void {

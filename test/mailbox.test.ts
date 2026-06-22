@@ -304,6 +304,142 @@ describe("mailbox bridge", () => {
     expect(existsSync(path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox"))).toBe(false);
   });
 
+  it("quarantines a stuck mailbox Codex turn without archiving or marking the message read", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const inboundPath = writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "stuck-msg",
+      subject: "Stuck mailbox turn",
+      body: "This prompt never returns.",
+    });
+    writeDeliveryEvent({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "stuck-msg",
+      subject: "Stuck mailbox turn",
+      messagePath: inboundPath,
+    });
+
+    const session = createSession(async () => {
+      await new Promise(() => undefined);
+    });
+    const config = createConfig({ personasRoot, workspace });
+    config.mailboxBridge.promptTimeoutMs = 5;
+
+    const result = await runMailboxDeliveryOnce(config, createRegistry(session) as never);
+
+    expect(result).toEqual({ processed: 0, replied: 0, skipped: 1 });
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(existsSync(inboundPath)).toBe(true);
+    expect(readFileSync(inboundPath, "utf8")).toContain("status: unread");
+    const receipt = JSON.parse(
+      readFileSync(
+        path.join(
+          personasRoot,
+          "_shared",
+          "memory",
+          "mailbox",
+          "_receipts",
+          "albert-v3",
+          "stuck-msg.json",
+        ),
+        "utf8",
+      ),
+    );
+    expect(receipt).toMatchObject({
+      msg_id: "stuck-msg",
+      status: "failed_prompt_timeout",
+      message_path: inboundPath,
+    });
+    const seen = JSON.parse(readFileSync(path.join(workspace, ".telecodex", "mailbox_seen_albert-v3.json"), "utf8"));
+    expect(seen.messages["stuck-msg"]).toMatchObject({
+      from: "cody",
+      path: inboundPath,
+      status: "failed_prompt_timeout",
+    });
+    expect(
+      existsSync(
+        path.join(
+          personasRoot,
+          "_shared",
+          "memory",
+          "mailbox",
+          "_events",
+          "albert-v3",
+          "archive",
+          "2026-06",
+          "20260621T000000Z-stuck-msg.json",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not let a quarantined timed-out mailbox message starve later messages", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "stuck-first",
+      sentAt: "2026-06-21T00:00:00Z",
+      subject: "Stuck first",
+      body: "This prompt never returns.",
+    });
+    writeDeliveryEvent({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "stuck-first",
+      sentAt: "2026-06-21T00:00:00Z",
+      subject: "Stuck first",
+      messagePath: "unused",
+    });
+    writeMailboxMessage({
+      personasRoot,
+      sender: "mira",
+      recipient: "albert-v3",
+      msgId: "second-ok",
+      sentAt: "2026-06-21T00:00:01Z",
+      subject: "Second ok",
+      body: "This should run after the stuck message is quarantined.",
+    });
+    writeDeliveryEvent({
+      personasRoot,
+      sender: "mira",
+      recipient: "albert-v3",
+      msgId: "second-ok",
+      sentAt: "2026-06-21T00:00:01Z",
+      subject: "Second ok",
+      messagePath: "unused",
+    });
+
+    const session = createSession(async (input, callbacks) => {
+      if (String(input).includes("msg_id: stuck-first")) {
+        await new Promise(() => undefined);
+        return;
+      }
+      callbacks.onAgentMessage?.("later message processed");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const config = createConfig({ personasRoot, workspace });
+    config.mailboxBridge.promptTimeoutMs = 5;
+
+    expect(await runMailboxDeliveryOnce(config, registry as never)).toEqual({ processed: 0, replied: 0, skipped: 1 });
+    expect(await runMailboxDeliveryOnce(config, registry as never)).toEqual({ processed: 1, replied: 1, skipped: 0 });
+
+    const replies = await readdir(path.join(personasRoot, "_shared", "memory", "mailbox", "mira", "inbox"));
+    expect(replies).toHaveLength(1);
+    expect(readFileSync(path.join(personasRoot, "_shared", "memory", "mailbox", "mira", "inbox", replies[0]!), "utf8")).toContain(
+      "later message processed",
+    );
+  });
+
   it("does not auto-reply to replies", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
@@ -521,6 +657,7 @@ function createConfig(overrides: { personasRoot: string; workspace: string }): T
       autoReply: true,
       maxMessagesPerTick: 1,
       minSentAt: undefined,
+      promptTimeoutMs: undefined,
     },
   };
 }
@@ -530,6 +667,7 @@ function createSession(onPrompt: (input: unknown, callbacks: CodexSessionCallbac
     isProcessing: vi.fn(() => false),
     hasActiveThread: vi.fn(() => true),
     newThread: vi.fn(),
+    abort: vi.fn(async () => undefined),
     prompt: vi.fn(async (input: unknown, callbacks: CodexSessionCallbacks) => {
       await onPrompt(input, callbacks);
     }),

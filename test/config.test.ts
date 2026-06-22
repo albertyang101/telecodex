@@ -40,6 +40,7 @@ describe("loadConfig", () => {
     delete process.env.MAILBOX_AUTO_REPLY;
     delete process.env.MAILBOX_MAX_MESSAGES_PER_TICK;
     delete process.env.MAILBOX_MIN_SENT_AT;
+    delete process.env.MAILBOX_PROMPT_TIMEOUT_MS;
     delete process.env.TELEGRAM_TRANSPORT_MCP_ENABLED;
     delete process.env.TELEGRAM_TRANSPORT_MCP_AUTO_APPROVE_SENDS;
     delete process.env.TELEGRAM_TRANSPORT_MCP_SERVER_NAME;
@@ -148,6 +149,7 @@ describe("loadConfig", () => {
         autoReply: false,
         maxMessagesPerTick: 1,
         minSentAt: undefined,
+        promptTimeoutMs: undefined,
       },
       telegramTransport: {
         enabled: false,
@@ -213,6 +215,7 @@ describe("loadConfig", () => {
     expect(config.showTurnTokenUsage).toBe(false);
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
+    expect(config.mailboxBridge.promptTimeoutMs).toBeUndefined();
     expect(config.workspace).toBe(process.cwd());
   });
 
@@ -413,6 +416,7 @@ describe("loadConfig", () => {
     process.env.MAILBOX_AUTO_REPLY = "true";
     process.env.MAILBOX_MAX_MESSAGES_PER_TICK = "2";
     process.env.MAILBOX_MIN_SENT_AT = "2026-06-21T06:15:00Z";
+    process.env.MAILBOX_PROMPT_TIMEOUT_MS = "120000";
 
     const config = loadConfig();
 
@@ -426,7 +430,19 @@ describe("loadConfig", () => {
       autoReply: true,
       maxMessagesPerTick: 2,
       minSentAt: "2026-06-21T06:15:00Z",
+      promptTimeoutMs: 120_000,
     });
+  });
+
+  it("rejects invalid MAILBOX_PROMPT_TIMEOUT_MS values", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_SANDBOX_MODE = "read-only";
+    process.env.CODEX_APPROVAL_POLICY = "never";
+    process.env.MAILBOX_PERSONA = "albert-v3";
+    process.env.MAILBOX_PROMPT_TIMEOUT_MS = "0";
+
+    expect(() => loadConfig()).toThrow("MAILBOX_PROMPT_TIMEOUT_MS must be a positive integer");
   });
 
   it("enables direct Telegram transport MCP only when explicitly configured", () => {
