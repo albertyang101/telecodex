@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
@@ -50,6 +51,9 @@ type ThreadRow = {
 type WorkspaceRow = {
   cwd: unknown;
 };
+type DatabaseReadResult<T> = { ok: true; value: T } | { ok: false };
+
+const SQLITE3_PATH = "/usr/bin/sqlite3";
 
 const betterSqlite3Module = await import("better-sqlite3").catch(() => null);
 const BetterSqlite3 = (
@@ -82,52 +86,111 @@ export function findLatestDatabase(): string | null {
 }
 
 export function listThreads(limit = 20): CodexThreadRecord[] {
-  return withDatabase((db) => {
+  const safeLimit = normalizeLimit(limit);
+  const databaseRows = withDatabase((db) => {
     const query = db.prepare(`
+        SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+        FROM threads
+        WHERE (archived = 0 OR archived IS NULL)
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `);
+
+    return query.all(safeLimit) as ThreadRow[];
+  });
+  const rows = databaseRows.ok
+    ? databaseRows.value
+    : querySqliteCli<ThreadRow>(`
       SELECT id, title, cwd, model, created_at, updated_at, first_user_message
       FROM threads
       WHERE (archived = 0 OR archived IS NULL)
       ORDER BY updated_at DESC
-      LIMIT ?
+      LIMIT ${safeLimit}
     `);
 
-    const rows = query.all(limit) as ThreadRow[];
-    return rows.map(mapThreadRow);
-  }) ?? [];
+  return rows?.map(mapThreadRow) ?? [];
 }
 
 export function getThread(id: string): CodexThreadRecord | null {
-  return (
-    withDatabase((db) => {
-      const query = db.prepare(`
+  const databaseRow = withDatabase((db) => {
+    const query = db.prepare(`
         SELECT id, title, cwd, model, created_at, updated_at, first_user_message
         FROM threads
         WHERE archived = 0 AND id = ?
         LIMIT 1
       `);
 
-      const row = query.get(id) as ThreadRow | undefined;
-      return row ? mapThreadRow(row) : null;
-    }) ?? null
-  );
+    return query.get(id) as ThreadRow | undefined;
+  });
+  const row = databaseRow.ok
+    ? databaseRow.value
+    : querySqliteCli<ThreadRow>(`
+      SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+      FROM threads
+      WHERE archived = 0 AND id = ${quoteSqlString(id)}
+      LIMIT 1
+    `)?.[0];
+
+  return row ? mapThreadRow(row) : null;
 }
 
 export function listWorkspaces(): string[] {
-  return (
-    withDatabase((db) => {
-      const query = db.prepare(`
+  const databaseRows = withDatabase((db) => {
+    const query = db.prepare(`
         SELECT DISTINCT cwd
         FROM threads
         WHERE (archived = 0 OR archived IS NULL) AND cwd IS NOT NULL AND cwd != ''
         ORDER BY cwd ASC
       `);
 
-      const rows = query.all() as WorkspaceRow[];
-      return rows
-        .map((row) => (typeof row.cwd === "string" ? row.cwd : ""))
-        .filter(Boolean);
-    }) ?? []
-  );
+    return query.all() as WorkspaceRow[];
+  });
+  const rows = databaseRows.ok
+    ? databaseRows.value
+    : querySqliteCli<WorkspaceRow>(`
+      SELECT DISTINCT cwd
+      FROM threads
+      WHERE (archived = 0 OR archived IS NULL) AND cwd IS NOT NULL AND cwd != ''
+      ORDER BY cwd ASC
+    `);
+
+  return rows?.map((row) => (typeof row.cwd === "string" ? row.cwd : "")).filter(Boolean) ?? [];
+}
+
+/*
+ * Codex state listing is UI/control-plane code. Prefer the in-process optional
+ * reader, but keep the bridge functional when its native binding is missing.
+ */
+function querySqliteCli<T>(sql: string): T[] | null {
+  const databasePath = findLatestDatabase();
+  if (!databasePath) {
+    return null;
+  }
+
+  try {
+    const output = execFileSync(SQLITE3_PATH, ["-readonly", "-json", databasePath, sql], {
+      encoding: "utf8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+    });
+    const parsed = JSON.parse(output.trim() || "[]");
+    return Array.isArray(parsed) ? (parsed as T[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeLimit(limit: number): number {
+  if (!Number.isFinite(limit)) {
+    return 20;
+  }
+
+  return Math.max(1, Math.min(100, Math.trunc(limit)));
+}
+
+function quoteSqlString(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 export function listModels(): CodexModelRecord[] {
@@ -172,22 +235,22 @@ function fromUnixSeconds(value: unknown): Date {
   return typeof value === "number" ? new Date(value * 1000) : new Date(0);
 }
 
-function withDatabase<T>(fn: (db: DatabaseInstance) => T): T | null {
+function withDatabase<T>(fn: (db: DatabaseInstance) => T): DatabaseReadResult<T> {
   if (!BetterSqlite3) {
-    return null;
+    return { ok: false };
   }
 
   const databasePath = findLatestDatabase();
   if (!databasePath) {
-    return null;
+    return { ok: false };
   }
 
   let db: DatabaseInstance | null = null;
   try {
     db = new BetterSqlite3(databasePath, { readonly: true, fileMustExist: true });
-    return fn(db);
+    return { ok: true, value: fn(db) };
   } catch {
-    return null;
+    return { ok: false };
   } finally {
     try {
       db?.close();
