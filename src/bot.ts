@@ -1538,12 +1538,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    await setReaction(ctx, "👀");
+    const receiptReaction = setReaction(ctx, "👀");
     try {
       await handleUserPrompt(ctx, contextKey, chatId, session, cached);
-      await setReaction(ctx, "👍");
+      await completeReaction(ctx, receiptReaction);
     } catch {
-      await clearReaction(ctx);
+      await failReaction(ctx, receiptReaction);
     }
   });
 

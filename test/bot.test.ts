@@ -1253,6 +1253,49 @@ describe("createBot response delivery", () => {
     expect(String(session.prompt.mock.calls[1][0])).toContain("空语音 clear reaction 卡住后这条也必须进 Codex");
   });
 
+  it("does not let a stuck retry reaction block retry prompt execution", async () => {
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
+      callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ enableTelegramReactions: true }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const retryCommand = bot.__handlers.commands.get("retry");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 84, text: "这条会被 retry" },
+      api: bot.api,
+    });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    bot.api.setMessageReaction.mockImplementation(async (_chatId: number, messageId: number) => {
+      if (messageId === 85) {
+        await new Promise(() => {});
+      }
+      return true;
+    });
+
+    const retryPromise = retryCommand({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 85, text: "/retry" },
+      api: bot.api,
+    });
+
+    await expect(Promise.race([retryPromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
+      "resolved",
+    );
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("这条会被 retry");
+  });
+
   it("keeps the final reaction after a slow receipt reaction settles late", async () => {
     const slowReceiptReaction = deferred<void>();
     const finishTurn = deferred<void>();
