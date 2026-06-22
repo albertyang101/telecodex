@@ -63,6 +63,15 @@ Open items stay in Linear, not here:
 - Validate runtime discipline end to end on THEO/testboard; tracked by ALB-714 / ALB-698.
 - GitHub branch/PR sync and Albert acceptance before closing ALB-717.
 
+2026-06-22 ALB-833 Memory transcript sink addendum:
+
+- ALB-833 root cause: the live `com.albert.albert-v3-codex-dispatcher` runtime was a TeleCodex/Codex dispatcher, not the old Channels wrapper, so Graphiti had no proven `TRANSCRIPT_ROOT` lane for `albert-v3` source Sessions.
+- Implementation boundary: TeleCodex still does not read/query Memory. It only has an optional write sink enabled by `TRANSCRIPT_ROOT`.
+- Contract: `TRANSCRIPT_ROOT` must be an absolute source persona `memory/Sessions` directory. `MEMORY_TRANSCRIPT_ROOT` is intentionally not accepted, matching the Memory health check contract.
+- Runtime target for THEO/albert-v3: `TRANSCRIPT_ROOT=/Users/albertyang0888/personas/albert-v3/memory/Sessions`.
+- Output format: append-only `YYYY-MM-DD.md` blocks tagged `[user-raw]` and `[bot-raw]` with `message_id`, `context_key`, and `thread_id` metadata comments. Graphiti owns owner routing and lane markers.
+- This does not close ALB-833 until the launchd env is deployed, live Telegram proof creates a source Sessions turn, health reports `codex_dispatcher_memory_lane OK`, and the next Graphiti ingest advances `.graphiti_session_state.albert-v3.json`.
+
 ALB-714 discipline mirror:
 
 - The Codex developer discipline must require root-cause fixes, not downstream symptom patches.

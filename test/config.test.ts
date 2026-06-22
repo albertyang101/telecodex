@@ -31,6 +31,8 @@ describe("loadConfig", () => {
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
+    delete process.env.TRANSCRIPT_ROOT;
+    delete process.env.MEMORY_TRANSCRIPT_ROOT;
     delete process.env.MAILBOX_ENABLED;
     delete process.env.MAILBOX_PERSONA;
     delete process.env.PERSONAS_ROOT;
@@ -141,6 +143,7 @@ describe("loadConfig", () => {
       showTurnTokenUsage: false,
       enableTelegramLogin: true,
       enableTelegramReactions: false,
+      memoryTranscriptRoot: undefined,
       mailboxBridge: {
         enabled: false,
         persona: undefined,
@@ -218,8 +221,37 @@ describe("loadConfig", () => {
     expect(config.showTurnTokenUsage).toBe(false);
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
+    expect(config.memoryTranscriptRoot).toBeUndefined();
     expect(config.mailboxBridge.promptTimeoutMs).toBeUndefined();
     expect(config.workspace).toBe(process.cwd());
+  });
+
+  it("parses optional TRANSCRIPT_ROOT as an absolute Sessions path", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TRANSCRIPT_ROOT = path.join(tempDir, "personas", "albert-v3", "memory", "Sessions");
+
+    const config = loadConfig();
+
+    expect(config.memoryTranscriptRoot).toBe(process.env.TRANSCRIPT_ROOT);
+  });
+
+  it("rejects relative TRANSCRIPT_ROOT values", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TRANSCRIPT_ROOT = "relative/Sessions";
+
+    expect(() => loadConfig()).toThrow("TRANSCRIPT_ROOT must be an absolute path");
+  });
+
+  it("does not accept MEMORY_TRANSCRIPT_ROOT as a transcript contract alias", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.MEMORY_TRANSCRIPT_ROOT = path.join(tempDir, "personas", "albert-v3", "memory", "Sessions");
+
+    const config = loadConfig();
+
+    expect(config.memoryTranscriptRoot).toBeUndefined();
   });
 
   it("throws when CODEX_PATH is relative", () => {

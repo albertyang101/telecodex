@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -129,6 +129,7 @@ describe("createBot response delivery", () => {
     enableTelegramLogin: true,
     enableTelegramReactions: false,
     streamAgentResponses: false,
+    memoryTranscriptRoot: undefined,
     mailboxBridge: {
       enabled: false,
       persona: undefined,
@@ -322,6 +323,112 @@ describe("createBot response delivery", () => {
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
     expect(bot.api.sendMessage.mock.calls[0][1]).toContain("✅ Done");
     expect(bot.api.sendMessage.mock.calls[0][1]).not.toContain("中间草稿");
+  });
+
+  it("appends Graphiti source session turns when a memory transcript root is configured", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("ALB-833 测试回复");
+      callbacks.onAgentMessage?.("ALB-833 测试回复");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 91, text: "请记录 ALB-833 测试输入" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^20\d{2}-\d{2}-\d{2}\.md$/);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+
+    expect(transcript).toContain("[user-raw]");
+    expect(transcript).toMatch(/^## \d{2}:\d{2}:\d{2} \[user-raw\]/m);
+    expect(transcript).toContain("<!-- message_id=42:91; context_key=42; thread_id=thread-1 -->");
+    expect(transcript).toContain("请记录 ALB-833 测试输入");
+    expect(transcript).toContain("[bot-raw]");
+    expect(transcript).toMatch(/^## \d{2}:\d{2}:\d{2} \[bot-raw\]/m);
+    expect(transcript).toContain("<!-- message_id=42:91; context_key=42; thread_id=thread-1 -->");
+    expect(transcript).toContain("ALB-833 测试回复");
+    expect(transcript).not.toContain("Albert: 请记录 ALB-833 测试输入");
+    expect(transcript).not.toContain("Assistant: ALB-833 测试回复");
+    expect(transcript).not.toContain("session_id=");
+  });
+
+  it("records the visible fallback bot turn when the final agent message is empty", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-empty-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("中间草稿，不进最终记忆。");
+      callbacks.onAgentMessage?.("");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 92, text: "空回复 fallback 测试" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+
+    expect(transcript).toContain("[user-raw]");
+    expect(transcript).toContain("空回复 fallback 测试");
+    expect(transcript).toContain("[bot-raw]");
+    expect(transcript).toContain("Done");
+    expect(transcript).not.toContain("中间草稿，不进最终记忆。");
+  });
+
+  it("keeps replying and avoids logging turn text when memory append fails", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-fail-"));
+    tempDirs.push(root);
+    const blockedRoot = path.join(root, "not-a-directory");
+    await writeFile(blockedRoot, "blocks mkdir");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("ALB-833 visible reply after append failure");
+      callbacks.onAgentMessage?.("ALB-833 visible reply after append failure");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    try {
+      const bot = createBot(createConfig({ memoryTranscriptRoot: blockedRoot }), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 93, text: "ALB-833 append failure input" },
+        api: bot.api,
+      });
+
+      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+      expect(bot.api.sendMessage.mock.calls[0][1]).toContain("ALB-833 visible reply after append failure");
+      const logged = consoleError.mock.calls.flat().map(String).join("\n");
+      expect(logged).toContain("Failed to append memory user turn");
+      expect(logged).toContain("Failed to append memory bot turn");
+      expect(logged).not.toContain("ALB-833 append failure input");
+      expect(logged).not.toContain("ALB-833 visible reply after append failure");
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it("prepends Telegram reply style guard before sending user text to Codex", async () => {

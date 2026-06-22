@@ -71,6 +71,7 @@ export interface TeleCodexConfig {
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
+  memoryTranscriptRoot?: string;
   mailboxBridge: MailboxBridgeConfig;
   telegramTransport: TelegramTransportConfig;
   linearControl: LinearControlConfig;
@@ -115,6 +116,10 @@ export function loadConfig(): TeleCodexConfig {
     optionalString(process.env.ENABLE_TELEGRAM_REACTIONS),
     false,
   );
+  const memoryTranscriptRoot = parseOptionalAbsolutePath(
+    optionalString(process.env.TRANSCRIPT_ROOT),
+    "TRANSCRIPT_ROOT",
+  );
   const mailboxBridge = parseMailboxBridgeConfig();
   const telegramTransport = parseTelegramTransportConfig();
   const linearControl = parseLinearControlConfig();
@@ -142,6 +147,7 @@ export function loadConfig(): TeleCodexConfig {
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
+    memoryTranscriptRoot,
     mailboxBridge,
     telegramTransport,
     linearControl,
@@ -230,6 +236,18 @@ function parseCodexPathOverride(raw: string | undefined): string | undefined {
     accessSync(raw, constants.X_OK);
   } catch {
     throw new Error(`CODEX_PATH is not executable: ${raw}`);
+  }
+
+  return raw;
+}
+
+function parseOptionalAbsolutePath(raw: string | undefined, name: string): string | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  if (!path.isAbsolute(raw)) {
+    throw new Error(`${name} must be an absolute path`);
   }
 
   return raw;

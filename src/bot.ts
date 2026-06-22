@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -181,6 +181,73 @@ function visibleUserText(input: CodexPromptInput): string {
   }
 
   return input.text ?? "";
+}
+
+function padTwoDigits(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function localDateStamp(now = new Date()): string {
+  return [
+    now.getFullYear(),
+    padTwoDigits(now.getMonth() + 1),
+    padTwoDigits(now.getDate()),
+  ].join("-");
+}
+
+function todaySessionFile(root: string, now = new Date()): string {
+  return path.join(root, `${localDateStamp(now)}.md`);
+}
+
+function turnTimestamp(now = new Date()): string {
+  return [
+    padTwoDigits(now.getHours()),
+    padTwoDigits(now.getMinutes()),
+    padTwoDigits(now.getSeconds()),
+  ].join(":");
+}
+
+function sanitizeTurnText(text: string): string {
+  return text.replace(/\r\n?/g, "\n").trim();
+}
+
+function turnMetadata(ctx: Context, contextKey: TelegramContextKey, session: CodexSessionService): string {
+  const chatId = ctx.chat?.id;
+  const messageId = ctx.message?.message_id;
+  const ids = chatId !== undefined && messageId !== undefined ? `${chatId}:${messageId}` : "unknown";
+  const threadId = session.getInfo().threadId;
+  return [
+    `message_id=${ids}`,
+    `context_key=${contextKey}`,
+    threadId ? `thread_id=${threadId}` : undefined,
+  ]
+    .filter((item): item is string => Boolean(item))
+    .join("; ");
+}
+
+async function appendMemoryTranscriptTurn(
+  config: TeleCodexConfig,
+  ctx: Context,
+  contextKey: TelegramContextKey,
+  session: CodexSessionService,
+  tag: "user-raw" | "bot-raw",
+  text: string,
+): Promise<void> {
+  const root = config.memoryTranscriptRoot;
+  const body = sanitizeTurnText(text);
+  if (!root || !body) {
+    return;
+  }
+
+  await mkdir(root, { recursive: true });
+  const file = todaySessionFile(root);
+  const block = [
+    `## ${turnTimestamp()} [${tag}]`,
+    `<!-- ${turnMetadata(ctx, contextKey, session)} -->`,
+    body,
+    "",
+  ].join("\n");
+  await appendFile(file, block, "utf8");
 }
 
 async function waitForCodexPrompt(
@@ -782,7 +849,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let lastRenderedPlan = "";
     let planMessageSending = false;
     let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
-    let finalizePromise: Promise<void> | undefined;
+    let finalizePromise: Promise<string> | undefined;
     const userVisibleText = visibleUserText(userInput);
 
     const typingInterval = setInterval(() => {
@@ -976,9 +1043,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     };
 
-    const finalizeResponse = async (): Promise<void> => {
+    const finalizeResponse = async (): Promise<string> => {
       if (finalized) {
-        return;
+        return "";
       }
       finalized = true;
 
@@ -1003,13 +1070,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         } else {
           await safeReply(ctx, html, { fallbackText: plainText });
         }
-        return;
+        return plainText;
       }
 
       await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
+      return finalText;
     };
 
-    const ensureFinalized = (): Promise<void> => {
+    const ensureFinalized = (): Promise<string> => {
       if (!finalizePromise) {
         finalizePromise = finalizeResponse();
       }
@@ -1197,6 +1265,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
+      await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "user-raw", userVisibleText).catch((error) => {
+        console.error("Failed to append memory user turn:", error instanceof Error ? error.message : String(error));
+      });
+
       await waitForCodexPrompt(
         session,
         session.prompt(withTelegramReplyStyleGuard(userInput, session.getInfo()), callbacks),
@@ -1204,7 +1276,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         () => drainQueuedPrompts(contextKey),
       );
       updateSessionMetadata(contextKey, session);
-      await ensureFinalized();
+      const finalVisibleText = await ensureFinalized();
+      await appendMemoryTranscriptTurn(
+        config,
+        ctx,
+        contextKey,
+        session,
+        "bot-raw",
+        finalVisibleText,
+      ).catch((error) => {
+        console.error("Failed to append memory bot turn:", error instanceof Error ? error.message : String(error));
+      });
     } catch (error) {
       stopTyping();
       clearFlushTimer();

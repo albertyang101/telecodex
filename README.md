@@ -66,6 +66,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
    | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
    | `ENABLE_TELEGRAM_REACTIONS` | — | Enable Telegram emoji reactions like 👀 / 👍 (`false` by default) |
+   | `TRANSCRIPT_ROOT` | — | Optional absolute path to a Graphiti-readable source `memory/Sessions` directory. When set, TeleCodex appends final user/assistant turns as `[user-raw]` / `[bot-raw]` markdown for Albert Memory ingest. |
    | `TELEGRAM_TRANSPORT_MCP_ENABLED` | — | Enable the CC-style `telegram_transport` MCP server for direct cross-persona Telegram sends (`false` by default) |
    | `TELEGRAM_TRANSPORT_MCP_AUTO_APPROVE_SENDS` | — | Auto-approve the direct Telegram send MCP tool for non-interactive dispatcher runs. This can post real Telegram messages; keep `false` unless the runtime is isolated and explicitly allowed. |
    | `TELEGRAM_TRANSPORT_MCP_SERVER_NAME` | — | MCP server name injected into Codex CLI (default `telegram_transport`) |
@@ -184,6 +185,22 @@ The `SessionRegistry` maps context keys to `CodexSessionService` instances:
 Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecodex/contexts.json` and restored on restart so threads survive bot reboots.
 
 Each context has independent busy-state tracking, so a running prompt in one topic doesn't block another.
+
+## Optional Memory Transcript Sink
+
+TeleCodex does not read or query Albert Memory. When `TRANSCRIPT_ROOT` is set to an absolute source `memory/Sessions` directory, it appends only the visible Telegram user turn and final assistant reply to `YYYY-MM-DD.md` using the existing Graphiti session format:
+
+```md
+## HH:MM:SS [user-raw]
+<!-- message_id=<chat>:<message>; context_key=<context>; thread_id=<codex-thread> -->
+<user text>
+
+## HH:MM:SS [bot-raw]
+<!-- message_id=<chat>:<message>; context_key=<context>; thread_id=<codex-thread> -->
+<assistant text>
+```
+
+For aliased Albert bots, point this to the source persona directory, for example `/Users/albertyang0888/personas/albert-v3/memory/Sessions`. The Graphiti ingest layer owns the source-to-owner routing and lane markers.
 
 ## Handoff: Telegram → CLI
 
