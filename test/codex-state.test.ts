@@ -1,6 +1,12 @@
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const mockExecFileSync = vi.hoisted(() => vi.fn());
+
+vi.mock("node:child_process", () => ({
+  execFileSync: mockExecFileSync,
+}));
+
 type ThreadFixture = {
   id: string;
   title: string;
@@ -20,6 +26,8 @@ type LoadOptions = {
   modelsJson?: string;
   betterSqliteAvailable?: boolean;
   openThrows?: boolean;
+  sqliteCliOutput?: string;
+  sqliteCliThrows?: boolean;
 };
 
 const originalHome = process.env.HOME;
@@ -28,6 +36,7 @@ afterEach(() => {
   vi.doUnmock("node:fs");
   vi.doUnmock("better-sqlite3");
   vi.resetModules();
+  mockExecFileSync.mockReset();
 
   if (originalHome === undefined) {
     delete process.env.HOME;
@@ -46,6 +55,14 @@ async function loadCodexState(options: LoadOptions = {}) {
   process.env.HOME = home;
 
   vi.resetModules();
+  mockExecFileSync.mockReset();
+  mockExecFileSync.mockImplementation(() => {
+    if (options.sqliteCliThrows) {
+      throw new Error("sqlite3 failed");
+    }
+
+    return options.sqliteCliOutput ?? "[]";
+  });
 
   vi.doMock("node:fs", () => ({
     existsSync: vi.fn((targetPath: string) => {
@@ -157,6 +174,115 @@ describe("codex-state", () => {
     const state = await loadCodexState({ betterSqliteAvailable: false, files: ["state_main.sqlite"] });
 
     expect(state.listThreads()).toEqual([]);
+  });
+
+  it("getThread reads Codex state through sqlite3 CLI when better-sqlite3 is unavailable", async () => {
+    const state = await loadCodexState({
+      betterSqliteAvailable: false,
+      files: ["state_main.sqlite"],
+      sqliteCliOutput: JSON.stringify([
+        {
+          id: "019eeed3-cdb6-7271-b597-337fc266709f",
+          title: "Lifecycle",
+          cwd: "/workspace/lifecycle",
+          model: "gpt-5.5",
+          created_at: 1_700_000_000,
+          updated_at: 1_700_000_100,
+          first_user_message: "ready",
+        },
+      ]),
+    });
+
+    expect(state.getThread("019eeed3-cdb6-7271-b597-337fc266709f")).toEqual({
+      id: "019eeed3-cdb6-7271-b597-337fc266709f",
+      title: "Lifecycle",
+      cwd: "/workspace/lifecycle",
+      model: "gpt-5.5",
+      createdAt: new Date(1_700_000_000 * 1000),
+      updatedAt: new Date(1_700_000_100 * 1000),
+      firstUserMessage: "ready",
+    });
+    expect(mockExecFileSync).toHaveBeenCalledWith(
+      "/usr/bin/sqlite3",
+      expect.arrayContaining(["-json", expect.stringContaining("state_main.sqlite")]),
+      expect.any(Object),
+    );
+  });
+
+  it("getThread does not use sqlite3 CLI when better-sqlite3 successfully finds no row", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      sqliteCliOutput: JSON.stringify([
+        {
+          id: "missing",
+          title: "Wrong source",
+          cwd: "/workspace/wrong",
+          model: "gpt-5.5",
+          created_at: 1,
+          updated_at: 2,
+          first_user_message: "wrong",
+        },
+      ]),
+    });
+
+    expect(state.getThread("missing")).toBeNull();
+    expect(mockExecFileSync).not.toHaveBeenCalled();
+  });
+
+  it("getThread escapes ids when querying through sqlite3 CLI", async () => {
+    const state = await loadCodexState({
+      betterSqliteAvailable: false,
+      files: ["state_main.sqlite"],
+      sqliteCliOutput: "[]",
+    });
+
+    expect(state.getThread("thread'abc")).toBeNull();
+    const sqliteArgs = mockExecFileSync.mock.calls[0]?.[1] as string[];
+    expect(sqliteArgs).toContain("-readonly");
+    expect(sqliteArgs).toContain("-json");
+    expect(sqliteArgs.at(-1)).toContain("id = 'thread''abc'");
+  });
+
+  it("listThreads reads Codex state through sqlite3 CLI when better-sqlite3 is unavailable", async () => {
+    const state = await loadCodexState({
+      betterSqliteAvailable: false,
+      files: ["state_main.sqlite"],
+      sqliteCliOutput: JSON.stringify([
+        {
+          id: "thread-1",
+          title: "One",
+          cwd: "/workspace/a",
+          model: "gpt-5.5",
+          created_at: 1_700_000_000,
+          updated_at: 1_700_000_100,
+          first_user_message: "one",
+        },
+      ]),
+    });
+
+    expect(state.listThreads(5)).toEqual([
+      {
+        id: "thread-1",
+        title: "One",
+        cwd: "/workspace/a",
+        model: "gpt-5.5",
+        createdAt: new Date(1_700_000_000 * 1000),
+        updatedAt: new Date(1_700_000_100 * 1000),
+        firstUserMessage: "one",
+      },
+    ]);
+    const sqliteArgs = mockExecFileSync.mock.calls[0]?.[1] as string[];
+    expect(sqliteArgs.at(-1)).toContain("LIMIT 5");
+  });
+
+  it("listWorkspaces reads Codex state through sqlite3 CLI when better-sqlite3 is unavailable", async () => {
+    const state = await loadCodexState({
+      betterSqliteAvailable: false,
+      files: ["state_main.sqlite"],
+      sqliteCliOutput: JSON.stringify([{ cwd: "/workspace/a" }, { cwd: "/workspace/b" }]),
+    });
+
+    expect(state.listWorkspaces()).toEqual(["/workspace/a", "/workspace/b"]);
   });
 
   it("listThreads returns mapped active thread records", async () => {
