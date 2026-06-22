@@ -3,11 +3,19 @@ import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
 import { loadConfig } from "./config.js";
 import { startMailboxBridge } from "./mailbox.js";
+import { installFatalProcessHandlers } from "./process-lifecycle.js";
 import { SessionRegistry } from "./session-registry.js";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
 let stopMailboxBridge: (() => void) | undefined;
+let shuttingDown = false;
+
+installFatalProcessHandlers({
+  getBot: () => bot,
+  getStopMailboxBridge: () => stopMailboxBridge,
+  getRegistry: () => registry,
+});
 
 try {
   const config = loadConfig();
@@ -49,7 +57,6 @@ try {
   process.exit(1);
 }
 
-let shuttingDown = false;
 const shutdown = (signal: NodeJS.Signals) => {
   if (shuttingDown) {
     return;
