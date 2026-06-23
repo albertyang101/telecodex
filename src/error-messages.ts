@@ -18,7 +18,7 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string }> = [
     message: "Rate limited by the API. Wait a moment and try again.",
   },
   {
-    pattern: /usage.?limit|purchase more credits|try again at/i,
+    pattern: /usage.?(?:limit|cap|capped)|purchase more credits|try again at/i,
     message: "Codex usage limit reached. Wait for quota reset or use an approved fallback profile.",
   },
   {
