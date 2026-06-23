@@ -1344,6 +1344,14 @@ export function createBot(
         const chunks = splitMarkdownForTelegram(combinedText);
         try {
           await deliverRenderedChunks(chunks);
+          await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "bot-raw", combinedText).catch(
+            (appendError) => {
+              console.error(
+                "Failed to append memory bot turn:",
+                appendError instanceof Error ? appendError.message : String(appendError),
+              );
+            },
+          );
         } catch (telegramError) {
           console.error("Failed to send error message to Telegram:", telegramError);
         }
