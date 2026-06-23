@@ -37,6 +37,16 @@ describe("error-messages", () => {
       expect(result.userMessage).not.toContain("chatgpt.com");
     });
 
+    it("translates Codex usage cap wording without leaking provider URLs", () => {
+      const result = translateError(
+        new Error("Your usage cap is exhausted. See https://chatgpt.com/codex/settings/usage for details."),
+      );
+
+      expect(result.userMessage).toContain("Codex usage limit");
+      expect(result.userMessage).not.toContain("https://");
+      expect(result.userMessage).not.toContain("chatgpt.com");
+    });
+
     it("translates 401 unauthorized", () => {
       const result = translateError(new Error("401 Unauthorized"));
       expect(result.userMessage).toContain("/login");
