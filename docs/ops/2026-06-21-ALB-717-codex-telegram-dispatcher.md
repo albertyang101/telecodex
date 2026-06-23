@@ -14,7 +14,7 @@ Linear is the control-plane truth. This file is only a local recovery pointer fo
 - Runtime launchd label: `com.albert.albert-v3-codex-dispatcher`
 - Runtime repo: `/Users/albertyang0888/code/codex-telegram-research/telecodex`
 - Runtime workspace: `/Users/albertyang0888/code/codex-telegram-research/discipline-workspace`
-- Final target runtime model/effort: `gpt-5.5` + `xhigh`
+- Current THEO runtime model/effort: `gpt-5.5` + `high`
 
 2026-06-21 checkpoint:
 
@@ -62,6 +62,33 @@ Open items stay in Linear, not here:
 - Build the CodexBot Agent Skill after the design/spec has closed; tracked by ALB-716.
 - Validate runtime discipline end to end on THEO/testboard; tracked by ALB-714 / ALB-698.
 - GitHub branch/PR sync and Albert acceptance before closing ALB-717.
+
+2026-06-23 ALB-917 runner / restart intake addendum:
+
+- ALB-917 is the current fresh disposable Codex dispatcher live-build line. It is separate from Memory and from the parallel dispatcher WIP.
+- Runtime branch: `alb-717-native-telegram-queue`.
+- Latest commits:
+  - `febb7dd Refs ALB-917 use runner polling for Codex dispatcher`
+  - `31077c9 Refs ALB-917 preserve Telegram updates on restart`
+- P0 root cause found for THEO 17:36 no-response/no-typing:
+  - THEO process restarted at Tue Jun 23 17:36:37 2026, matching Albert's missing-message window.
+  - No active `codex exec`, `linear-control`, or `telegram-transport` child existed under THEO when checked, so Codex had not received a turn.
+  - `src/polling.ts` defaulted every startup to `deleteWebhook({ drop_pending_updates: true })`, so Telegram updates queued during a restart could be intentionally dropped at the intake boundary.
+- Fix:
+  - `startTelegramPolling()` now defaults to `drop_pending_updates: false` for normal restarts.
+  - Explicit `dropPendingUpdates: true` is still available for a deliberate one-off clean startup.
+- TDD / verification:
+  - Red target test first: `test/polling.test.ts` expected normal restart to preserve queued updates and failed with received `true`.
+  - Green target test: `npm test -- --run test/polling.test.ts` passed, 3 tests.
+  - Full Mac mini suite: `npm test -- --reporter=dot` passed, 24 files / 480 tests.
+  - Build: `npm run build` passed.
+- Deployment:
+  - `com.albert.albert-codex-e2e-codex-dispatcher`: running after restart, pid `82919`, last exit code `0`.
+  - `com.albert.albert-v3-codex-dispatcher`: running after restart, pid `82960`, last exit code `0`.
+- Linear evidence:
+  - ALB-917 comment `ee92d0d2-1cd2-4d9f-9e41-c5d36d8a165d`
+  - ALB-831 comment `03c9a68d-f375-401b-a6fb-813e2fee3e75`
+- Live Telegram E2E proof remains pending because the shared Pyrogram user session is held by another CC task (`/tmp/_iris_case.py`). Do not steal that lock; send an isolated E2E nonce when the session is free.
 
 2026-06-22 ALB-833 Memory transcript sink addendum:
 
