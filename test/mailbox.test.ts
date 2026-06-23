@@ -6,7 +6,7 @@ import { describe, expect, it, vi, afterEach, beforeEach } from "vitest";
 
 import type { CodexSessionCallbacks } from "../src/codex-session.js";
 import type { TeleCodexConfig } from "../src/config.js";
-import { runMailboxDeliveryOnce } from "../src/mailbox.js";
+import { runMailboxDeliveryOnce, startMailboxBridge } from "../src/mailbox.js";
 
 describe("mailbox bridge", () => {
   let tempDir: string;
@@ -378,6 +378,333 @@ describe("mailbox bridge", () => {
     ).toBe(true);
   });
 
+  it("quarantines a mailbox turn that settles only after the prompt timeout fires", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const inboundPath = writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "late-after-timeout",
+      subject: "Late after timeout",
+      body: "This prompt returns after timeout but before abort grace expires.",
+    });
+    writeDeliveryEvent({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "late-after-timeout",
+      subject: "Late after timeout",
+      messagePath: inboundPath,
+    });
+
+    const abortCalled = deferred<void>();
+    let processing = false;
+    const session = createSession(async (_input, callbacks) => {
+      processing = true;
+      await abortCalled.promise;
+      await delay(10);
+      callbacks.onAgentMessage?.("late reply should not be mailed");
+      callbacks.onAgentEnd();
+      processing = false;
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockImplementation(async () => {
+      abortCalled.resolve();
+    });
+    const config = createConfig({ personasRoot, workspace });
+    config.codexTurnAbortGraceMs = 50;
+    config.mailboxBridge.promptTimeoutMs = 5;
+
+    const result = await runMailboxDeliveryOnce(config, createRegistry(session) as never);
+
+    expect(result).toEqual({ processed: 0, replied: 0, skipped: 1 });
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(existsSync(inboundPath)).toBe(true);
+    expect(existsSync(path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox"))).toBe(false);
+    const receipt = JSON.parse(
+      readFileSync(
+        path.join(
+          personasRoot,
+          "_shared",
+          "memory",
+          "mailbox",
+          "_receipts",
+          "albert-v3",
+          "late-after-timeout.json",
+        ),
+        "utf8",
+      ),
+    );
+    expect(receipt.status).toBe("failed_prompt_timeout");
+    await delay(20);
+    expect(existsSync(path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox"))).toBe(false);
+  });
+
+  it("reports fatal recovery when a timed-out mailbox Codex turn remains active after abort grace", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const inboundPath = writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "stuck-after-abort",
+      subject: "Stuck after abort",
+      body: "This prompt ignores abort and never releases the session.",
+    });
+    writeDeliveryEvent({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "stuck-after-abort",
+      subject: "Stuck after abort",
+      messagePath: inboundPath,
+    });
+
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const config = createConfig({ personasRoot, workspace });
+    config.codexTurnAbortGraceMs = 5;
+    config.mailboxBridge.promptTimeoutMs = 5;
+    const onFatalRecovery = vi.fn();
+
+    const result = await runMailboxDeliveryOnce(config, createRegistry(session) as never, { onFatalRecovery });
+
+    expect(result).toEqual({ processed: 0, replied: 0, skipped: 1 });
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(existsSync(inboundPath)).toBe(true);
+    expect(readFileSync(inboundPath, "utf8")).toContain("status: unread");
+    await vi.waitFor(() => expect(onFatalRecovery).toHaveBeenCalledTimes(1));
+    expect(String(onFatalRecovery.mock.calls[0]?.[0]?.message)).toContain(
+      "Mailbox Codex turn remained active after timeout abort grace",
+    );
+  });
+
+  it("persists the timeout quarantine before starting mailbox fatal recovery", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const inboundPath = writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "quarantine-before-fatal",
+      subject: "Quarantine before fatal",
+      body: "This prompt should leave evidence before fatal recovery is allowed.",
+    });
+    writeDeliveryEvent({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "quarantine-before-fatal",
+      subject: "Quarantine before fatal",
+      messagePath: inboundPath,
+    });
+
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const config = createConfig({ personasRoot, workspace });
+    config.codexTurnAbortGraceMs = 1;
+    config.mailboxBridge.promptTimeoutMs = 5;
+    const onFatalRecovery = vi.fn();
+
+    const result = await runMailboxDeliveryOnce(config, createRegistry(session) as never, { onFatalRecovery });
+
+    expect(result).toEqual({ processed: 0, replied: 0, skipped: 1 });
+    expect(onFatalRecovery).not.toHaveBeenCalled();
+    expect(readFileSync(inboundPath, "utf8")).toContain("status: unread");
+    const receipt = JSON.parse(
+      readFileSync(
+        path.join(
+          personasRoot,
+          "_shared",
+          "memory",
+          "mailbox",
+          "_receipts",
+          "albert-v3",
+          "quarantine-before-fatal.json",
+        ),
+        "utf8",
+      ),
+    );
+    expect(receipt.status).toBe("failed_prompt_timeout");
+    const seen = JSON.parse(readFileSync(path.join(workspace, ".telecodex", "mailbox_seen_albert-v3.json"), "utf8"));
+    expect(seen.messages["quarantine-before-fatal"]).toMatchObject({
+      path: inboundPath,
+      status: "failed_prompt_timeout",
+    });
+    await vi.waitFor(() => expect(onFatalRecovery).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not start mailbox fatal recovery when timeout quarantine persistence fails", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "quarantine-fails-before-fatal",
+      subject: "Quarantine fails before fatal",
+      body: "This prompt should not fatal before timeout evidence is persisted.",
+    });
+    const brokenReceiptDir = path.join(
+      personasRoot,
+      "_shared",
+      "memory",
+      "mailbox",
+      "_receipts",
+      "albert-v3",
+    );
+    mkdirRecursive(path.dirname(brokenReceiptDir));
+    writeFileSync(brokenReceiptDir, "not a directory", "utf8");
+
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const config = createConfig({ personasRoot, workspace });
+    config.codexTurnAbortGraceMs = 1;
+    config.mailboxBridge.promptTimeoutMs = 5;
+    const onFatalRecovery = vi.fn();
+
+    await expect(
+      runMailboxDeliveryOnce(config, createRegistry(session) as never, { onFatalRecovery }),
+    ).rejects.toThrow();
+    await delay(10);
+
+    expect(onFatalRecovery).not.toHaveBeenCalled();
+  });
+
+  it("does not start mailbox fatal recovery when timeout seen-state persistence fails", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "seen-fails-before-fatal",
+      subject: "Seen fails before fatal",
+      body: "This prompt should not fatal before seen-state timeout evidence is persisted.",
+    });
+    mkdirRecursive(workspace);
+    writeFileSync(path.join(workspace, ".telecodex"), "not a directory", "utf8");
+
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const config = createConfig({ personasRoot, workspace });
+    config.codexTurnAbortGraceMs = 1;
+    config.mailboxBridge.promptTimeoutMs = 5;
+    const onFatalRecovery = vi.fn();
+
+    await expect(
+      runMailboxDeliveryOnce(config, createRegistry(session) as never, { onFatalRecovery }),
+    ).rejects.toThrow();
+    await delay(10);
+
+    const receipt = JSON.parse(
+      readFileSync(
+        path.join(
+          personasRoot,
+          "_shared",
+          "memory",
+          "mailbox",
+          "_receipts",
+          "albert-v3",
+          "seen-fails-before-fatal.json",
+        ),
+        "utf8",
+      ),
+    );
+    expect(receipt.status).toBe("failed_prompt_timeout");
+    expect(onFatalRecovery).not.toHaveBeenCalled();
+  });
+
+  it("uses the mailbox prompt timeout as default abort grace when no global grace is configured", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "default-mailbox-abort-grace",
+      subject: "Default mailbox abort grace",
+      body: "This prompt ignores abort and should recover even without CODEX_TURN_ABORT_GRACE_MS.",
+    });
+
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const config = createConfig({ personasRoot, workspace });
+    config.codexTurnAbortGraceMs = undefined;
+    config.mailboxBridge.promptTimeoutMs = 5;
+    const onFatalRecovery = vi.fn();
+
+    const result = await runMailboxDeliveryOnce(config, createRegistry(session) as never, { onFatalRecovery });
+
+    expect(result).toEqual({ processed: 0, replied: 0, skipped: 1 });
+    await vi.waitFor(() => expect(onFatalRecovery).toHaveBeenCalledTimes(1));
+    expect(String(onFatalRecovery.mock.calls[0]?.[0]?.message)).toContain(
+      "Mailbox Codex turn remained active after timeout abort grace (5ms timeout, 5ms grace)",
+    );
+  });
+
+  it("escalates mailbox stuck-after-abort errors to fatal recovery", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "bridge-stuck-after-abort",
+      subject: "Bridge stuck after abort",
+      body: "This prompt ignores abort and should force launchd recovery.",
+    });
+
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const config = createConfig({ personasRoot, workspace });
+    config.codexTurnAbortGraceMs = 5;
+    config.mailboxBridge.promptTimeoutMs = 5;
+    const onFatalRecovery = vi.fn();
+
+    const stop = startMailboxBridge(config, createRegistry(session) as never, { onFatalRecovery });
+    try {
+      await vi.waitFor(() => expect(onFatalRecovery).toHaveBeenCalledTimes(1), { timeout: 200 });
+    } finally {
+      stop?.();
+    }
+
+    expect(String(onFatalRecovery.mock.calls[0]?.[0]?.message)).toContain(
+      "Mailbox Codex turn remained active after timeout abort grace",
+    );
+  });
+
   it("does not let a quarantined timed-out mailbox message starve later messages", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
@@ -690,6 +1017,23 @@ function createRegistry(session: unknown) {
     getOrCreate: vi.fn(async () => session),
     updateMetadata: vi.fn(),
   };
+}
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value?: T | PromiseLike<T>) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value?: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function writeMailboxMessage(input: {

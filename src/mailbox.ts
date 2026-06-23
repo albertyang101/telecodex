@@ -41,11 +41,16 @@ export interface MailboxDeliveryResult {
   skipped: number;
 }
 
+export interface MailboxRecoveryOptions {
+  onFatalRecovery?: (error: Error) => void;
+}
+
 const MAILBOX_PROMPT_TIMEOUT_STATUS = "failed_prompt_timeout";
 
 export async function runMailboxDeliveryOnce(
   config: TeleCodexConfig,
   registry: Pick<SessionRegistry, "getOrCreate" | "updateMetadata">,
+  recoveryOptions: MailboxRecoveryOptions = {},
 ): Promise<MailboxDeliveryResult> {
   const settings = config.mailboxBridge;
   if (!settings.enabled || !settings.persona) {
@@ -54,6 +59,8 @@ export async function runMailboxDeliveryOnce(
   assertSafeSegment(settings.persona, "MAILBOX_PERSONA");
 
   const contextKey = mailboxContextKey(settings);
+  const abortGraceMs = mailboxAbortGraceMs(config);
+  const onFatalRecovery = mailboxFatalRecovery(recoveryOptions);
   const statePath = mailboxSeenStatePath(config.workspace, settings.persona);
   const seen = await loadSeenState(statePath);
   const events = await listDeliveryEvents(settings);
@@ -91,12 +98,18 @@ export async function runMailboxDeliveryOnce(
 
     let finalText: string;
     try {
-      finalText = await promptMailboxMessage(session, message, settings.promptTimeoutMs);
+      finalText = await promptMailboxMessage(
+        session,
+        message,
+        settings.promptTimeoutMs,
+        abortGraceMs,
+      );
     } catch (error) {
       if (!(error instanceof MailboxPromptTimeoutError)) {
         throw error;
       }
       await quarantineTimedOutMailboxMessage(settings, statePath, seen, message);
+      error.startAbortGrace(onFatalRecovery);
       registry.updateMetadata(contextKey, session);
       skipped += 1;
       break;
@@ -127,6 +140,7 @@ export async function runMailboxDeliveryOnce(
 export function startMailboxBridge(
   config: TeleCodexConfig,
   registry: Pick<SessionRegistry, "getOrCreate" | "updateMetadata">,
+  options: MailboxRecoveryOptions = {},
 ): (() => void) | undefined {
   const settings = config.mailboxBridge;
   if (!settings.enabled || !settings.persona) {
@@ -140,14 +154,15 @@ export function startMailboxBridge(
     }
     running = true;
     try {
-      const result = await runMailboxDeliveryOnce(config, registry);
+      const result = await runMailboxDeliveryOnce(config, registry, options);
       if (result.processed || result.skipped) {
         console.log(
           `mailbox bridge tick persona=${settings.persona} processed=${result.processed} replied=${result.replied} skipped=${result.skipped}`,
         );
       }
     } catch (error) {
-      console.error("mailbox bridge tick failed:", error instanceof Error ? error.message : String(error));
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      console.error("mailbox bridge tick failed:", normalizedError.message);
     } finally {
       running = false;
     }
@@ -166,6 +181,21 @@ export function startMailboxBridge(
 
 function mailboxContextKey(settings: MailboxBridgeConfig): TelegramContextKey {
   return (settings.contextKey ?? `mailbox:${settings.persona}`) as TelegramContextKey;
+}
+
+function mailboxAbortGraceMs(config: TeleCodexConfig): number | undefined {
+  if (!config.mailboxBridge.promptTimeoutMs) {
+    return undefined;
+  }
+  return config.codexTurnAbortGraceMs ?? config.mailboxBridge.promptTimeoutMs;
+}
+
+function mailboxFatalRecovery(options: MailboxRecoveryOptions): (error: Error) => void {
+  return options.onFatalRecovery ?? ((error: Error) => {
+    setImmediate(() => {
+      throw error;
+    });
+  });
 }
 
 function mailboxRoot(settings: MailboxBridgeConfig): string {
@@ -353,6 +383,7 @@ async function promptMailboxMessage(
   session: CodexSessionService,
   message: MailboxMessage,
   timeoutMs?: number,
+  abortGraceMs?: number,
 ): Promise<string> {
   let accumulatedText = "";
   let completedAgentText = "";
@@ -370,7 +401,7 @@ async function promptMailboxMessage(
   };
 
   const promptPromise = session.prompt(renderCodexMailboxPrompt(message), callbacks);
-  await awaitMailboxPrompt(session, promptPromise, timeoutMs);
+  await awaitMailboxPrompt(session, promptPromise, timeoutMs, abortGraceMs);
   return completedAgentText || accumulatedText;
 }
 
@@ -378,24 +409,59 @@ async function awaitMailboxPrompt(
   session: CodexSessionService,
   promptPromise: Promise<void>,
   timeoutMs?: number,
+  abortGraceMs?: number,
 ): Promise<void> {
   if (!timeoutMs) {
     await promptPromise;
     return;
   }
 
+  let timedOut = false;
+  let promptSettled = false;
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let abortGraceTimeout: ReturnType<typeof setTimeout> | undefined;
+  const startAbortGrace = (onFatalRecovery: (error: Error) => void): void => {
+    if (!abortGraceMs || promptSettled || !session.isProcessing()) {
+      return;
+    }
+    abortGraceTimeout = setTimeout(() => {
+      if (promptSettled || !session.isProcessing()) {
+        return;
+      }
+      onFatalRecovery(new MailboxPromptAbortGraceError(timeoutMs, abortGraceMs));
+    }, abortGraceMs);
+  };
+  const markPromptSettled = (): void => {
+    promptSettled = true;
+    if (abortGraceTimeout) {
+      clearTimeout(abortGraceTimeout);
+      abortGraceTimeout = undefined;
+    }
+  };
+  const observedPromptPromise = promptPromise.then(
+    () => {
+      markPromptSettled();
+    },
+    (error) => {
+      markPromptSettled();
+      if (timedOut) {
+        return;
+      }
+      throw error;
+    },
+  );
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
     timeout = setTimeout(() => {
+      timedOut = true;
       void session.abort().catch((error) => {
         console.error("mailbox bridge abort after prompt timeout failed:", error instanceof Error ? error.message : String(error));
       });
-      reject(new MailboxPromptTimeoutError(timeoutMs));
+      reject(new MailboxPromptTimeoutError(timeoutMs, startAbortGrace));
     }, timeoutMs);
   });
 
   try {
-    await Promise.race([promptPromise, timeoutPromise]);
+    await Promise.race([observedPromptPromise, timeoutPromise]);
   } finally {
     if (timeout) {
       clearTimeout(timeout);
@@ -404,9 +470,19 @@ async function awaitMailboxPrompt(
 }
 
 class MailboxPromptTimeoutError extends Error {
-  constructor(timeoutMs: number) {
+  constructor(
+    timeoutMs: number,
+    readonly startAbortGrace: (onFatalRecovery: (error: Error) => void) => void,
+  ) {
     super(`Mailbox Codex turn timed out after ${timeoutMs}ms`);
     this.name = "MailboxPromptTimeoutError";
+  }
+}
+
+class MailboxPromptAbortGraceError extends Error {
+  constructor(timeoutMs: number, abortGraceMs: number) {
+    super(`Mailbox Codex turn remained active after timeout abort grace (${timeoutMs}ms timeout, ${abortGraceMs}ms grace)`);
+    this.name = "MailboxPromptAbortGraceError";
   }
 }
 

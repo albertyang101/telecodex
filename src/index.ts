@@ -27,7 +27,13 @@ try {
       });
     },
   });
-  stopMailboxBridge = startMailboxBridge(config, registry);
+  stopMailboxBridge = startMailboxBridge(config, registry, {
+    onFatalRecovery: (error) => {
+      setImmediate(() => {
+        throw error;
+      });
+    },
+  });
   await registerCommands(bot);
 
   console.log("TeleCodex running");
