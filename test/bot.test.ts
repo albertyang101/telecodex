@@ -395,6 +395,40 @@ describe("createBot response delivery", () => {
     expect(transcript).not.toContain("中间草稿，不进最终记忆。");
   });
 
+  it("records prompt failure replies as bot turns without leaking raw provider URLs", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-prompt-failure-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const session = createSession(async () => {
+      throw new Error(
+        "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jun 28th, 2026 6:15 PM.",
+      );
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 97, text: "触发 usage cap" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+
+    expect(visibleReplies).toContain("Codex usage limit");
+    expect(visibleReplies).not.toContain("https://chatgpt.com");
+    expect(transcript).toContain("[user-raw]");
+    expect(transcript).toContain("触发 usage cap");
+    expect(transcript).toContain("[bot-raw]");
+    expect(transcript).toContain("Codex usage limit");
+    expect(transcript).not.toContain("https://chatgpt.com");
+  });
+
   it("keeps replying and avoids logging turn text when memory append fails", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-fail-"));
     tempDirs.push(root);

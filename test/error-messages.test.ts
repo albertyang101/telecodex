@@ -25,6 +25,18 @@ describe("error-messages", () => {
       expect(result.userMessage).toContain("Rate limited");
     });
 
+    it("translates Codex usage cap messages without leaking provider URLs", () => {
+      const result = translateError(
+        new Error(
+          "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jun 28th, 2026 6:15 PM.",
+        ),
+      );
+
+      expect(result.userMessage).toContain("Codex usage limit");
+      expect(result.userMessage).not.toContain("https://");
+      expect(result.userMessage).not.toContain("chatgpt.com");
+    });
+
     it("translates 401 unauthorized", () => {
       const result = translateError(new Error("401 Unauthorized"));
       expect(result.userMessage).toContain("/login");
