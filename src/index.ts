@@ -20,7 +20,13 @@ installFatalProcessHandlers({
 try {
   const config = loadConfig();
   registry = new SessionRegistry(config);
-  bot = createBot(config, registry);
+  bot = createBot(config, registry, {
+    onFatalRecovery: (error) => {
+      setImmediate(() => {
+        throw error;
+      });
+    },
+  });
   stopMailboxBridge = startMailboxBridge(config, registry);
   await registerCommands(bot);
 

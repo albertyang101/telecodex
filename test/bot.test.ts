@@ -1080,6 +1080,41 @@ describe("createBot response delivery", () => {
     );
   });
 
+  it("escalates to fatal recovery when a timed-out Codex turn never settles after abort", async () => {
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const registry = createRegistry(session);
+    const onFatalRecovery = vi.fn();
+
+    const bot = createBot(
+      createConfig({ codexTurnTimeoutMs: 5, codexTurnAbortGraceMs: 5 } as any),
+      registry as any,
+      { onFatalRecovery },
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 14, text: "第一条会超时且 abort 后永不 settle" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    await firstPromise;
+    await vi.waitFor(() => expect(onFatalRecovery).toHaveBeenCalledTimes(1));
+
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(String(onFatalRecovery.mock.calls[0]?.[0]?.message)).toContain(
+      "Codex turn remained active after timeout abort grace",
+    );
+  });
+
   it("preserves text arrival order when the first receipt reaction is slow", async () => {
     const firstReceiptReaction = deferred<void>();
     const firstTurn = deferred<void>();
