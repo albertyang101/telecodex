@@ -70,6 +70,7 @@ Open items stay in Linear, not here:
 - Latest commits:
   - `febb7dd Refs ALB-917 use runner polling for Codex dispatcher`
   - `31077c9 Refs ALB-917 preserve Telegram updates on restart`
+  - `d1968ae Refs ALB-917 avoid repeated update drops on polling retry`
 - P0 root cause found for THEO 17:36 no-response/no-typing:
   - THEO process restarted at Tue Jun 23 17:36:37 2026, matching Albert's missing-message window.
   - No active `codex exec`, `linear-control`, or `telegram-transport` child existed under THEO when checked, so Codex had not received a turn.
@@ -83,11 +84,17 @@ Open items stay in Linear, not here:
   - Full Mac mini suite: `npm test -- --reporter=dot` passed, 24 files / 480 tests.
   - Build: `npm run build` passed.
 - Deployment:
-  - `com.albert.albert-codex-e2e-codex-dispatcher`: running after restart, pid `82919`, last exit code `0`.
-  - `com.albert.albert-v3-codex-dispatcher`: running after restart, pid `82960`, last exit code `0`.
+  - `com.albert.albert-codex-e2e-codex-dispatcher`: running after latest restart, pid `86341`, last exit code `0`.
+  - `com.albert.albert-v3-codex-dispatcher`: running after latest restart, pid `86387`, last exit code `0`.
 - Linear evidence:
   - ALB-917 comment `ee92d0d2-1cd2-4d9f-9e41-c5d36d8a165d`
   - ALB-831 comment `03c9a68d-f375-401b-a6fb-813e2fee3e75`
+  - Post-review ALB-917 comment `1c951103-a475-4907-9a7c-bb01d62aeece`
+  - Post-review ALB-831 comment `d2edc291-66a3-4c58-a912-212f81b9ffb1`
+- Review:
+  - Independent review found no Critical issues.
+  - One Important issue was fixed: explicit clean startup previously could repeat `drop_pending_updates=true` on 409 retry. Retry attempts now preserve pending updates after the first startup.
+  - Post-review verification: `npm test -- --run test/polling.test.ts` passed 4 tests; full suite passed 24 files / 481 tests; build passed.
 - Live Telegram E2E proof remains pending because the shared Pyrogram user session is held by another CC task (`/tmp/_iris_case.py`). Do not steal that lock; send an isolated E2E nonce when the session is free.
 
 2026-06-22 ALB-833 Memory transcript sink addendum:
