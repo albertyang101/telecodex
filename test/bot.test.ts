@@ -483,6 +483,35 @@ describe("createBot response delivery", () => {
     expect(codexInput).toContain("修一下这个 bug");
   });
 
+  it("preserves long Telegram text input before sending it to Codex", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("收到。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const head = "ALB896_LONG_INPUT_HEAD";
+    const tail = "ALB896_LONG_INPUT_TAIL";
+    const paragraph = "这是一段用于验证 Telegram 长文本输入不会在 dispatcher 入口被截断的中文内容。";
+    const longText = `${head}\n${Array.from({ length: 90 }, (_, index) => `${index + 1}. ${paragraph}`).join("\n")}\n${tail}`;
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 896, text: longText },
+      api: bot.api,
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const codexInput = String(session.prompt.mock.calls[0][0]);
+    expect(longText.length).toBeGreaterThan(4000);
+    expect(codexInput).toContain(head);
+    expect(codexInput).toContain(tail);
+    expect(codexInput.endsWith(longText)).toBe(true);
+  });
+
   it("does not expose echoed developer discipline in final Telegram replies", async () => {
     const echoed = [
       "[DEVELOPER DISCIPLINE]",
