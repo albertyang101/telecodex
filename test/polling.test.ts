@@ -28,7 +28,7 @@ describe("startTelegramPolling", () => {
     runnerMock.handle.task.mockReset();
   });
 
-  it("uses grammY runner instead of simple long polling for long-running Codex turns", async () => {
+  it("uses grammY runner without dropping queued updates during normal restarts", async () => {
     runnerMock.run.mockReturnValue(runnerMock.handle);
     const bot = {
       api: {
@@ -39,7 +39,7 @@ describe("startTelegramPolling", () => {
 
     const handle = await startTelegramPolling(bot as any, { concurrency: 8 });
 
-    expect(bot.api.deleteWebhook).toHaveBeenCalledWith({ drop_pending_updates: true });
+    expect(bot.api.deleteWebhook).toHaveBeenCalledWith({ drop_pending_updates: false });
     expect(runnerMock.run).toHaveBeenCalledWith(bot, {
       runner: {
         fetch: { timeout: 30 },
@@ -50,6 +50,19 @@ describe("startTelegramPolling", () => {
     });
     expect(bot.start).not.toHaveBeenCalled();
     expect(handle).toBe(runnerMock.handle);
+  });
+
+  it("can explicitly drop queued updates for one-off clean startup", async () => {
+    runnerMock.run.mockReturnValue(runnerMock.handle);
+    const bot = {
+      api: {
+        deleteWebhook: vi.fn(async () => true),
+      },
+    };
+
+    await startTelegramPolling(bot as any, { dropPendingUpdates: true });
+
+    expect(bot.api.deleteWebhook).toHaveBeenCalledWith({ drop_pending_updates: true });
   });
 
   it("retries short-lived Telegram 409 conflicts during polling startup", async () => {

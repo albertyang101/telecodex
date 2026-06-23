@@ -21,7 +21,7 @@ export async function startTelegramPolling(
   options: TelegramPollingOptions = {},
 ): Promise<RunnerHandle> {
   await bot.api.deleteWebhook({
-    drop_pending_updates: options.dropPendingUpdates ?? true,
+    drop_pending_updates: options.dropPendingUpdates ?? false,
   });
 
   return run(bot, {
