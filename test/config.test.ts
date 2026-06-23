@@ -20,6 +20,7 @@ describe("loadConfig", () => {
     delete process.env.CODEX_MODEL;
     delete process.env.CODEX_REASONING_EFFORT;
     delete process.env.CODEX_TURN_TIMEOUT_MS;
+    delete process.env.CODEX_TURN_ABORT_GRACE_MS;
     delete process.env.CODEX_SANDBOX_MODE;
     delete process.env.CODEX_APPROVAL_POLICY;
     delete process.env.CODEX_LAUNCH_PROFILES_JSON;
@@ -712,6 +713,22 @@ describe("loadConfig", () => {
     process.env.CODEX_TURN_TIMEOUT_MS = "0";
 
     expect(() => loadConfig()).toThrow("CODEX_TURN_TIMEOUT_MS must be a positive integer");
+  });
+
+  it("parses CODEX_TURN_ABORT_GRACE_MS when configured", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_TURN_ABORT_GRACE_MS = "60000";
+
+    expect((loadConfig() as any).codexTurnAbortGraceMs).toBe(60000);
+  });
+
+  it("throws when CODEX_TURN_ABORT_GRACE_MS is invalid", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_TURN_ABORT_GRACE_MS = "0";
+
+    expect(() => loadConfig()).toThrow("CODEX_TURN_ABORT_GRACE_MS must be a positive integer");
   });
 
   it("throws when unsafe extra launch profiles are configured without enabling them", () => {
