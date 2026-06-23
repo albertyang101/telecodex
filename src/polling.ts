@@ -43,7 +43,10 @@ export async function runTelegramPollingWithRetry(
   let conflictRestartAttempts = 0;
 
   while (!options.shouldStop?.()) {
-    const handle = await startTelegramPolling(bot, options);
+    const handle = await startTelegramPolling(bot, {
+      ...options,
+      dropPendingUpdates: conflictRestartAttempts === 0 ? options.dropPendingUpdates : false,
+    });
     options.onHandle?.(handle);
     const task = handle.task();
     if (!task) {

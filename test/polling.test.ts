@@ -88,5 +88,33 @@ describe("startTelegramPolling", () => {
 
     expect(runnerMock.run).toHaveBeenCalledTimes(2);
     expect(bot.api.deleteWebhook).toHaveBeenCalledTimes(2);
+    expect(bot.api.deleteWebhook).toHaveBeenNthCalledWith(1, { drop_pending_updates: false });
+    expect(bot.api.deleteWebhook).toHaveBeenNthCalledWith(2, { drop_pending_updates: false });
+  });
+
+  it("only drops queued updates once when explicit clean startup retries after a Telegram conflict", async () => {
+    const firstHandle = {
+      ...runnerMock.handle,
+      task: vi.fn(() => Promise.reject({ error_code: 409, description: "Conflict: terminated by other getUpdates request" })),
+    };
+    const secondHandle = {
+      ...runnerMock.handle,
+      task: vi.fn(() => Promise.resolve()),
+    };
+    runnerMock.run.mockReturnValueOnce(firstHandle).mockReturnValueOnce(secondHandle);
+    const bot = {
+      api: {
+        deleteWebhook: vi.fn(async () => true),
+      },
+    };
+
+    await runTelegramPollingWithRetry(bot as any, {
+      conflictRestartDelayMs: 0,
+      dropPendingUpdates: true,
+      maxConflictRestartAttempts: 1,
+    });
+
+    expect(bot.api.deleteWebhook).toHaveBeenNthCalledWith(1, { drop_pending_updates: true });
+    expect(bot.api.deleteWebhook).toHaveBeenNthCalledWith(2, { drop_pending_updates: false });
   });
 });
