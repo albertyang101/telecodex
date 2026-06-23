@@ -123,6 +123,17 @@ class CodexTurnTimeoutError extends Error {
   }
 }
 
+class CodexTurnAbortGraceError extends Error {
+  constructor(timeoutMs: number, abortGraceMs: number) {
+    super(`Codex turn remained active after timeout abort grace (${timeoutMs}ms + ${abortGraceMs}ms)`);
+    this.name = "CodexTurnAbortGraceError";
+  }
+}
+
+export type BotRecoveryOptions = {
+  onFatalRecovery?: (error: Error) => void;
+};
+
 const SOURCE_REQUEST_RE =
   /((?:show|include|with|provide|send|list|cite|add|attach|give)\s+(?:me\s+)?(?:the\s+)?(?:visible\s+)?(?:sources?|references?|citations?|sauces?|links?|urls?)|official\s+(?:site|url|link)|source\s*block|(?:给|列|带|附|发|贴|提供|保留|加上|展示|显示).{0,12}(?:引用|来源|出处|参考资料|链接|网址|官网)|(?:引用|来源|出处|参考资料|链接|网址|官网).{0,12}(?:发我|给我|列出|带上|附上|也要|保留|贴出来))/i;
 const SOURCE_PRESERVE_RE =
@@ -254,7 +265,11 @@ async function waitForCodexPrompt(
   session: CodexSessionService,
   promptPromise: Promise<void>,
   timeoutMs: number | undefined,
-  onSettledAfterTimeout?: () => Promise<void>,
+  options?: {
+    abortGraceMs?: number;
+    onSettledAfterTimeout?: () => Promise<void>;
+    onFatalRecovery?: (error: Error) => void;
+  },
 ): Promise<void> {
   if (!timeoutMs) {
     await promptPromise;
@@ -264,21 +279,26 @@ async function waitForCodexPrompt(
   let timedOut = false;
   let notifiedPostTimeoutSettle = false;
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let abortGraceTimeout: ReturnType<typeof setTimeout> | undefined;
   const notifyPromptSettledAfterTimeout = (error?: unknown): void => {
     if (!timedOut || notifiedPostTimeoutSettle) {
       return;
     }
     notifiedPostTimeoutSettle = true;
+    if (abortGraceTimeout) {
+      clearTimeout(abortGraceTimeout);
+      abortGraceTimeout = undefined;
+    }
 
     if (error && !isAbortLikeError(error)) {
       console.error("Codex prompt error after timeout abort:", formatError(error));
     }
 
-    if (!onSettledAfterTimeout) {
+    if (!options?.onSettledAfterTimeout) {
       return;
     }
 
-    void onSettledAfterTimeout().catch((callbackError) => {
+    void options.onSettledAfterTimeout().catch((callbackError) => {
       console.error("Failed to drain queued prompts after timeout abort:", formatError(callbackError));
     });
   };
@@ -297,6 +317,14 @@ async function waitForCodexPrompt(
       void session.abort().catch((error) => {
         console.error("Failed to abort timed-out Codex turn:", formatError(error));
       });
+      if (options?.abortGraceMs && options.onFatalRecovery) {
+        abortGraceTimeout = setTimeout(() => {
+          if (notifiedPostTimeoutSettle || !session.isProcessing()) {
+            return;
+          }
+          options.onFatalRecovery?.(new CodexTurnAbortGraceError(timeoutMs, options.abortGraceMs!));
+        }, options.abortGraceMs);
+      }
       reject(new CodexTurnTimeoutError(timeoutMs));
     }, timeoutMs);
   });
@@ -497,7 +525,11 @@ function findSourceHeadingInRange(lines: string[], start: number, end: number): 
   return undefined;
 }
 
-export function createBot(config: TeleCodexConfig, registry: SessionRegistry): Bot<Context> {
+export function createBot(
+  config: TeleCodexConfig,
+  registry: SessionRegistry,
+  recoveryOptions: BotRecoveryOptions = {},
+): Bot<Context> {
   const bot = new Bot<Context>(config.telegramBotToken);
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
 
@@ -1273,7 +1305,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         session,
         session.prompt(withTelegramReplyStyleGuard(userInput, session.getInfo()), callbacks),
         config.codexTurnTimeoutMs,
-        () => drainQueuedPrompts(contextKey),
+        {
+          abortGraceMs: config.codexTurnAbortGraceMs,
+          onSettledAfterTimeout: () => drainQueuedPrompts(contextKey),
+          onFatalRecovery: recoveryOptions.onFatalRecovery,
+        },
       );
       updateSessionMetadata(contextKey, session);
       const finalVisibleText = await ensureFinalized();

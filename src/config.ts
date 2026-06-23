@@ -61,6 +61,7 @@ export interface TeleCodexConfig {
   codexModel?: string;
   codexReasoningEffort?: CodexReasoningEffort;
   codexTurnTimeoutMs?: number;
+  codexTurnAbortGraceMs?: number;
   codexSandboxMode: CodexSandboxMode;
   codexApprovalPolicy: CodexApprovalPolicy;
   launchProfiles: CodexLaunchProfile[];
@@ -91,6 +92,10 @@ export function loadConfig(): TeleCodexConfig {
   const codexTurnTimeoutMs = parseOptionalPositiveIntegerEnv(
     optionalString(process.env.CODEX_TURN_TIMEOUT_MS),
     "CODEX_TURN_TIMEOUT_MS",
+  );
+  const codexTurnAbortGraceMs = parseOptionalPositiveIntegerEnv(
+    optionalString(process.env.CODEX_TURN_ABORT_GRACE_MS),
+    "CODEX_TURN_ABORT_GRACE_MS",
   );
   const codexSandboxMode = parseSandboxMode(optionalString(process.env.CODEX_SANDBOX_MODE));
   const codexApprovalPolicy = parseApprovalPolicy(optionalString(process.env.CODEX_APPROVAL_POLICY));
@@ -137,6 +142,7 @@ export function loadConfig(): TeleCodexConfig {
     codexModel,
     codexReasoningEffort,
     codexTurnTimeoutMs,
+    codexTurnAbortGraceMs,
     codexSandboxMode,
     codexApprovalPolicy,
     launchProfiles,
