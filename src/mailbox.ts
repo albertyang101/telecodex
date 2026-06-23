@@ -5,6 +5,7 @@ import path from "node:path";
 import type { CodexPromptInput, CodexSessionCallbacks, CodexSessionService } from "./codex-session.js";
 import type { MailboxBridgeConfig, TeleCodexConfig } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
+import { stripVisiblePromptGuardEcho, withDispatcherDisciplineGuard } from "./prompt-guard.js";
 import type { SessionRegistry } from "./session-registry.js";
 
 const MAILBOX_REL = ["_shared", "memory", "mailbox"] as const;
@@ -400,9 +401,12 @@ async function promptMailboxMessage(
     onAgentEnd: () => undefined,
   };
 
-  const promptPromise = session.prompt(renderCodexMailboxPrompt(message), callbacks);
+  const promptPromise = session.prompt(
+    withDispatcherDisciplineGuard(renderCodexMailboxPrompt(message), session.getInfo()),
+    callbacks,
+  );
   await awaitMailboxPrompt(session, promptPromise, timeoutMs, abortGraceMs);
-  return completedAgentText || accumulatedText;
+  return stripVisiblePromptGuardEcho(completedAgentText || accumulatedText);
 }
 
 async function awaitMailboxPrompt(

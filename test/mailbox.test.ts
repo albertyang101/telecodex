@@ -58,6 +58,12 @@ describe("mailbox bridge", () => {
     expect(promptText).toContain("from: cody");
     expect(promptText).toContain("to: albert-v3");
     expect(promptText).toContain("The bridge will write your final reply back to the sender mailbox");
+    expect(promptText).toContain("[DEVELOPER DISCIPLINE]");
+    expect(promptText).toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(promptText).toContain("fix at the earliest reliable boundary");
+    expect(promptText).toContain("[CURRENT CONTEXT]");
+    expect(promptText).toContain("Current model: gpt-5.5");
+    expect(promptText).toContain("Current launch behavior: read-only / never");
     expect(promptText).not.toContain("mcp__persona_memory__");
 
     expect(existsSync(inboundPath)).toBe(false);
@@ -122,6 +128,77 @@ describe("mailbox bridge", () => {
       delivered_by: "telecodex-mailbox-bridge",
       message_path: archivedInbound,
     });
+  });
+
+  it("strips echoed dispatcher discipline before writing mailbox replies", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "echo-guard-reply",
+      subject: "Guard echo",
+      body: "Please reply without leaking dispatcher guard text.",
+    });
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.(
+        [
+          "[DEVELOPER DISCIPLINE]",
+          "discipline_version=ALB-714-hard-discipline-v1",
+          "Fix root cause: explain why a bug happened before fixing it, then fix at the earliest reliable boundary.",
+          "",
+          "clean mailbox reply",
+        ].join("\n"),
+      );
+      callbacks.onAgentEnd();
+    });
+
+    const result = await runMailboxDeliveryOnce(createConfig({ personasRoot, workspace }), createRegistry(session) as never);
+
+    expect(result).toEqual({ processed: 1, replied: 1, skipped: 0 });
+    const replies = await readdir(path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox"));
+    expect(replies).toHaveLength(1);
+    const replyText = readFileSync(
+      path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox", replies[0]!),
+      "utf8",
+    );
+    expect(replyText).toContain("clean mailbox reply");
+    expect(replyText).not.toContain("[DEVELOPER DISCIPLINE]");
+    expect(replyText).not.toContain("discipline_version=ALB-714-hard-discipline-v1");
+    expect(replyText).not.toContain("Fix root cause");
+  });
+
+  it("treats guard-echoed NO_REPLY as no mailbox reply", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "echo-guard-no-reply",
+      subject: "Guard echo no reply",
+      body: "This does not need a mailbox reply.",
+    });
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.(
+        [
+          "[CURRENT CONTEXT]",
+          "You are Albert Codex Dispatcher backend for Telegram.",
+          "Current model: gpt-5.5",
+          "",
+          "NO_REPLY",
+        ].join("\n"),
+      );
+      callbacks.onAgentEnd();
+    });
+
+    const result = await runMailboxDeliveryOnce(createConfig({ personasRoot, workspace }), createRegistry(session) as never);
+
+    expect(result).toEqual({ processed: 1, replied: 0, skipped: 0 });
+    expect(existsSync(path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox"))).toBe(false);
   });
 
   it("ignores unsafe frontmatter path segments before processing", async () => {
