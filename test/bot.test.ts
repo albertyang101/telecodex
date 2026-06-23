@@ -511,7 +511,8 @@ describe("createBot response delivery", () => {
     const codexInput = session.prompt.mock.calls[0][0] as string;
     expect(codexInput).toContain("[DEVELOPER DISCIPLINE]");
     expect(codexInput).toContain("discipline_version=ALB-714-hard-discipline-v1");
-    expect(codexInput).toContain("explain why a bug happened before fixing it");
+    expect(codexInput).toContain("find the first cause");
+    expect(codexInput).toContain("check existing architecture/tooling before adding new code");
     expect(codexInput).toContain("fix at the earliest reliable boundary");
     expect(codexInput).toContain("workarounds are temporary and require Linear follow-up");
     expect(codexInput).toContain("修一下这个 bug");

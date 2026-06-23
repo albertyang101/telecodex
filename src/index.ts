@@ -3,13 +3,17 @@ import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
 import { loadConfig } from "./config.js";
 import { startMailboxBridge } from "./mailbox.js";
+import { runTelegramPollingWithRetry } from "./polling.js";
 import { installFatalProcessHandlers } from "./process-lifecycle.js";
 import { SessionRegistry } from "./session-registry.js";
+import type { RunnerHandle } from "@grammyjs/runner";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
 let stopMailboxBridge: (() => void) | undefined;
+let pollingHandle: RunnerHandle | undefined;
 let shuttingDown = false;
+let shutdownPromise: Promise<void> | undefined;
 
 installFatalProcessHandlers({
   getBot: () => bot,
@@ -70,57 +74,39 @@ try {
 }
 
 const shutdown = (signal: NodeJS.Signals) => {
-  if (shuttingDown) {
+  if (shutdownPromise) {
     return;
   }
+  shutdownPromise = shutdownGracefully(signal);
+};
+
+const shutdownGracefully = async (signal: NodeJS.Signals): Promise<void> => {
   shuttingDown = true;
 
   console.log(`Received ${signal}, shutting down TeleCodex...`);
-  if (bot) bot.stop();
   stopMailboxBridge?.();
 
-  setTimeout(() => {
+  try {
+    await pollingHandle?.stop();
+  } catch (error) {
+    console.error("Failed to stop Telegram polling:", error instanceof Error ? error.message : String(error));
+  } finally {
     registry?.disposeAll();
     console.log("TeleCodex stopped.");
     process.exit(0);
-  }, 500);
+  }
 };
 
 process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));
 
-const MAX_RESTART_ATTEMPTS = 5;
-const RESTART_DELAY_MS = 3000;
-let restartAttempts = 0;
-
 async function startPolling(): Promise<void> {
-  try {
-    await bot!.start({
-      drop_pending_updates: true,
-      onStart: () => {
-        restartAttempts = 0;
-      },
-    });
-  } catch (error) {
-    if (shuttingDown) {
-      return;
-    }
-
-    const message = error instanceof Error ? error.message : String(error);
-    const is409 = message.includes("409") || message.includes("Conflict");
-
-    if (is409 && restartAttempts < MAX_RESTART_ATTEMPTS) {
-      restartAttempts += 1;
-      console.warn(`Polling error (attempt ${restartAttempts}/${MAX_RESTART_ATTEMPTS}): ${message}`);
-      console.warn(`Restarting polling in ${RESTART_DELAY_MS / 1000}s...`);
-      await new Promise((resolve) => setTimeout(resolve, RESTART_DELAY_MS));
-      return startPolling();
-    }
-
-    console.error(`Fatal polling error: ${message}`);
-    registry?.disposeAll();
-    process.exit(1);
-  }
+  await runTelegramPollingWithRetry(bot!, {
+    onHandle: (handle) => {
+      pollingHandle = handle;
+    },
+    shouldStop: () => shuttingDown,
+  });
 }
 
 await startPolling();

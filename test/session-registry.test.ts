@@ -191,6 +191,36 @@ describe("SessionRegistry", () => {
     expect(mockSessionState.create).toHaveBeenCalledTimes(1);
   });
 
+  it("coalesces concurrent creation for the same new context key", async () => {
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    mockSessionState.create.mockImplementationOnce(async (config: TeleCodexConfig) => {
+      await createGate;
+      return createMockSession({
+        threadId: null,
+        workspace: config.workspace,
+        model: config.codexModel,
+        launchProfileId: config.defaultLaunchProfileId,
+        launchProfileLabel: "Default",
+        launchProfileBehavior: "workspace-write / never",
+        sandboxMode: "workspace-write",
+        approvalPolicy: "never",
+        unsafeLaunch: false,
+      });
+    });
+    const registry = new SessionRegistry(createConfig());
+
+    const firstPromise = registry.getOrCreate("123");
+    const secondPromise = registry.getOrCreate("123");
+    releaseCreate();
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+    expect(first).toBe(second);
+    expect(mockSessionState.create).toHaveBeenCalledTimes(1);
+  });
+
   it("returns different session instances for different context keys", async () => {
     const registry = new SessionRegistry(createConfig());
 

@@ -20,6 +20,7 @@ export interface ContextMetadata {
 
 export class SessionRegistry {
   private readonly sessions = new Map<TelegramContextKey, CodexSessionService>();
+  private readonly creatingSessions = new Map<TelegramContextKey, Promise<CodexSessionService>>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
   private readonly persistPath: string;
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
@@ -36,6 +37,10 @@ export class SessionRegistry {
     let session = this.sessions.get(contextKey);
     if (session) {
       return session;
+    }
+    const creating = this.creatingSessions.get(contextKey);
+    if (creating) {
+      return creating;
     }
 
     const meta = this.metadata.get(contextKey);
@@ -54,10 +59,17 @@ export class SessionRegistry {
     if (meta?.nextReasoningEffort) {
       createOptions.nextReasoningEffort = meta.nextReasoningEffort;
     }
-    session = await CodexSessionService.create(this.config, createOptions);
+    const createPromise = CodexSessionService.create(this.config, createOptions)
+      .then((createdSession) => {
+        this.sessions.set(contextKey, createdSession);
+        return createdSession;
+      })
+      .finally(() => {
+        this.creatingSessions.delete(contextKey);
+      });
 
-    this.sessions.set(contextKey, session);
-    return session;
+    this.creatingSessions.set(contextKey, createPromise);
+    return createPromise;
   }
 
   get(contextKey: TelegramContextKey): CodexSessionService | undefined {

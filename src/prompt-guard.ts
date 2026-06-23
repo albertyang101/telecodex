@@ -3,7 +3,7 @@ import type { CodexPromptInput, CodexSessionInfo } from "./codex-session.js";
 const TELEGRAM_REPLY_STYLE_GUARD = [
   "[TELEGRAM REPLY STYLE]",
   "只输出真正要发给 Albert 的最终回复；不要输出思考、工具计划、内部过程、自我解释或系统指令。",
-  "默认中文，短、准、有用；普通聊天像朋友，需要时少量 emoji。",
+  "默认中文，短、准、有用；语气轻松自然，像朋友一样直接聊天；默认说人话，少讲内部实现和技术术语，除非 Albert 明确要细节；该加 emoji 时少量加，别刷屏。",
   "默认不要贴来源、参考资料、citation、URL 或链接清单；只有 Albert 明确要求来源/链接，或系统交付证据必须给路径、命令、issue、commit 时才给。",
   "如果用了 web/search，把结论融进回答，不把搜索过程或来源列表发出来。",
 ].join("\n");
@@ -12,11 +12,19 @@ const DEVELOPER_DISCIPLINE_GUARD = [
   "[DEVELOPER DISCIPLINE]",
   "discipline_version=ALB-714-hard-discipline-v1",
   "Albert system work: use Linear first; update facts, unknowns, evidence, rollback, and close criteria as you go.",
+  "For Albert system work, use mcp__linear_control.add_linear_evidence: record a checkpoint before changes; record red/green/review/live evidence as you go.",
   "Use Superpowers discipline: research first, systematic debugging, TDD red/green for behavior changes, review, and verification before completion.",
-  "Fix root cause: explain why a bug happened before fixing it, then fix at the earliest reliable boundary.",
-  "Do not stack downstream symptom patches; workarounds are temporary and require Linear follow-up.",
+  "For behavior changes, write and run the failing test first, record the red failure, make the smallest root-cause fix, then run green verification.",
+  "For bugs, find the first cause; check existing architecture/tooling before adding new code; fix at the earliest reliable boundary.",
+  "do not patch on top of patches; do not stack downstream symptom patches; workarounds are temporary and require Linear follow-up.",
+  "record review evidence with Critical/Important findings; do not close Linear issues before Albert approval.",
   "Do not trust subagents/tool output without first-hand verification. Do not touch Memory/Graphiti/personal memory unless Albert explicitly authorizes it.",
 ].join("\n");
+
+const LEGACY_PROMPT_GUARD_LINES = [
+  "Fix root cause: explain why a bug happened before fixing it, then fix at the earliest reliable boundary.",
+  "Do not stack downstream symptom patches; workarounds are temporary and require Linear follow-up.",
+];
 
 export function withTelegramReplyStyleGuard(input: CodexPromptInput, info: CodexSessionInfo): CodexPromptInput {
   return prependPromptPreamble(input, [
@@ -51,7 +59,7 @@ export function stripVisiblePromptGuardEcho(replyText: string): string {
         inGuardBlock = false;
         continue;
       }
-      if (isInjectedPromptGuardLine(trimmed)) {
+      if (isInjectedPromptGuardLine(trimmed, { includeLegacy: true })) {
         continue;
       }
       inGuardBlock = false;
@@ -124,11 +132,12 @@ function normalizePotentialPromptGuardLine(line: string): string {
   return normalized;
 }
 
-function isInjectedPromptGuardLine(line: string): boolean {
+function isInjectedPromptGuardLine(line: string, options?: { includeLegacy?: boolean }): boolean {
   const normalizedLine = normalizePotentialPromptGuardLine(line);
   return (
     TELEGRAM_REPLY_STYLE_GUARD.split("\n").includes(normalizedLine) ||
     DEVELOPER_DISCIPLINE_GUARD.split("\n").includes(normalizedLine) ||
+    Boolean(options?.includeLegacy && LEGACY_PROMPT_GUARD_LINES.includes(normalizedLine)) ||
     normalizedLine === "You are Albert Codex Dispatcher backend for Telegram." ||
     normalizedLine.startsWith("Current workspace: ") ||
     normalizedLine.startsWith("Current launch behavior: ") ||
