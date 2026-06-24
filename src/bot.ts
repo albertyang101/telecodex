@@ -37,7 +37,7 @@ import {
 import { getThread } from "./codex-state.js";
 import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
-import { friendlyErrorText } from "./error-messages.js";
+import { codexCapacityRetryDelayMs, friendlyErrorText } from "./error-messages.js";
 import {
   type EnqueueForegroundTextPromptResult,
   type ForegroundTextPromptEntry,
@@ -53,6 +53,7 @@ const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
 const DURABLE_FOREGROUND_CLAIM_HEARTBEAT_MS = 10_000;
+const DURABLE_FOREGROUND_REPLAY_FAILURE_RETRY_MS = 60_000;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
@@ -491,6 +492,8 @@ export function createBot(
   const durableForegroundTextPromptReleasePromises = new Map<string, Promise<void>>();
   const activeTelegramChatActions = new Set<string>();
   let foregroundReplayScheduling: Promise<void> | undefined;
+  let durableForegroundRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let durableForegroundRetryTimerDueAt: number | undefined;
 
   registry.onRemove((key) => {
     const queuedPrompts = pendingPromptQueues.get(key) ?? [];
@@ -591,6 +594,48 @@ export function createBot(
       return;
     }
     await foregroundReplayScheduling;
+  };
+
+  const scheduleDurableForegroundRetryReplay = (nextAttemptAt: number): void => {
+    if (
+      durableForegroundRetryTimer &&
+      durableForegroundRetryTimerDueAt !== undefined &&
+      durableForegroundRetryTimerDueAt <= nextAttemptAt
+    ) {
+      return;
+    }
+
+    if (durableForegroundRetryTimer) {
+      clearTimeout(durableForegroundRetryTimer);
+    }
+
+    durableForegroundRetryTimerDueAt = nextAttemptAt;
+    const delayMs = Math.max(0, nextAttemptAt - Date.now());
+    durableForegroundRetryTimer = setTimeout(() => {
+      durableForegroundRetryTimer = undefined;
+      durableForegroundRetryTimerDueAt = undefined;
+      void replayForegroundTextPrompts()
+        .catch((error) => {
+          console.error("Failed to replay retryable durable foreground text prompts:", formatError(error));
+        })
+        .finally(() => {
+          void scheduleNextDurableForegroundRetryFromQueue().catch((error) => {
+            console.error("Failed to schedule next durable foreground retry:", formatError(error));
+          });
+        });
+    }, delayMs);
+  };
+
+  const scheduleNextDurableForegroundRetryFromQueue = async (): Promise<void> => {
+    const now = Date.now();
+    const nextAttemptAt = (await foregroundTextQueue.list())
+      .filter((entry) => entry.status === "pending" && entry.nextAttemptAt !== undefined && entry.nextAttemptAt > now)
+      .map((entry) => entry.nextAttemptAt!)
+      .sort((left, right) => left - right)[0];
+
+    if (nextAttemptAt !== undefined) {
+      scheduleDurableForegroundRetryReplay(nextAttemptAt);
+    }
   };
 
   const getContextSession = async (
@@ -837,6 +882,7 @@ export function createBot(
     ids: string[] | undefined,
     action: "pending" | "remove",
     errorMessage: string,
+    options: { nextAttemptAt?: number } = {},
   ): Promise<void> => {
     const durableIds = ids ?? [];
     if (durableIds.length === 0) {
@@ -850,7 +896,9 @@ export function createBot(
           return;
         }
         if (action === "pending") {
-          await foregroundTextQueue.markPendingClaimedMany(claims);
+          await foregroundTextQueue.markPendingClaimedMany(claims, {
+            nextAttemptAt: options.nextAttemptAt,
+          });
         } else {
           await foregroundTextQueue.removeClaimedMany(claims);
         }
@@ -1303,6 +1351,7 @@ export function createBot(
     const durableIds = durableTextPromptIds?.filter((id, index, ids) => ids.indexOf(id) === index) ?? [];
     const durableClaims = durableForegroundTextPromptClaimsFor(durableIds);
     let durableTextPromptHandled = durableIds.length === 0;
+    let retryDurableTextPromptDelayMs: number | undefined;
     const durableClaimHeartbeat =
       durableClaims.length > 0
         ? setInterval(() => {
@@ -1832,12 +1881,15 @@ export function createBot(
 
         finalized = true;
 
+        retryDurableTextPromptDelayMs = codexCapacityRetryDelayMs(error);
+        const shouldPreserveDurablePrompt =
+          error instanceof CodexTurnTimeoutError || retryDurableTextPromptDelayMs !== undefined;
+        durableTextPromptHandled = !shouldPreserveDurablePrompt;
         const failureSourceText = streamAgentResponses ? accumulatedText : completedAgentText;
         const combinedText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
         const chunks = splitMarkdownForTelegram(combinedText);
         try {
           await deliverRenderedChunks(chunks);
-          durableTextPromptHandled = !(error instanceof CodexTurnTimeoutError);
           await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "bot-raw", combinedText).catch(
             (appendError) => {
               console.error(
@@ -1868,7 +1920,13 @@ export function createBot(
             durableIds,
             "pending",
             "Failed to mark durable foreground text prompt pending:",
+            retryDurableTextPromptDelayMs !== undefined
+              ? { nextAttemptAt: Date.now() + retryDurableTextPromptDelayMs }
+              : undefined,
           );
+          if (retryDurableTextPromptDelayMs !== undefined) {
+            scheduleDurableForegroundRetryReplay(Date.now() + retryDurableTextPromptDelayMs);
+          }
         }
       }
       busyState.processing = false;
@@ -3449,6 +3507,7 @@ export function createBot(
             "pending",
             "Failed to release durable foreground text prompt after replay scheduling failure:",
           );
+          scheduleDurableForegroundRetryReplay(Date.now() + DURABLE_FOREGROUND_REPLAY_FAILURE_RETRY_MS);
           console.error("Failed to schedule durable foreground text prompt replay:", formatError(error));
         }
       }
@@ -3467,7 +3526,12 @@ export function createBot(
         "pending",
         "Failed to release claimed durable foreground text prompts after replay abort:",
       );
+      if (claimedButNotEnqueuedIds.length > 0) {
+        scheduleDurableForegroundRetryReplay(Date.now() + DURABLE_FOREGROUND_REPLAY_FAILURE_RETRY_MS);
+      }
       throw error;
+    } finally {
+      await scheduleNextDurableForegroundRetryFromQueue();
     }
   };
 

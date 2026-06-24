@@ -1353,6 +1353,196 @@ describe("createBot response delivery", () => {
     await waitForForegroundQueueEmpty(workspace);
   });
 
+  it("keeps retryable Codex capacity failures durable and replays them after backoff", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-retryable-capacity-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    let promptCalls = 0;
+    const session = createSession(async (callbacks) => {
+      promptCalls += 1;
+      if (promptCalls === 1) {
+        throw new Error("429 rate limit");
+      }
+
+      callbacks.onTextDelta("retried after rate reset");
+      callbacks.onAgentMessage?.("retried after rate reset");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    try {
+      const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 437, text: "this must survive a retryable Codex capacity failure" },
+        api: bot.api,
+      });
+
+      const queuePath = path.join(workspace, ".telecodex", "foreground_text_prompts.json");
+      const queueAfterFailure = JSON.parse(await readFile(queuePath, "utf8"));
+      expect(queueAfterFailure.entries["42:437"]).toMatchObject({
+        status: "pending",
+        text: "this must survive a retryable Codex capacity failure",
+      });
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+      expect(String(session.prompt.mock.calls[1][0])).toContain(
+        "this must survive a retryable Codex capacity failure",
+      );
+      await waitForForegroundQueueEmpty(workspace);
+
+      const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+      expect(visibleReplies).toContain("Rate limited");
+      expect(visibleReplies).toContain("retried after rate reset");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not auto-retry usage cap failures without a reset time", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-usage-cap-no-reset-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const session = createSession(async () => {
+      throw new Error("Your usage cap is exhausted. Visit settings to purchase more credits.");
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 438, text: "this usage cap has no reset time" },
+      api: bot.api,
+    });
+
+    const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(visibleReplies).toContain("Codex usage limit");
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("replays only due durable capacity failures when retry windows differ", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-24T00:00:00Z"));
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-scoped-capacity-retry-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const session = createSession(async (callbacks, input) => {
+      const text = String(input);
+      if (text.includes("long usage cap prompt")) {
+        const callCountForLong = session.prompt.mock.calls.filter((call: unknown[]) =>
+          String(call[0]).includes("long usage cap prompt"),
+        ).length;
+        if (callCountForLong === 1) {
+          throw new Error("You've hit your usage limit; try again at 2026-06-24T00:10:00Z.");
+        }
+        callbacks.onTextDelta("long reset reply");
+        callbacks.onAgentMessage?.("long reset reply");
+        callbacks.onAgentEnd();
+        return;
+      }
+
+      if (text.includes("short rate prompt")) {
+        const callCountForShort = session.prompt.mock.calls.filter((call: unknown[]) =>
+          String(call[0]).includes("short rate prompt"),
+        ).length;
+        if (callCountForShort === 1) {
+          throw new Error("429 rate limit");
+        }
+        callbacks.onTextDelta("short rate reply");
+        callbacks.onAgentMessage?.("short rate reply");
+        callbacks.onAgentEnd();
+        return;
+      }
+
+      throw new Error(`unexpected prompt: ${text}`);
+    });
+    const registry = createRegistry(session);
+
+    try {
+      const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 439, text: "long usage cap prompt" },
+        api: bot.api,
+      });
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 440, text: "short rate prompt" },
+        api: bot.api,
+      });
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+      expect(String(session.prompt.mock.calls[2][0])).toContain("short rate prompt");
+
+      const queueAfterShortRetry = JSON.parse(
+        await readFile(path.join(workspace, ".telecodex", "foreground_text_prompts.json"), "utf8"),
+      );
+      expect(queueAfterShortRetry.entries["42:439"]).toMatchObject({
+        status: "pending",
+        text: "long usage cap prompt",
+      });
+
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(4));
+      expect(String(session.prompt.mock.calls[3][0])).toContain("long usage cap prompt");
+      await waitForForegroundQueueEmpty(workspace);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("schedules durable capacity retry even when the visible failure reply cannot be sent", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-capacity-retry-send-fail-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    let promptCalls = 0;
+    const session = createSession(async (callbacks) => {
+      promptCalls += 1;
+      if (promptCalls === 1) {
+        throw new Error("429 rate limit");
+      }
+
+      callbacks.onTextDelta("retry survived send failure");
+      callbacks.onAgentMessage?.("retry survived send failure");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    try {
+      const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+      bot.api.sendMessage.mockRejectedValueOnce(new Error("Telegram send failed"));
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 441, text: "capacity failure whose visible error cannot send" },
+        api: bot.api,
+      });
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+      expect(String(session.prompt.mock.calls[1][0])).toContain("capacity failure whose visible error cannot send");
+      await waitForForegroundQueueEmpty(workspace);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("removes durable text after a visible final answer even if Codex rejects during cleanup", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-finalized-reject-"));
     tempDirs.push(root);
@@ -3160,6 +3350,58 @@ describe("createBot response delivery", () => {
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
     expect(String(session.prompt.mock.calls[0][0])).toContain("redelivery after replay scheduling failure");
     await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("automatically retries pending durable replay after startup scheduling fails without waiting for redelivery", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-replay-failure-auto-retry-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:442": {
+              id: "42:442",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 442,
+              text: "auto retry after replay scheduling failure",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("auto replay recovered");
+      callbacks.onAgentMessage?.("auto replay recovered");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockRejectedValueOnce(new Error("startup session unavailable")).mockResolvedValue(session);
+
+    try {
+      createBot(createConfig({ workspace } as any), registry as any);
+      await vi.waitFor(() => expect(registry.getOrCreate).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+      expect(String(session.prompt.mock.calls[0][0])).toContain("auto retry after replay scheduling failure");
+      await waitForForegroundQueueEmpty(workspace);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not eat live redelivery while startup durable replay is failing", async () => {

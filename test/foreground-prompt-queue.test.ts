@@ -228,6 +228,58 @@ describe("ForegroundTextPromptQueue", () => {
     });
   });
 
+  it("does not claim pending foreground receipts before their retry time", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-queue-retry-after-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    const nextAttemptAt = Date.now() + 60_000;
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:708": {
+              id: "42:708",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 708,
+              text: "claim only after retry time",
+              status: "pending",
+              attempts: 1,
+              nextAttemptAt,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const queue = new ForegroundTextPromptQueue(workspace);
+
+    await expect(queue.claim("42:708")).resolves.toBeUndefined();
+
+    const persisted = JSON.parse(await readFile(path.join(queueDir, "foreground_text_prompts.json"), "utf8"));
+    persisted.entries["42:708"].nextAttemptAt = Date.now() - 1;
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      `${JSON.stringify(persisted, null, 2)}\n`,
+      "utf8",
+    );
+
+    await expect(queue.claim("42:708")).resolves.toMatchObject({
+      id: "42:708",
+      status: "processing",
+      attempts: 2,
+    });
+  });
+
   it("does not claim a fresh processing receipt owned by this process", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-queue-fresh-processing-"));
     tempDirs.push(root);

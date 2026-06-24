@@ -8,6 +8,12 @@ export interface FriendlyError {
   logMessage: string;
 }
 
+const CODEX_RATE_LIMIT_RE = /429|rate.?limit|too many requests/i;
+const CODEX_USAGE_CAP_RE = /usage.?(?:limit|cap|capped)|purchase more credits|try again at/i;
+const CODEX_CAPACITY_DEFAULT_RETRY_DELAY_MS = 60_000;
+const MAX_TIMEOUT_DELAY_MS = 2_147_000_000;
+const TRY_AGAIN_AT_RE = /try again at/i;
+
 const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string }> = [
   {
     pattern: /ECONNREFUSED|ENOTFOUND|ENETUNREACH|fetch failed/i,
@@ -73,6 +79,28 @@ export function friendlyErrorText(error: unknown): string {
   return translateError(error).userMessage;
 }
 
+export function isRetryableCodexCapacityError(error: unknown): boolean {
+  const raw = extractRawMessage(error);
+  return CODEX_RATE_LIMIT_RE.test(raw) || (CODEX_USAGE_CAP_RE.test(raw) && TRY_AGAIN_AT_RE.test(raw));
+}
+
+export function codexCapacityRetryDelayMs(error: unknown, now = Date.now()): number | undefined {
+  const raw = extractRawMessage(error);
+  if (CODEX_RATE_LIMIT_RE.test(raw)) {
+    return CODEX_CAPACITY_DEFAULT_RETRY_DELAY_MS;
+  }
+
+  if (!CODEX_USAGE_CAP_RE.test(raw) || !TRY_AGAIN_AT_RE.test(raw)) {
+    return undefined;
+  }
+  const resetAt = parseCodexTryAgainAt(raw);
+  if (resetAt === undefined) {
+    return undefined;
+  }
+
+  return Math.max(0, Math.min(resetAt - now, MAX_TIMEOUT_DELAY_MS));
+}
+
 function extractRawMessage(error: unknown): string {
   if (error instanceof Error) {
     const cause = (error as Error & { cause?: Error }).cause;
@@ -87,4 +115,15 @@ function stripStackTrace(message: string): string {
   // Remove stack frame lines (lines starting with "at ")
   const lines = message.split("\n").filter((line) => !line.trim().startsWith("at "));
   return lines.join("\n").trim() || message.trim();
+}
+
+function parseCodexTryAgainAt(message: string): number | undefined {
+  const match = message.match(/try again at\s+([^.\n]+)/i);
+  if (!match?.[1]) {
+    return undefined;
+  }
+
+  const cleaned = match[1].replace(/\b(\d{1,2})(st|nd|rd|th)\b/gi, "$1").trim();
+  const parsed = Date.parse(cleaned);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }

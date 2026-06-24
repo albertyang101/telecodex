@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { friendlyErrorText, translateError } from "../src/error-messages.js";
+import {
+  codexCapacityRetryDelayMs,
+  friendlyErrorText,
+  isRetryableCodexCapacityError,
+  translateError,
+} from "../src/error-messages.js";
 
 describe("error-messages", () => {
   describe("translateError", () => {
@@ -129,6 +134,29 @@ describe("error-messages", () => {
     it("returns just the user message string", () => {
       const text = friendlyErrorText(new Error("429 too many requests"));
       expect(text).toContain("Rate limited");
+    });
+  });
+
+  describe("retryable Codex capacity classification", () => {
+    it("retries rate limits with the default short delay", () => {
+      const error = new Error("Request failed with status 429");
+
+      expect(isRetryableCodexCapacityError(error)).toBe(true);
+      expect(codexCapacityRetryDelayMs(error, Date.parse("2026-06-24T00:00:00Z"))).toBe(60_000);
+    });
+
+    it("does not auto-retry usage caps that do not include a reset time", () => {
+      const error = new Error("Your usage cap is exhausted. Visit settings to purchase more credits.");
+
+      expect(isRetryableCodexCapacityError(error)).toBe(false);
+      expect(codexCapacityRetryDelayMs(error, Date.parse("2026-06-24T00:00:00Z"))).toBeUndefined();
+    });
+
+    it("retries usage caps only when a reset time is present", () => {
+      const error = new Error("You've hit your usage limit; try again at 2026-06-24T00:10:00Z.");
+
+      expect(isRetryableCodexCapacityError(error)).toBe(true);
+      expect(codexCapacityRetryDelayMs(error, Date.parse("2026-06-24T00:00:00Z"))).toBe(600_000);
     });
   });
 });

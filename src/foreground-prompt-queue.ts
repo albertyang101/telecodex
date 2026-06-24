@@ -14,6 +14,7 @@ export interface ForegroundTextPromptEntry {
   text: string;
   status: ForegroundTextPromptStatus;
   attempts: number;
+  nextAttemptAt?: number;
   claimProcessId?: number;
   claimToken?: string;
   createdAt: number;
@@ -124,7 +125,7 @@ export class ForegroundTextPromptQueue {
             continue;
           }
           const claimed = {
-            ...entry,
+            ...withoutRetryDelay(entry),
             status: "processing" as const,
             attempts: entry.attempts + 1,
             claimProcessId: process.pid,
@@ -186,7 +187,7 @@ export class ForegroundTextPromptQueue {
             continue;
           }
           state.entries[id] = {
-            ...withoutClaim(entry),
+            ...withoutClaimAndRetry(entry),
             status: "pending",
             updatedAt: now,
           };
@@ -199,7 +200,10 @@ export class ForegroundTextPromptQueue {
     });
   }
 
-  async markPendingClaimedMany(claims: ForegroundTextPromptClaim[]): Promise<void> {
+  async markPendingClaimedMany(
+    claims: ForegroundTextPromptClaim[],
+    options: { nextAttemptAt?: number } = {},
+  ): Promise<void> {
     await this.serialize(async () => {
       await this.withFileLock(async (lockToken) => {
         const state = await this.readState();
@@ -211,8 +215,9 @@ export class ForegroundTextPromptQueue {
             continue;
           }
           state.entries[claim.id] = {
-            ...withoutClaim(entry),
+            ...withoutClaimAndRetry(entry),
             status: "pending",
+            ...(options.nextAttemptAt !== undefined ? { nextAttemptAt: options.nextAttemptAt } : {}),
             updatedAt: now,
           };
           changed = true;
@@ -456,7 +461,7 @@ function compareForegroundTextPromptEntries(
 
 function isForegroundTextPromptClaimable(entry: ForegroundTextPromptEntry, now: number): boolean {
   if (entry.status === "pending") {
-    return true;
+    return entry.nextAttemptAt === undefined || entry.nextAttemptAt <= now;
   }
 
   if (entry.claimProcessId === undefined) {
@@ -481,6 +486,15 @@ function isClaimOwner(entry: ForegroundTextPromptEntry, claim: ForegroundTextPro
 function withoutClaim(entry: ForegroundTextPromptEntry): ForegroundTextPromptEntry {
   const { claimProcessId: _claimProcessId, claimToken: _claimToken, ...rest } = entry;
   return rest;
+}
+
+function withoutRetryDelay(entry: ForegroundTextPromptEntry): ForegroundTextPromptEntry {
+  const { nextAttemptAt: _nextAttemptAt, ...rest } = entry;
+  return rest;
+}
+
+function withoutClaimAndRetry(entry: ForegroundTextPromptEntry): ForegroundTextPromptEntry {
+  return withoutRetryDelay(withoutClaim(entry));
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
