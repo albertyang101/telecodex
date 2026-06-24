@@ -22,6 +22,8 @@ export interface MailboxBridgeConfig {
   persona?: string;
   personasRoot: string;
   contextKey?: string;
+  launchProfileId?: string;
+  allowUnsafeLaunchProfile: boolean;
   pollMs: number;
   fullScanMs: number;
   autoReply: boolean;
@@ -72,6 +74,7 @@ export interface TeleCodexConfig {
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
+  telegramTextCoalesceMs: number;
   memoryTranscriptRoot?: string;
   mailboxBridge: MailboxBridgeConfig;
   telegramTransport: TelegramTransportConfig;
@@ -121,6 +124,11 @@ export function loadConfig(): TeleCodexConfig {
     optionalString(process.env.ENABLE_TELEGRAM_REACTIONS),
     false,
   );
+  const telegramTextCoalesceMs = parseOptionalNonNegativeIntegerEnv(
+    optionalString(process.env.TELEGRAM_TEXT_COALESCE_MS),
+    0,
+    "TELEGRAM_TEXT_COALESCE_MS",
+  );
   const memoryTranscriptRoot = parseOptionalAbsolutePath(
     optionalString(process.env.TRANSCRIPT_ROOT),
     "TRANSCRIPT_ROOT",
@@ -153,6 +161,7 @@ export function loadConfig(): TeleCodexConfig {
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
+    telegramTextCoalesceMs,
     memoryTranscriptRoot,
     mailboxBridge,
     telegramTransport,
@@ -324,6 +333,18 @@ function parsePositiveIntegerEnv(raw: string | undefined, defaultValue: number, 
   return parsed;
 }
 
+function parseOptionalNonNegativeIntegerEnv(raw: string | undefined, defaultValue: number, name: string): number {
+  if (!raw) {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
 function parseMailboxBridgeConfig(): MailboxBridgeConfig {
   const persona = optionalString(process.env.MAILBOX_PERSONA);
   const enabled = Boolean(persona) && parseBooleanEnv(optionalString(process.env.MAILBOX_ENABLED), true);
@@ -337,6 +358,8 @@ function parseMailboxBridgeConfig(): MailboxBridgeConfig {
     persona,
     personasRoot,
     contextKey: optionalString(process.env.MAILBOX_CONTEXT_KEY),
+    launchProfileId: optionalString(process.env.MAILBOX_LAUNCH_PROFILE_ID),
+    allowUnsafeLaunchProfile: parseBooleanEnv(optionalString(process.env.MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE), false),
     pollMs: parsePositiveIntegerEnv(optionalString(process.env.MAILBOX_POLL_MS), 500, "MAILBOX_POLL_MS"),
     fullScanMs: parsePositiveIntegerEnv(
       optionalString(process.env.MAILBOX_FULL_SCAN_MS),
@@ -463,12 +486,22 @@ function validateMailboxBridgeLaunch(
     throw new Error("MAILBOX_PERSONA must be a safe single path segment");
   }
 
-  const profile = findLaunchProfile(launchProfiles, defaultLaunchProfileId);
+  const launchProfileId = mailboxBridge.launchProfileId ?? defaultLaunchProfileId;
+  const profile = findLaunchProfile(launchProfiles, launchProfileId);
+  if (!profile && mailboxBridge.launchProfileId) {
+    throw new Error(`Unknown MAILBOX_LAUNCH_PROFILE_ID: ${mailboxBridge.launchProfileId}`);
+  }
   if (profile?.sandboxMode === "read-only" && profile.approvalPolicy === "never") {
     return;
   }
+  if (profile && mailboxBridge.allowUnsafeLaunchProfile) {
+    if (profile.approvalPolicy !== "never") {
+      throw new Error("MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE requires a never approval launch profile");
+    }
+    return;
+  }
 
-  throw new Error("MAILBOX_PERSONA requires the default Codex launch profile to be read-only / never");
+  throw new Error("MAILBOX_PERSONA requires a read-only / never launch profile");
 }
 
 function parseMailboxMinSentAt(raw: string | undefined): string | undefined {

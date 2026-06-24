@@ -87,6 +87,9 @@ type BusyState = {
   processing: boolean;
   switching: boolean;
   transcribing: number;
+  activeSession?: CodexSessionService;
+  abortRequested: boolean;
+  supersededByFollowUp: boolean;
 };
 
 type QueuedPrompt = {
@@ -96,8 +99,42 @@ type QueuedPrompt = {
   status: "pending" | "ready" | "skipped";
   input?: CodexPromptInput;
   receiptReaction?: Promise<void>;
+  reactionTargets?: PromptReaction[];
   afterPrompt?: () => Promise<void>;
 };
+
+type PromptReaction = {
+  ctx: Context;
+  receiptReaction?: Promise<void>;
+};
+
+type PendingTextCoalesce = {
+  contextKey: TelegramContextKey;
+  ctx: Context;
+  chatId: TelegramChatId;
+  session: CodexSessionService;
+  texts: string[];
+  reactionTargets: PromptReaction[];
+  timer: ReturnType<typeof setTimeout>;
+};
+
+export function formatTelegramIngressAuditLine(ctx: Context, authorized: boolean): string {
+  const updateId = (ctx.update as { update_id?: number } | undefined)?.update_id ?? "unknown";
+  const updateType = ctx.message ? "message" : ctx.callbackQuery ? "callback_query" : "unknown";
+  const fromId = ctx.from?.id ?? "unknown";
+  const chatId = ctx.chat?.id ?? "unknown";
+  const chatType = ctx.chat?.type ?? "unknown";
+  const messageId = ctx.message?.message_id ?? ctx.callbackQuery?.message?.message_id ?? "unknown";
+  return [
+    `Telegram ingress update_id=${updateId}`,
+    `type=${updateType}`,
+    `from_id=${fromId}`,
+    `chat_id=${chatId}`,
+    `chat_type=${chatType}`,
+    `message_id=${messageId}`,
+    `authorized=${authorized ? "yes" : "no"}`,
+  ].join(" ");
+}
 
 class CodexTurnTimeoutError extends Error {
   constructor(timeoutMs: number) {
@@ -252,6 +289,7 @@ async function waitForCodexPrompt(
     abortGraceMs?: number;
     onSettledAfterTimeout?: () => Promise<void>;
     onFatalRecovery?: (error: Error) => void;
+    shouldAbortOnTimeout?: () => boolean;
   },
 ): Promise<void> {
   if (!timeoutMs) {
@@ -297,9 +335,11 @@ async function waitForCodexPrompt(
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeout = setTimeout(() => {
       timedOut = true;
-      void session.abort().catch((error) => {
-        console.error("Failed to abort timed-out Codex turn:", formatError(error));
-      });
+      if (options?.shouldAbortOnTimeout?.() ?? true) {
+        void session.abort().catch((error) => {
+          console.error("Failed to abort timed-out Codex turn:", formatError(error));
+        });
+      }
       if (options?.abortGraceMs && options.onFatalRecovery) {
         abortGraceTimeout = setTimeout(() => {
           if (notifiedPostTimeoutSettle || !session.isProcessing()) {
@@ -418,6 +458,7 @@ export function createBot(
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const pendingPromptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
   const drainingPromptQueues = new Set<TelegramContextKey>();
+  const pendingTextCoalesces = new Map<string, PendingTextCoalesce>();
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
@@ -427,21 +468,72 @@ export function createBot(
     lastPromptInput.delete(key);
     pendingPromptQueues.delete(key);
     drainingPromptQueues.delete(key);
+    for (const [coalesceKey, pending] of pendingTextCoalesces) {
+      if (pending.contextKey === key) {
+        clearTimeout(pending.timer);
+        pendingTextCoalesces.delete(coalesceKey);
+        void failPromptReactions(pending.reactionTargets).catch((error) => {
+          console.error("Failed to clear coalesced Telegram text reactions after context removal:", error);
+        });
+      }
+    }
   });
 
   const getBusyState = (contextKey: TelegramContextKey): BusyState => {
     let state = contextBusy.get(contextKey);
     if (!state) {
-      state = { processing: false, switching: false, transcribing: 0 };
+      state = {
+        processing: false,
+        switching: false,
+        transcribing: 0,
+        abortRequested: false,
+        supersededByFollowUp: false,
+      };
       contextBusy.set(contextKey, state);
     }
     return state;
   };
 
+  const hasPendingTextCoalesce = (contextKey: TelegramContextKey): boolean => {
+    for (const pending of pendingTextCoalesces.values()) {
+      if (pending.contextKey === contextKey) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   const isBusy = (contextKey: TelegramContextKey): boolean => {
     const state = contextBusy.get(contextKey);
     const session = registry.get(contextKey);
-    return Boolean(state?.processing || state?.switching || state?.transcribing || session?.isProcessing());
+    return Boolean(
+      state?.processing ||
+        state?.switching ||
+        state?.transcribing ||
+        session?.isProcessing() ||
+        hasPendingTextCoalesce(contextKey),
+    );
+  };
+
+  const hasQueuedFollowUp = (contextKey: TelegramContextKey): boolean => {
+    return (
+      (pendingPromptQueues.get(contextKey)?.some((item) => item.status !== "skipped") ?? false) ||
+      hasPendingTextCoalesce(contextKey)
+    );
+  };
+
+  const interruptActivePrompt = (contextKey: TelegramContextKey): void => {
+    const busyState = getBusyState(contextKey);
+    const activeSession = busyState.activeSession ?? registry.get(contextKey);
+    if (busyState.abortRequested || (!busyState.processing && !activeSession?.isProcessing())) {
+      return;
+    }
+
+    busyState.abortRequested = true;
+    busyState.supersededByFollowUp = true;
+    void activeSession?.abort().catch((error) => {
+      console.error("Failed to abort active Codex turn after Telegram follow-up:", formatError(error));
+    });
   };
 
   const getContextSession = async (
@@ -583,6 +675,18 @@ export function createBot(
     void clearReaction(ctx).catch(() => {});
   };
 
+  const promptReactionTargets = (item: QueuedPrompt): PromptReaction[] => {
+    return item.reactionTargets ?? [{ ctx: item.ctx, receiptReaction: item.receiptReaction }];
+  };
+
+  const completePromptReactions = async (targets: PromptReaction[]): Promise<void> => {
+    await Promise.all(targets.map((target) => completeReaction(target.ctx, target.receiptReaction)));
+  };
+
+  const failPromptReactions = async (targets: PromptReaction[]): Promise<void> => {
+    await Promise.all(targets.map((target) => failReaction(target.ctx, target.receiptReaction)));
+  };
+
   const sendRepeatingChatAction = async <T>(
     chatId: TelegramChatId,
     action: TelegramChatAction,
@@ -638,7 +742,7 @@ export function createBot(
         }
 
         if (next.status === "skipped") {
-          await failReaction(next.ctx, next.receiptReaction);
+          await failPromptReactions(promptReactionTargets(next));
           if (next.afterPrompt) {
             await next.afterPrompt();
           }
@@ -654,9 +758,9 @@ export function createBot(
 
         try {
           await handleUserPrompt(next.ctx, contextKey, next.chatId, next.session, next.input);
-          await completeReaction(next.ctx, next.receiptReaction);
+          await completePromptReactions(promptReactionTargets(next));
         } catch {
-          await failReaction(next.ctx, next.receiptReaction);
+          await failPromptReactions(promptReactionTargets(next));
         } finally {
           if (next.afterPrompt) {
             await next.afterPrompt();
@@ -674,24 +778,129 @@ export function createBot(
     chatId: TelegramChatId,
     session: CodexSessionService,
     input: CodexPromptInput,
-    options?: { reactionAlreadySet?: boolean },
+    options?: { reactionAlreadySet?: boolean; reactionTargets?: PromptReaction[] },
   ): Promise<void> => {
     rememberPromptInput(contextKey, input);
     const receiptReaction = options?.reactionAlreadySet ? undefined : setReaction(ctx, "👀");
+    const reactionTargets = options?.reactionTargets ?? [{ ctx, receiptReaction }];
 
     const hasQueuedPrompts = (pendingPromptQueues.get(contextKey)?.length ?? 0) > 0;
     if (isBusy(contextKey) || hasQueuedPrompts) {
-      enqueuePrompt(contextKey, { ctx, chatId, session, status: "ready", input, receiptReaction });
+      enqueuePrompt(contextKey, { ctx, chatId, session, status: "ready", input, receiptReaction, reactionTargets });
+      interruptActivePrompt(contextKey);
       await drainQueuedPrompts(contextKey);
       return;
     }
 
     try {
       await handleUserPrompt(ctx, contextKey, chatId, session, input);
-      await completeReaction(ctx, receiptReaction);
+      await completePromptReactions(reactionTargets);
     } catch {
-      await failReaction(ctx, receiptReaction);
+      await failPromptReactions(reactionTargets);
     }
+  };
+
+  const textCoalesceKey = (contextKey: TelegramContextKey, ctx: Context): string => {
+    return `${contextKey}\u0000${ctx.from?.id ?? "unknown"}`;
+  };
+
+  const formatCoalescedTextInput = (texts: string[]): string => {
+    if (texts.length === 1) {
+      return texts[0] ?? "";
+    }
+
+    return [
+      "Albert sent these Telegram messages consecutively. Treat them as one user turn, in order:",
+      "",
+      ...texts.map((text, index) => `[${index + 1}]\n${text}`),
+    ].join("\n\n");
+  };
+
+  const flushTextCoalescedPrompt = (key: string): void => {
+    const pending = pendingTextCoalesces.get(key);
+    if (!pending) {
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    pendingTextCoalesces.delete(key);
+    const input = formatCoalescedTextInput(pending.texts);
+    void runOrQueuePrompt(pending.ctx, pending.contextKey, pending.chatId, pending.session, input, {
+      reactionAlreadySet: true,
+      reactionTargets: pending.reactionTargets,
+    }).catch((error) => {
+      console.error("Failed to flush coalesced Telegram text prompt:", formatError(error));
+    });
+  };
+
+  const flushTextCoalesceForSender = (contextKey: TelegramContextKey, ctx: Context): void => {
+    flushTextCoalescedPrompt(textCoalesceKey(contextKey, ctx));
+  };
+
+  const flushTextCoalescesForContext = (contextKey: TelegramContextKey): void => {
+    for (const [coalesceKey, pending] of [...pendingTextCoalesces]) {
+      if (pending.contextKey === contextKey) {
+        flushTextCoalescedPrompt(coalesceKey);
+      }
+    }
+  };
+
+  const cancelPendingTextCoalescesForContext = async (contextKey: TelegramContextKey): Promise<void> => {
+    const reactionTargets: PromptReaction[] = [];
+    for (const [coalesceKey, pending] of pendingTextCoalesces) {
+      if (pending.contextKey !== contextKey) {
+        continue;
+      }
+
+      clearTimeout(pending.timer);
+      pendingTextCoalesces.delete(coalesceKey);
+      reactionTargets.push(...pending.reactionTargets);
+    }
+
+    if (reactionTargets.length > 0) {
+      await failPromptReactions(reactionTargets);
+    }
+  };
+
+  const runOrCoalesceTextPrompt = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    session: CodexSessionService,
+    userText: string,
+  ): Promise<void> => {
+    const windowMs = config.telegramTextCoalesceMs;
+    if (windowMs <= 0) {
+      await runOrQueuePrompt(ctx, contextKey, chatId, session, userText);
+      return;
+    }
+
+    const key = textCoalesceKey(contextKey, ctx);
+    const receiptReaction = setReaction(ctx, "👀");
+    const existing = pendingTextCoalesces.get(key);
+    if (existing) {
+      clearTimeout(existing.timer);
+      existing.ctx = ctx;
+      existing.chatId = chatId;
+      existing.session = session;
+      existing.texts.push(userText);
+      existing.reactionTargets.push({ ctx, receiptReaction });
+      existing.timer = setTimeout(() => flushTextCoalescedPrompt(key), windowMs);
+      interruptActivePrompt(contextKey);
+      return;
+    }
+
+    const pending: PendingTextCoalesce = {
+      contextKey,
+      ctx,
+      chatId,
+      session,
+      texts: [userText],
+      reactionTargets: [{ ctx, receiptReaction }],
+      timer: setTimeout(() => flushTextCoalescedPrompt(key), windowMs),
+    };
+    pendingTextCoalesces.set(key, pending);
+    interruptActivePrompt(contextKey);
   };
 
   const ensureActiveThread = async (
@@ -732,6 +941,9 @@ export function createBot(
 
     const busyState = getBusyState(contextKey);
     busyState.processing = true;
+    busyState.activeSession = session;
+    busyState.abortRequested = false;
+    busyState.supersededByFollowUp = false;
 
     const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
     const toolVerbosity: ToolVerbosity = config.toolVerbosity;
@@ -913,6 +1125,32 @@ export function createBot(
       } catch (error) {
         if (!isMessageNotModifiedError(error)) {
           console.error("Failed to clear Abort button", error);
+        }
+      }
+    };
+
+    const removeInterruptedResponseMessage = async (): Promise<void> => {
+      if (!responseMessageId) {
+        return;
+      }
+
+      const interruptedMessageId = responseMessageId;
+      try {
+        await bot.api.deleteMessage(chatId, interruptedMessageId);
+        responseMessageId = undefined;
+        lastRenderedText = "";
+      } catch (deleteError) {
+        const replacement = renderMarkdownChunkWithinLimit("已收到后续消息，正在按最新内容处理。");
+        try {
+          await safeEditMessage(bot, chatId, interruptedMessageId, replacement.text, {
+            parseMode: replacement.parseMode,
+            fallbackText: replacement.fallbackText,
+            replyMarkup: new InlineKeyboard(),
+          });
+          lastRenderedText = replacement.text;
+        } catch (editError) {
+          console.error("Failed to clear interrupted Telegram response message:", formatError(deleteError));
+          console.error("Failed to replace interrupted Telegram response message:", formatError(editError));
         }
       }
     };
@@ -1179,8 +1417,19 @@ export function createBot(
         config.codexTurnTimeoutMs,
         {
           abortGraceMs: config.codexTurnAbortGraceMs,
-          onSettledAfterTimeout: () => drainQueuedPrompts(contextKey),
+          onSettledAfterTimeout: async () => {
+            getBusyState(contextKey).abortRequested = false;
+            await drainQueuedPrompts(contextKey);
+          },
           onFatalRecovery: recoveryOptions.onFatalRecovery,
+          shouldAbortOnTimeout: () => {
+            const currentBusyState = getBusyState(contextKey);
+            if (currentBusyState.abortRequested) {
+              return false;
+            }
+            currentBusyState.abortRequested = true;
+            return true;
+          },
         },
       );
       updateSessionMetadata(contextKey, session);
@@ -1209,6 +1458,15 @@ export function createBot(
       if (finalized) {
         console.error("Codex prompt error after finalization:", formatError(error));
       } else {
+        const suppressInterruptedFailure =
+          (busyState.supersededByFollowUp || hasQueuedFollowUp(contextKey)) &&
+          (isAbortLikeError(error) || error instanceof CodexTurnTimeoutError);
+        if (suppressInterruptedFailure) {
+          await removeInterruptedResponseMessage();
+          console.error("Codex prompt interrupted by newer Telegram input:", formatError(error));
+          return;
+        }
+
         finalized = true;
 
         const failureSourceText = streamAgentResponses ? accumulatedText : completedAgentText;
@@ -1232,6 +1490,11 @@ export function createBot(
       stopTyping();
       clearFlushTimer();
       busyState.processing = false;
+      busyState.activeSession = undefined;
+      if (!session.isProcessing()) {
+        busyState.abortRequested = false;
+      }
+      busyState.supersededByFollowUp = false;
       await drainQueuedPrompts(contextKey);
     }
   };
@@ -1274,7 +1537,9 @@ export function createBot(
 
   bot.use(async (ctx, next) => {
     const fromId = ctx.from?.id;
-    if (!fromId || !config.telegramAllowedUserIdSet.has(fromId)) {
+    const authorized = Boolean(fromId && config.telegramAllowedUserIdSet.has(fromId));
+    console.log(formatTelegramIngressAuditLine(ctx, authorized));
+    if (!authorized) {
       if (ctx.callbackQuery) {
         await ctx.answerCallbackQuery({ text: "Unauthorized" }).catch(() => {});
       } else if (ctx.chat) {
@@ -1570,8 +1835,9 @@ export function createBot(
       return;
     }
 
-    const { session } = contextSession;
+    const { contextKey, session } = contextSession;
     try {
+      await cancelPendingTextCoalescesForContext(contextKey);
       await session.abort();
       await safeReply(ctx, escapeHTML("Aborted current operation"), {
         fallbackText: "Aborted current operation",
@@ -2032,6 +2298,7 @@ export function createBot(
     }
 
     await ctx.answerCallbackQuery({ text: "Aborting..." });
+    await cancelPendingTextCoalescesForContext(contextKey);
     await session.abort();
   });
 
@@ -2405,6 +2672,11 @@ export function createBot(
       return;
     }
 
+    if (isBusy(contextKey)) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
     await ctx.answerCallbackQuery({ text: `Effort set to ${effort}` });
     pendingEffortButtons.delete(contextKey);
     session.setReasoningEffort(effort);
@@ -2427,7 +2699,7 @@ export function createBot(
     }
 
     const { contextKey, session } = contextSession;
-    await runOrQueuePrompt(ctx, contextKey, ctx.chat.id, session, userText);
+    await runOrCoalesceTextPrompt(ctx, contextKey, ctx.chat.id, session, userText);
   });
 
   bot.on(["message:voice", "message:audio"], async (ctx) => {
@@ -2443,6 +2715,8 @@ export function createBot(
     if (!fileId) {
       return;
     }
+
+    flushTextCoalescesForContext(contextKey);
 
     const receiptReaction = setReaction(ctx, "👀");
     const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
@@ -2499,6 +2773,8 @@ export function createBot(
       return;
     }
 
+    flushTextCoalescesForContext(contextKey);
+
     const receiptReaction = setReaction(ctx, "👀");
     const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
@@ -2554,6 +2830,8 @@ export function createBot(
       });
       return;
     }
+
+    flushTextCoalescesForContext(contextKey);
 
     const receiptReaction = setReaction(ctx, "👀");
     const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
@@ -3164,9 +3442,9 @@ function isTelegramParseError(error: unknown): boolean {
   );
 }
 
-function renderPromptFailure(accumulatedText: string, error: unknown): string {
+function renderPromptFailure(_accumulatedText: string, error: unknown): string {
   const message = friendlyErrorText(error);
-  return accumulatedText.trim() ? `${accumulatedText.trim()}\n\n⚠️ ${message}` : `⚠️ ${message}`;
+  return `⚠️ ${message}`;
 }
 
 function isAbortLikeError(error: unknown): boolean {

@@ -201,3 +201,58 @@ ALB-714 discipline mirror:
   - No-leak probe file: `/tmp/alb714-turn-discipline-noleak-live-20260622T0730.json`.
   - Sent id `25949`, reply id `25950`, final reply `ALB714_NOLEAK_OK`; hidden guard lines were not visible in Telegram.
 - ALB-714 still should not close solely from this injection proof. Remaining closure is a real THEO task lifecycle proving Linear-first behavior, root-cause-first repair, TDD/review/live proof, and Albert acceptance.
+
+2026-06-24 ALB-717 follow-up interrupt / timeout leak proof:
+
+- Scope: isolated E2E testbot only. THEO was not restarted or used.
+- Runtime branch/worktree: `alb-717-native-telegram-queue` on Mac mini.
+- Runtime label after restart: `com.albert.albert-codex-e2e-codex-dispatcher`, pid `50318`.
+- Runtime env proof: `CODEX_MODEL=gpt-5.5`, `CODEX_REASONING_EFFORT=xhigh`, `CODEX_SANDBOX_MODE=danger-full-access`, `CODEX_APPROVAL_POLICY=never`, `TELEGRAM_TEXT_COALESCE_MS=1200`.
+- Local verification:
+  - Target red tests first covered active text interrupt/merge, queued timeout suppression, and partial timeout output leak.
+  - `npm test -- test/bot.test.ts -t "interrupts an active text turn|aborts a stuck foreground|does not append partial Codex output"` -> 3 passed.
+  - `npm test -- test/bot.test.ts` -> 78 passed.
+  - `npm run build` -> passed.
+  - `npm test` -> 25 files / 514 tests passed.
+- Mac mini verification:
+  - Target test command above -> 3 passed.
+  - `npm test -- test/bot.test.ts` -> 78 passed.
+  - `npm run build` -> passed.
+  - `npm test` -> 27 files / 519 tests passed.
+- Live Telegram proof via Pyrogram against `@albert_codex_e2e_4ad0_bot`:
+  - JSON: `/tmp/alb717-followup-interrupt-live.json` on Mac mini.
+  - Nonce: `ALB717_INTERRUPT_20260624T1057`.
+  - Sent first long turn message id `27653`, then follow-ups `27654` and `27655`.
+  - Bot produced exactly one reply, id `27656`, text `ALB717_INTERRUPT_20260624T1057_OK`.
+  - Checks: `contains_expected=true`, `contains_first_done=false`, `contains_timeout=false`.
+  - Logs captured three Telegram ingress lines after restart and `Codex prompt interrupted by newer Telegram input: The operation was aborted`.
+
+2026-06-24 ALB-717 review-fix proof:
+
+- Independent review found no Critical and two Important issues:
+  - normal foreground timeout could be swallowed while the SDK session remained active;
+  - streaming mode could leave an already-sent partial preview visible after follow-up supersede.
+- Fix:
+  - removed the broad active-timeout suppression; timeout is suppressed only when actually superseded by newer input / queued follow-up;
+  - added interrupted streaming preview cleanup via Telegram `deleteMessage`, with an edit-to-placeholder fallback if deletion fails.
+- Added red/green tests:
+  - `deletes an already streamed partial reply when a text follow-up interrupts the active turn`;
+  - `still sends a timeout failure when no newer input exists and the aborted session is still active`.
+- Local verification after fixes:
+  - 5-test ALB-717/review target -> passed.
+  - `npm test -- test/bot.test.ts` -> 80 passed.
+  - `npm run build` -> passed.
+  - `npm test` -> 25 files / 516 tests passed.
+- Mac mini verification after fixes:
+  - 5-test target -> passed.
+  - `npm test -- test/bot.test.ts` -> 80 passed.
+  - `npm run build` -> passed.
+  - `npm test` -> 27 files / 521 tests passed.
+- Runtime/live after review fixes:
+  - Restarted isolated E2E testbot only; current label `com.albert.albert-codex-e2e-codex-dispatcher`, pid `56534`.
+  - JSON: `/tmp/alb717-reviewfix-followup-live.json`.
+  - Nonce: `ALB717_REVIEWFIX_20260624T1109`.
+  - Sent long first turn `27670`, then follow-ups `27672` and `27673`.
+  - Bot produced exactly one reply `27674`: `ALB717_REVIEWFIX_20260624T1109_OK`.
+  - Checks: `contains_expected=true`, `contains_first_done=false`, `contains_timeout=false`.
+  - THEO, CC Dispatcher, Memory, and Graphiti were not touched.

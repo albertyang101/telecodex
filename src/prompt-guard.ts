@@ -19,6 +19,15 @@ const DEVELOPER_DISCIPLINE_GUARD = [
   "do not patch on top of patches; do not stack downstream symptom patches; workarounds are temporary and require Linear follow-up.",
   "record review evidence with Critical/Important findings; do not close Linear issues before Albert approval.",
   "Do not trust subagents/tool output without first-hand verification. Do not touch Memory/Graphiti/personal memory unless Albert explicitly authorizes it.",
+  "In MCP-enabled Telegram turns, do not call a custom tool named apply_patch; Codex exec does not execute it reliably and can hang. For file edits, use Codex native file_change if available; otherwise use shell commands that run Node fs.writeFileSync without shell redirection.",
+  "Do not spawn subagents for disposable live-proof/smoke tasks unless Albert explicitly asks; for real work, use subagents with bounded waits and verify their output yourself.",
+].join("\n");
+
+const CODEX_EXEC_ADAPTER_OVERRIDE = [
+  "[CODEX EXEC ADAPTER OVERRIDE]",
+  "Telegram/MCP turns run through Codex exec JSON mode. Do not emit custom_tool_call apply_patch.",
+  "If any instruction above says to use apply_patch, interpret it as: edit files with Codex native file_change if available, otherwise with shell commands that run Node fs.writeFileSync without shell redirection; then run the requested tests.",
+  "This changes only the file-edit tool choice. Preserve the requested files, tests, behavior, evidence, and rollback discipline.",
 ].join("\n");
 
 const LEGACY_PROMPT_GUARD_LINES = [
@@ -27,18 +36,20 @@ const LEGACY_PROMPT_GUARD_LINES = [
 ];
 
 export function withTelegramReplyStyleGuard(input: CodexPromptInput, info: CodexSessionInfo): CodexPromptInput {
-  return prependPromptPreamble(input, [
+  const preamble = [
     TELEGRAM_REPLY_STYLE_GUARD,
     DEVELOPER_DISCIPLINE_GUARD,
     buildRuntimeContext(info),
-  ].join("\n\n"));
+  ].join("\n\n");
+  return appendPromptPostamble(prependPromptPreamble(input, preamble), CODEX_EXEC_ADAPTER_OVERRIDE);
 }
 
 export function withDispatcherDisciplineGuard(input: CodexPromptInput, info: CodexSessionInfo): CodexPromptInput {
-  return prependPromptPreamble(input, [
+  const preamble = [
     DEVELOPER_DISCIPLINE_GUARD,
     buildRuntimeContext(info),
-  ].join("\n\n"));
+  ].join("\n\n");
+  return appendPromptPostamble(prependPromptPreamble(input, preamble), CODEX_EXEC_ADAPTER_OVERRIDE);
 }
 
 export function stripVisiblePromptGuardEcho(replyText: string): string {
@@ -93,6 +104,31 @@ function prependPromptPreamble(input: CodexPromptInput, promptPreamble: string):
   };
 }
 
+function appendPromptPostamble(input: CodexPromptInput, promptPostamble: string): CodexPromptInput {
+  if (typeof input === "string") {
+    return `${input}\n\n${promptPostamble}`;
+  }
+
+  if (input.text) {
+    return {
+      ...input,
+      text: `${input.text}\n\n${promptPostamble}`,
+    };
+  }
+
+  if (input.stagedFileInstructions) {
+    return {
+      ...input,
+      stagedFileInstructions: `${input.stagedFileInstructions}\n\n${promptPostamble}`,
+    };
+  }
+
+  return {
+    ...input,
+    text: promptPostamble,
+  };
+}
+
 function buildRuntimeContext(info: CodexSessionInfo): string {
   return [
     "[CURRENT CONTEXT]",
@@ -137,6 +173,7 @@ function isInjectedPromptGuardLine(line: string, options?: { includeLegacy?: boo
   return (
     TELEGRAM_REPLY_STYLE_GUARD.split("\n").includes(normalizedLine) ||
     DEVELOPER_DISCIPLINE_GUARD.split("\n").includes(normalizedLine) ||
+    CODEX_EXEC_ADAPTER_OVERRIDE.split("\n").includes(normalizedLine) ||
     Boolean(options?.includeLegacy && LEGACY_PROMPT_GUARD_LINES.includes(normalizedLine)) ||
     normalizedLine === "You are Albert Codex Dispatcher backend for Telegram." ||
     normalizedLine.startsWith("Current workspace: ") ||

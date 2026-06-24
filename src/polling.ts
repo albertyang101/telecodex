@@ -12,9 +12,17 @@ export type TelegramPollingOptions = {
 export type TelegramPollingRetryOptions = TelegramPollingOptions & {
   maxConflictRestartAttempts?: number;
   conflictRestartDelayMs?: number;
+  pendingUpdateWatchdogIntervalMs?: number;
+  pendingUpdateWatchdogStaleMs?: number;
+  pendingUpdateWatchdogMinPendingUpdates?: number;
   onHandle?: (handle: RunnerHandle) => void;
   shouldStop?: () => boolean;
+  logger?: Pick<Console, "warn">;
 };
+
+const DEFAULT_PENDING_UPDATE_WATCHDOG_INTERVAL_MS = 10_000;
+const DEFAULT_PENDING_UPDATE_WATCHDOG_STALE_MS = 60_000;
+const DEFAULT_PENDING_UPDATE_WATCHDOG_MIN_UPDATES = 1;
 
 export async function startTelegramPolling(
   bot: Bot<Context>,
@@ -41,30 +49,41 @@ export async function runTelegramPollingWithRetry(
   const maxConflictRestartAttempts = options.maxConflictRestartAttempts ?? 5;
   const conflictRestartDelayMs = options.conflictRestartDelayMs ?? 3_000;
   let conflictRestartAttempts = 0;
+  let pollingStartAttempts = 0;
 
   while (!options.shouldStop?.()) {
+    const dropPendingUpdates = pollingStartAttempts === 0 ? options.dropPendingUpdates : false;
+    pollingStartAttempts += 1;
     const handle = await startTelegramPolling(bot, {
       ...options,
-      dropPendingUpdates: conflictRestartAttempts === 0 ? options.dropPendingUpdates : false,
+      dropPendingUpdates,
     });
     options.onHandle?.(handle);
     const task = handle.task();
     if (!task) {
       return;
     }
+    const watchdogAbort = new AbortController();
+    const watchdogTask = watchForStalePendingUpdates(bot, handle, options, watchdogAbort.signal);
 
     try {
-      await task;
+      await (watchdogTask ? Promise.race([task, watchdogTask]) : task);
       return;
     } catch (error) {
       if (options.shouldStop?.()) {
         return;
       }
 
+      if (error instanceof PendingUpdatesStalledError) {
+        console.warn(error.message);
+        continue;
+      }
+
       if (isTelegramConflictError(error) && conflictRestartAttempts < maxConflictRestartAttempts) {
         conflictRestartAttempts += 1;
+        const limitLabel = Number.isFinite(maxConflictRestartAttempts) ? String(maxConflictRestartAttempts) : "unbounded";
         console.warn(
-          `Polling conflict (attempt ${conflictRestartAttempts}/${maxConflictRestartAttempts}); retrying in ${
+          `Polling conflict (attempt ${conflictRestartAttempts}/${limitLabel}); retrying in ${
             conflictRestartDelayMs / 1000
           }s...`,
         );
@@ -73,8 +92,81 @@ export async function runTelegramPollingWithRetry(
       }
 
       throw error;
+    } finally {
+      watchdogAbort.abort();
     }
   }
+}
+
+class PendingUpdatesStalledError extends Error {
+  constructor(pendingUpdates: number, staleMs: number) {
+    super(
+      `Telegram polling appears stalled: ${pendingUpdates} pending update(s) stayed unconsumed for ${staleMs}ms; restarting polling without dropping updates.`,
+    );
+    this.name = "PendingUpdatesStalledError";
+  }
+}
+
+function watchForStalePendingUpdates(
+  bot: Bot<Context>,
+  handle: RunnerHandle,
+  options: TelegramPollingRetryOptions,
+  signal: AbortSignal,
+): Promise<void> | undefined {
+  const getWebhookInfo = bot.api.getWebhookInfo?.bind(bot.api);
+  if (!getWebhookInfo) {
+    return undefined;
+  }
+
+  const intervalMs = options.pendingUpdateWatchdogIntervalMs ?? DEFAULT_PENDING_UPDATE_WATCHDOG_INTERVAL_MS;
+  const staleMs = options.pendingUpdateWatchdogStaleMs ?? DEFAULT_PENDING_UPDATE_WATCHDOG_STALE_MS;
+  const minPendingUpdates = options.pendingUpdateWatchdogMinPendingUpdates ?? DEFAULT_PENDING_UPDATE_WATCHDOG_MIN_UPDATES;
+  if (intervalMs <= 0 || staleMs <= 0 || minPendingUpdates <= 0) {
+    return undefined;
+  }
+
+  const logger = options.logger ?? console;
+  let firstStalePendingAt: number | undefined;
+  let lastPendingUpdates = 0;
+
+  return (async () => {
+    while (!signal.aborted && !options.shouldStop?.()) {
+      await delay(intervalMs, signal);
+      if (signal.aborted || options.shouldStop?.()) {
+        return;
+      }
+
+      let pendingUpdates = 0;
+      try {
+        const webhookInfo = await getWebhookInfo();
+        pendingUpdates = webhookInfo.pending_update_count ?? 0;
+      } catch (error) {
+        logger.warn(`Failed to inspect Telegram pending updates: ${formatError(error)}`);
+        firstStalePendingAt = undefined;
+        lastPendingUpdates = 0;
+        continue;
+      }
+
+      const runnerQueueSize = typeof handle.size === "function" ? handle.size() : 0;
+      const runnerActive = typeof handle.isRunning === "function" ? handle.isRunning() : true;
+      const looksStalled = runnerActive && runnerQueueSize === 0 && pendingUpdates >= minPendingUpdates;
+      if (!looksStalled) {
+        firstStalePendingAt = undefined;
+        lastPendingUpdates = pendingUpdates;
+        continue;
+      }
+
+      const now = Date.now();
+      firstStalePendingAt ??= now;
+      lastPendingUpdates = pendingUpdates;
+      if (now - firstStalePendingAt < staleMs) {
+        continue;
+      }
+
+      await handle.stop();
+      throw new PendingUpdatesStalledError(lastPendingUpdates, now - firstStalePendingAt);
+    }
+  })();
 }
 
 function isTelegramConflictError(error: unknown): boolean {
@@ -86,6 +178,20 @@ function isTelegramConflictError(error: unknown): boolean {
   return message.includes("409") || message.includes("Conflict");
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+      { once: true },
+    );
+  });
 }

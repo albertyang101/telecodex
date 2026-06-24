@@ -43,6 +43,7 @@ const mockGrammy = vi.hoisted(() => {
       sendMessage: vi.fn().mockImplementation(async () => ({ message_id: api.sendMessage.mock.calls.length })),
       editMessageText: vi.fn().mockResolvedValue(true),
       editMessageReplyMarkup: vi.fn().mockResolvedValue(true),
+      deleteMessage: vi.fn().mockResolvedValue(true),
       setMyCommands: vi.fn().mockResolvedValue(true),
       setMessageReaction: vi.fn().mockResolvedValue(true),
     };
@@ -128,6 +129,7 @@ describe("createBot response delivery", () => {
     showTurnTokenUsage: false,
     enableTelegramLogin: true,
     enableTelegramReactions: false,
+    telegramTextCoalesceMs: 0,
     streamAgentResponses: false,
     memoryTranscriptRoot: undefined,
     mailboxBridge: {
@@ -168,12 +170,18 @@ describe("createBot response delivery", () => {
     })),
   });
 
-  const createRegistry = (session: any) => ({
-    onRemove: vi.fn(),
-    get: vi.fn(() => session),
-    getOrCreate: vi.fn(async () => session),
-    updateMetadata: vi.fn(),
-  });
+  const createRegistry = (session: any) => {
+    const removeCallbacks: Array<(key: string) => void> = [];
+    return {
+      __removeCallbacks: removeCallbacks,
+      onRemove: vi.fn((callback: (key: string) => void) => {
+        removeCallbacks.push(callback);
+      }),
+      get: vi.fn(() => session),
+      getOrCreate: vi.fn(async () => session),
+      updateMetadata: vi.fn(),
+    };
+  };
 
   beforeEach(() => {
     mockGrammy.bots.length = 0;
@@ -996,7 +1004,9 @@ describe("createBot response delivery", () => {
     expect(input.stagedFileInstructions).toContain("Current reasoning effort: xhigh");
     expect(input.stagedFileInstructions).not.toMatch(/runtime facts/i);
     expect(input.stagedFileInstructions).toContain("staged on disk");
-    expect(input.text).toBe("帮我总结");
+    expect(input.text).toContain("帮我总结");
+    expect(input.text).toContain("[CODEX EXEC ADAPTER OVERRIDE]");
+    expect(input.text?.startsWith("帮我总结\n\n[CODEX EXEC ADAPTER OVERRIDE]")).toBe(true);
   });
 
   it("adds runtime facts to image prompts while preserving image paths", async () => {
@@ -1157,7 +1167,472 @@ describe("createBot response delivery", () => {
     );
   });
 
+  it("interrupts an active text turn and merges consecutive follow-ups into one next Codex turn", async () => {
+    vi.useFakeTimers();
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮半截输出，不应该发到 Telegram。");
+        callbacks.onAgentMessage?.("第一轮半截输出，不应该发到 Telegram。");
+        await firstTurn.promise;
+        throw new Error("The operation was aborted");
+      }
+
+      callbacks.onTextDelta("合并后回复。");
+      callbacks.onAgentMessage?.("合并后回复。");
+      callbacks.onAgentEnd();
+    });
+    session.abort.mockImplementation(async () => {
+      firstTurn.resolve();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ telegramTextCoalesceMs: 25 }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 210, text: "第一条，先跑一个长任务" },
+      api: bot.api,
+    });
+    await vi.advanceTimersByTimeAsync(25);
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 211, text: "第二条：别继续上一条了" },
+      api: bot.api,
+    });
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 212, text: "第三条：按这两条一起处理" },
+      api: bot.api,
+    });
+
+    try {
+      await vi.waitFor(() => expect(session.abort).toHaveBeenCalledTimes(1), { timeout: 100 });
+      await firstPromise;
+      await vi.advanceTimersByTimeAsync(25);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+
+      const secondPrompt = String(session.prompt.mock.calls[1][0]);
+      expect(secondPrompt).toContain("第二条：别继续上一条了");
+      expect(secondPrompt).toContain("第三条：按这两条一起处理");
+      expect(secondPrompt.indexOf("第二条：别继续上一条了")).toBeLessThan(
+        secondPrompt.indexOf("第三条：按这两条一起处理"),
+      );
+
+      const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+      expect(visibleReplies).toContain("合并后回复。");
+      expect(visibleReplies).not.toContain("第一轮半截输出");
+      expect(visibleReplies).not.toContain("Aborted");
+      expect(visibleReplies).not.toContain("Request timed out");
+    } finally {
+      firstTurn.resolve();
+      await firstPromise;
+      vi.useRealTimers();
+    }
+  });
+
+  it("deletes an already streamed partial reply when a text follow-up interrupts the active turn", async () => {
+    vi.useFakeTimers();
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮半截 streaming 输出，不应该留在 Telegram。");
+        await firstTurn.promise;
+        throw new Error("The operation was aborted");
+      }
+
+      callbacks.onTextDelta("合并后回复。");
+      callbacks.onAgentMessage?.("合并后回复。");
+      callbacks.onAgentEnd();
+    });
+    session.abort.mockImplementation(async () => {
+      firstTurn.resolve();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(
+      createConfig({ streamAgentResponses: true, telegramTextCoalesceMs: 25 }),
+      registry as any,
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 214, text: "第一条，先开始 streaming 长任务" },
+      api: bot.api,
+    });
+    await vi.advanceTimersByTimeAsync(25);
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).toContain(
+        "第一轮半截 streaming 输出",
+      ),
+    );
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 215, text: "第二条：打断上一条" },
+      api: bot.api,
+    });
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 216, text: "第三条：按这两条一起处理" },
+      api: bot.api,
+    });
+
+    try {
+      await vi.waitFor(() => expect(session.abort).toHaveBeenCalledTimes(1), { timeout: 100 });
+      await vi.waitFor(() => expect(bot.api.deleteMessage).toHaveBeenCalledWith(42, expect.any(Number)));
+      await vi.advanceTimersByTimeAsync(25);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+
+      const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+      expect(visibleReplies).toContain("合并后回复。");
+      expect(visibleReplies).not.toContain("Request timed out");
+    } finally {
+      firstTurn.resolve();
+      vi.useRealTimers();
+    }
+  });
+
+  it("coalesces a burst of text messages from the same Telegram user into one Codex turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("合并后的回复。");
+        callbacks.onAgentMessage?.("合并后的回复。");
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig({ telegramTextCoalesceMs: 25 }), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 92, text: "第一段：先说明背景" },
+        api: bot.api,
+      });
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 93, text: "第二段：补充约束" },
+        api: bot.api,
+      });
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 94, text: "第三段：最后的问题" },
+        api: bot.api,
+      });
+
+      expect(session.prompt).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      const prompt = String(session.prompt.mock.calls[0][0]);
+      expect(prompt).toContain("第一段：先说明背景");
+      expect(prompt).toContain("第二段：补充约束");
+      expect(prompt).toContain("第三段：最后的问题");
+      expect(prompt.indexOf("第一段：先说明背景")).toBeLessThan(prompt.indexOf("第二段：补充约束"));
+      expect(prompt.indexOf("第二段：补充约束")).toBeLessThan(prompt.indexOf("第三段：最后的问题"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels pending coalesced text when Albert aborts before the turn is sent to Codex", async () => {
+    vi.useFakeTimers();
+    try {
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("不应执行。");
+        callbacks.onAgentMessage?.("不应执行。");
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig({ telegramTextCoalesceMs: 25 }), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+      const abortCommand = bot.__handlers.commands.get("abort");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 95, text: "这条还在 coalescing window 里，abort 后不能进 Codex" },
+        api: bot.api,
+      });
+
+      await abortCommand({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 96, text: "/abort" },
+        api: bot.api,
+      });
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect(session.abort).toHaveBeenCalledTimes(1);
+      expect(session.prompt).not.toHaveBeenCalled();
+      expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).toContain(
+        "Aborted current operation",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats a pending coalesced text turn as busy before state-changing commands run", async () => {
+    vi.useFakeTimers();
+    try {
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("待处理文本回复。");
+        callbacks.onAgentMessage?.("待处理文本回复。");
+        callbacks.onAgentEnd();
+      });
+      (session as any).listWorkspaces = vi.fn(() => ["/workspace/base"]);
+      session.newThread.mockResolvedValue(session.getInfo());
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig({ telegramTextCoalesceMs: 25 }), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+      const newCommand = bot.__handlers.commands.get("new");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 95, text: "这条还在 coalescing window 里" },
+        api: bot.api,
+      });
+
+      await newCommand({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 96, text: "/new" },
+        api: bot.api,
+      });
+
+      expect(session.newThread).not.toHaveBeenCalled();
+      expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).toContain(
+        "Cannot create a new thread while a prompt is running.",
+      );
+
+      await vi.advanceTimersByTimeAsync(25);
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      expect(String(session.prompt.mock.calls[0][0])).toContain("这条还在 coalescing window 里");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats pending coalesced text as busy before effort callback changes session state", async () => {
+    vi.useFakeTimers();
+    try {
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("待处理文本回复。");
+        callbacks.onAgentMessage?.("待处理文本回复。");
+        callbacks.onAgentEnd();
+      });
+      (session as any).setReasoningEffort = vi.fn();
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig({ telegramTextCoalesceMs: 25 }), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+      const effortCommand = bot.__handlers.commands.get("effort");
+      const effortCallback = bot.__handlers.callbacks.find(
+        (callback: any) => typeof callback.pattern?.test === "function" && callback.pattern.test("effort_xhigh"),
+      )?.handler;
+      const answerCallbackQuery = vi.fn();
+
+      await effortCommand({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 97, text: "/effort" },
+        api: bot.api,
+      });
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 98, text: "这条 pending 文本应挡住 effort callback" },
+        api: bot.api,
+      });
+
+      await effortCallback({
+        chat: { id: 42 },
+        from: { id: 123 },
+        callbackQuery: { message: { message_id: 99 } },
+        match: ["effort_xhigh", "xhigh"],
+        answerCallbackQuery,
+        api: bot.api,
+      });
+
+      expect((session as any).setReasoningEffort).not.toHaveBeenCalled();
+      expect(answerCallbackQuery).toHaveBeenCalledWith({ text: "Wait for the current prompt to finish" });
+
+      await vi.advanceTimersByTimeAsync(25);
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      expect(String(session.prompt.mock.calls[0][0])).toContain("这条 pending 文本应挡住 effort callback");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears pending coalesced text reactions when a session context is removed", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("不应执行。");
+      callbacks.onAgentMessage?.("不应执行。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session) as any;
+
+    const bot = createBot(createConfig({ enableTelegramReactions: true, telegramTextCoalesceMs: 60_000 }), registry) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 97, text: "这条会在 remove 前被取消" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(reactionEmojiFromCall(bot.api.setMessageReaction.mock.calls[0])).toBe("👀"));
+
+    registry.__removeCallbacks[0]("42");
+
+    await vi.waitFor(() => expect(bot.api.setMessageReaction).toHaveBeenCalledWith(42, 97, []));
+    await delay(20);
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("flushes earlier pending text from another Telegram user before media in the same context", async () => {
+    const finishPhotoDownload = deferred<ArrayBuffer>();
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("图片回复。");
+      callbacks.onAgentMessage?.("图片回复。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session) as any;
+
+    const bot = createBot(
+      createConfig({
+        telegramAllowedUserIds: [123, 456],
+        telegramAllowedUserIdSet: new Set([123, 456]),
+        telegramTextCoalesceMs: 60_000,
+      }),
+      registry,
+    ) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "photos/cross-user.jpg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => finishPhotoDownload.promise,
+      })),
+    );
+    const textHandler = bot.__handlers.on.get("message:text");
+    const photoHandler = bot.__handlers.on.get("message:photo");
+
+    await textHandler({
+      chat: { id: -1001 },
+      from: { id: 123 },
+        message: { message_id: 98, text: "用户 A 的 pending 文本必须排在用户 B 的图片前" },
+        api: bot.api,
+      });
+
+    const photoPromise = photoHandler({
+      chat: { id: -1001 },
+      from: { id: 456 },
+      message: {
+        message_id: 99,
+        photo: [{ file_id: "photo-file-cross-user" }],
+      },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    expect(String(session.prompt.mock.calls[0][0])).toContain("用户 A 的 pending 文本必须排在用户 B 的图片前");
+
+    finishPhotoDownload.resolve(new Uint8Array([1, 2, 3]).buffer);
+    await photoPromise;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    const secondInput = session.prompt.mock.calls[1][0] as { imagePaths?: string[] };
+    expect(secondInput.imagePaths).toHaveLength(1);
+    registry.__removeCallbacks[0]("-1001");
+  });
+
+  it("flushes the same Telegram user's pending text before media in the same context", async () => {
+    const finishPhotoDownload = deferred<ArrayBuffer>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
+      callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session) as any;
+
+    const bot = createBot(createConfig({ telegramTextCoalesceMs: 60_000 }), registry) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "photos/same-user.jpg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => finishPhotoDownload.promise,
+      })),
+    );
+    const textHandler = bot.__handlers.on.get("message:text");
+    const photoHandler = bot.__handlers.on.get("message:photo");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 100, text: "同一用户的 pending 文本必须排在图片前" },
+      api: bot.api,
+    });
+
+    const photoPromise = photoHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 101,
+        photo: [{ file_id: "photo-file-same-user" }],
+      },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    expect(String(session.prompt.mock.calls[0][0])).toContain("同一用户的 pending 文本必须排在图片前");
+
+    finishPhotoDownload.resolve(new Uint8Array([1, 2, 3]).buffer);
+    await photoPromise;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    const secondInput = session.prompt.mock.calls[1][0] as { imagePaths?: string[] };
+    expect(secondInput.imagePaths).toHaveLength(1);
+  });
+
   it("aborts a stuck foreground Codex turn after the configured timeout and drains queued prompts", async () => {
+    vi.useFakeTimers();
     const abortCalled = deferred<void>();
     const releaseAbortedTurn = deferred<void>();
     const abortedTurnSettled = deferred<void>();
@@ -1188,38 +1663,95 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
+    try {
+      const bot = createBot(createConfig({ codexTurnTimeoutMs: 10_000 } as any), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      const firstPromise = textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 12, text: "第一条会卡住" },
+        api: bot.api,
+      });
+
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 13, text: "第二条必须在超时后继续进 Codex" },
+        api: bot.api,
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await firstPromise;
+
+      expect(session.abort).toHaveBeenCalledTimes(1);
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      releaseAbortedTurn.resolve();
+      await abortedTurnSettled.promise;
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+      expect(String(session.prompt.mock.calls[1][0])).toContain("第二条必须在超时后继续进 Codex");
+      const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+      expect(visibleReplies).toContain("第二轮回复。");
+      expect(visibleReplies).not.toContain("Request timed out. Try a shorter prompt or use /retry.");
+    } finally {
+      releaseAbortedTurn.resolve();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not append partial Codex output to timeout failure replies", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("半截内部输出，不应该跟 timeout 一起发出来。");
+      callbacks.onAgentMessage?.("半截内部输出，不应该跟 timeout 一起发出来。");
+      await new Promise(() => {});
+    });
+    const registry = createRegistry(session);
+
     const bot = createBot(createConfig({ codexTurnTimeoutMs: 5 } as any), registry as any) as any;
     const textHandler = bot.__handlers.on.get("message:text");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 12, text: "第一条会卡住" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
 
     await textHandler({
       chat: { id: 42 },
       from: { id: 123 },
-      message: { message_id: 13, text: "第二条必须在超时后继续进 Codex" },
+      message: { message_id: 213, text: "这条会超时" },
       api: bot.api,
     });
 
-    await expect(Promise.race([firstPromise.then(() => "resolved"), delay(100).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
+    const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(visibleReplies).toContain("Request timed out. Try a shorter prompt or use /retry.");
+    expect(visibleReplies).not.toContain("半截内部输出");
+  });
 
+  it("still sends a timeout failure when no newer input exists and the aborted session is still active", async () => {
+    let processing = false;
+    const session = createSession(async (callbacks) => {
+      processing = true;
+      callbacks.onTextDelta("半截 active timeout 输出，不应该跟 timeout 一起发出来。");
+      callbacks.onAgentMessage?.("半截 active timeout 输出，不应该跟 timeout 一起发出来。");
+      await new Promise(() => {});
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockImplementation(async () => {
+      processing = true;
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ codexTurnTimeoutMs: 5 } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 217, text: "这条会超时，且没有 follow-up" },
+      api: bot.api,
+    });
+
+    const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
     expect(session.abort).toHaveBeenCalledTimes(1);
-    expect(session.prompt).toHaveBeenCalledTimes(1);
-    releaseAbortedTurn.resolve();
-    await abortedTurnSettled.promise;
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条必须在超时后继续进 Codex");
-    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).toContain(
-      "Request timed out. Try a shorter prompt or use /retry.",
-    );
+    expect(visibleReplies).toContain("Request timed out. Try a shorter prompt or use /retry.");
+    expect(visibleReplies).not.toContain("半截 active timeout 输出");
   });
 
   it("escalates to fatal recovery when a timed-out Codex turn never settles after abort", async () => {
@@ -1975,7 +2507,9 @@ describe("createBot response delivery", () => {
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
     const documentInput = session.prompt.mock.calls[1][0] as { stagedFileInstructions?: string; text?: string };
     expect(documentInput.stagedFileInstructions).toContain("report.txt");
-    expect(documentInput.text).toBe("先总结这个文档");
+    expect(documentInput.text).toContain("先总结这个文档");
+    expect(documentInput.text).toContain("[CODEX EXEC ADAPTER OVERRIDE]");
+    expect(documentInput.text?.startsWith("先总结这个文档\n\n[CODEX EXEC ADAPTER OVERRIDE]")).toBe(true);
     expect(String(session.prompt.mock.calls[2][0])).toContain("文档后面发来的文字");
   });
 
@@ -2145,7 +2679,9 @@ describe("createBot response delivery", () => {
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
     const documentInput = session.prompt.mock.calls[1][0] as { stagedFileInstructions?: string; text?: string };
     expect(documentInput.stagedFileInstructions).toContain("report.txt");
-    expect(documentInput.text).toBe("先总结这个文档");
+    expect(documentInput.text).toContain("先总结这个文档");
+    expect(documentInput.text).toContain("[CODEX EXEC ADAPTER OVERRIDE]");
+    expect(documentInput.text?.startsWith("先总结这个文档\n\n[CODEX EXEC ADAPTER OVERRIDE]")).toBe(true);
     expect(String(session.prompt.mock.calls[2][0])).toContain("文档确认失败后这条也必须进 Codex");
   });
 
@@ -2234,7 +2770,9 @@ describe("createBot response delivery", () => {
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
     const documentInput = session.prompt.mock.calls[1][0] as { stagedFileInstructions?: string; text?: string };
     expect(documentInput.stagedFileInstructions).toContain("report.txt");
-    expect(documentInput.text).toBe("先总结这个文档");
+    expect(documentInput.text).toContain("先总结这个文档");
+    expect(documentInput.text).toContain("[CODEX EXEC ADAPTER OVERRIDE]");
+    expect(documentInput.text?.startsWith("先总结这个文档\n\n[CODEX EXEC ADAPTER OVERRIDE]")).toBe(true);
     expect(String(session.prompt.mock.calls[2][0])).toContain("文档确认卡住后这条也必须进 Codex");
   });
 

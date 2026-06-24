@@ -81,8 +81,10 @@ export async function runMailboxDeliveryOnce(
     return { processed: 0, replied: 0, skipped: historicalSkipped };
   }
 
-  const session = await registry.getOrCreate(contextKey);
-  ensureMailboxSessionIsReadOnly(session);
+  const session = settings.launchProfileId
+    ? await registry.getOrCreate(contextKey, { launchProfileId: settings.launchProfileId })
+    : await registry.getOrCreate(contextKey);
+  ensureMailboxSessionLaunchProfile(session, settings.allowUnsafeLaunchProfile);
   let processed = 0;
   let replied = 0;
   let skipped = historicalSkipped;
@@ -507,11 +509,19 @@ async function quarantineTimedOutMailboxMessage(
   await ackDeliveryEvents(settings, message.msgId);
 }
 
-function ensureMailboxSessionIsReadOnly(session: CodexSessionService): void {
+function ensureMailboxSessionLaunchProfile(session: CodexSessionService, allowUnsafeLaunchProfile: boolean): void {
   const info = session.getInfo();
+  if (allowUnsafeLaunchProfile) {
+    if (info.approvalPolicy === "never") {
+      return;
+    }
+    throw new Error("MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE requires a never approval Codex session");
+  }
+
   if (info.sandboxMode === "read-only" && info.approvalPolicy === "never") {
     return;
   }
+
   throw new Error("Mailbox bridge requires a read-only / never Codex session");
 }
 

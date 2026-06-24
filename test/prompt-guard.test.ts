@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { CodexSessionInfo } from "../src/codex-session.js";
-import { stripVisiblePromptGuardEcho, withTelegramReplyStyleGuard } from "../src/prompt-guard.js";
+import {
+  stripVisiblePromptGuardEcho,
+  withDispatcherDisciplineGuard,
+  withTelegramReplyStyleGuard,
+} from "../src/prompt-guard.js";
 
 const sessionInfo: CodexSessionInfo = {
   threadId: "thread-1",
@@ -39,6 +43,66 @@ describe("withTelegramReplyStyleGuard", () => {
     expect(prompt).toContain("run green verification");
     expect(prompt).toContain("record review evidence with Critical/Important findings");
     expect(prompt).toContain("do not close Linear issues before Albert approval");
+    expect(prompt).toContain("do not call a custom tool named apply_patch");
+    expect(prompt).toContain("Do not spawn subagents for disposable live-proof/smoke tasks");
+  });
+
+  it("appends an executable edit adapter override after user text that mentions apply_patch", () => {
+    const prompt = withTelegramReplyStyleGuard(
+      "用 apply_patch 创建 tiny.test.js，然后跑红绿测试",
+      sessionInfo,
+    );
+
+    expect(prompt).toContain("用 apply_patch 创建 tiny.test.js");
+    expect(prompt).toContain("[CODEX EXEC ADAPTER OVERRIDE]");
+    expect(prompt).toContain("If any instruction above says to use apply_patch");
+    expect(prompt.lastIndexOf("[CODEX EXEC ADAPTER OVERRIDE]")).toBeGreaterThan(
+      prompt.lastIndexOf("用 apply_patch 创建 tiny.test.js"),
+    );
+  });
+
+  it("keeps the executable edit adapter override last for mailbox/object prompts", () => {
+    const prompt = withDispatcherDisciplineGuard(
+      {
+        stagedFileInstructions: "Attached file instructions",
+        text: "please use apply_patch for the fix",
+        imagePaths: ["/tmp/example.png"],
+      },
+      sessionInfo,
+    );
+
+    expect(typeof prompt).toBe("object");
+    if (typeof prompt === "string") {
+      throw new Error("expected object prompt");
+    }
+    expect(prompt.imagePaths).toEqual(["/tmp/example.png"]);
+    expect(prompt.stagedFileInstructions).toContain("Attached file instructions");
+    expect(prompt.text).toContain("please use apply_patch for the fix");
+    expect(prompt.text).toContain("[CODEX EXEC ADAPTER OVERRIDE]");
+    expect(prompt.text!.lastIndexOf("[CODEX EXEC ADAPTER OVERRIDE]")).toBeGreaterThan(
+      prompt.text!.lastIndexOf("please use apply_patch for the fix"),
+    );
+  });
+
+  it("appends the executable edit adapter override after staged instructions when object prompts have no text", () => {
+    const prompt = withDispatcherDisciplineGuard(
+      {
+        stagedFileInstructions: "Attached file instructions",
+        imagePaths: ["/tmp/example.png"],
+      },
+      sessionInfo,
+    );
+
+    expect(typeof prompt).toBe("object");
+    if (typeof prompt === "string") {
+      throw new Error("expected object prompt");
+    }
+    expect(prompt.text).toBeUndefined();
+    expect(prompt.stagedFileInstructions).toContain("Attached file instructions");
+    expect(prompt.stagedFileInstructions).toContain("[CODEX EXEC ADAPTER OVERRIDE]");
+    expect(prompt.stagedFileInstructions!.lastIndexOf("[CODEX EXEC ADAPTER OVERRIDE]")).toBeGreaterThan(
+      prompt.stagedFileInstructions!.lastIndexOf("Attached file instructions"),
+    );
   });
 
   it("does not remove legacy discipline wording when it is normal reply content", () => {

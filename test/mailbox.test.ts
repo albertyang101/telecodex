@@ -130,6 +130,105 @@ describe("mailbox bridge", () => {
     });
   });
 
+  it("opens mailbox Codex sessions with the configured mailbox launch profile", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "msg-readonly-profile",
+      subject: "Use readonly profile",
+      body: "Please confirm the mailbox bridge uses the safe launch profile.",
+    });
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("NO_REPLY");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const config = createConfig({ personasRoot, workspace });
+    config.mailboxBridge.launchProfileId = "readonly";
+
+    await runMailboxDeliveryOnce(config, registry as never);
+
+    expect(registry.getOrCreate).toHaveBeenCalledWith("mailbox:albert-v3", {
+      launchProfileId: "readonly",
+    });
+  });
+
+  it("honors the explicit unsafe mailbox launch profile override at delivery time", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "msg-unsafe-profile",
+      subject: "Use developer profile",
+      body: "Please confirm the mailbox bridge can use the explicitly approved developer profile.",
+    });
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("developer profile mailbox reply");
+      callbacks.onAgentEnd();
+    });
+    session.getInfo.mockReturnValue({
+      ...session.getInfo(),
+      launchProfileId: "developer",
+      launchProfileLabel: "Developer",
+      launchProfileBehavior: "danger-full-access / never",
+      sandboxMode: "danger-full-access",
+      approvalPolicy: "never",
+      unsafeLaunch: true,
+    });
+    const registry = createRegistry(session);
+    const config = createConfig({ personasRoot, workspace });
+    config.mailboxBridge.launchProfileId = "developer";
+    config.mailboxBridge.allowUnsafeLaunchProfile = true;
+
+    const result = await runMailboxDeliveryOnce(config, registry as never);
+
+    expect(result).toEqual({ processed: 1, replied: 1, skipped: 0 });
+    expect(registry.getOrCreate).toHaveBeenCalledWith("mailbox:albert-v3", {
+      launchProfileId: "developer",
+    });
+  });
+
+  it("rejects unsafe mailbox sessions that would require runtime approvals", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "msg-unsafe-on-request",
+      subject: "Reject review profile",
+      body: "This mailbox turn must not use an approval-gated profile.",
+    });
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("NO_REPLY");
+      callbacks.onAgentEnd();
+    });
+    session.getInfo.mockReturnValue({
+      ...session.getInfo(),
+      launchProfileId: "review",
+      launchProfileLabel: "Review",
+      launchProfileBehavior: "workspace-write / on-request",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "on-request",
+      unsafeLaunch: false,
+    });
+    const config = createConfig({ personasRoot, workspace });
+    config.mailboxBridge.launchProfileId = "review";
+    config.mailboxBridge.allowUnsafeLaunchProfile = true;
+
+    await expect(runMailboxDeliveryOnce(config, createRegistry(session) as never)).rejects.toThrow(
+      "MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE requires a never approval Codex session",
+    );
+  });
+
   it("strips echoed dispatcher discipline before writing mailbox replies", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
@@ -1056,6 +1155,7 @@ function createConfig(overrides: { personasRoot: string; workspace: string }): T
       persona: "albert-v3",
       personasRoot: overrides.personasRoot,
       contextKey: undefined,
+      launchProfileId: undefined,
       pollMs: 500,
       fullScanMs: 10_000,
       autoReply: true,
