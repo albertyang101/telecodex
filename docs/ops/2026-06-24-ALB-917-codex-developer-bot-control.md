@@ -19,6 +19,21 @@ Linear is the source of truth. This file is a local recovery pointer for the act
 - Memory/Graphiti/personal memory: out of scope.
 - THEO/theu: Albert-owned bot; do not use for this validation.
 
+## Codex Dispatcher Bot Registry
+
+This is the Codex dispatcher registry for ALB-917/ALB-714. It is intentionally separate from the CC `config/channels_tenants.json` supervisor roster because these bots are not managed by `com.albert.channels-supervisor`.
+
+| Role | Bot display name | Username | Persona/token root | Launchd label | Workspace | Model/effort | Current use |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Albert-owned Codex developer | `Theo （Developer -Codex）` | `@albert_v3_xpx_bot` | `/Users/albertyang0888/personas/albert-v3` | `com.albert.albert-v3-codex-dispatcher` | `/Users/albertyang0888/code/codex-telegram-research/discipline-workspace` | `gpt-5.5` / `xhigh` | Albert may use directly; do not run ALB-917 validation traffic here unless Albert asks. |
+| Disposable Codex developer testbot | `Albert Codex Dev` | `@albert_codex_e2e_4ad0_bot` | `/Users/albertyang0888/personas/albert-codex-e2e` | `com.albert.albert-codex-e2e-codex-dispatcher` | `/Users/albertyang0888/code/codex-telegram-research/albert-codex-e2e-workspace` | `gpt-5.5` / `xhigh` | ALB-917 validation and future Codex developer bot Agent Skill proof. |
+
+Roster boundary:
+
+- Do not add either Codex dispatcher bot to the CC `channels_tenants.json` runtime supervisor unless the supervisor is explicitly extended to manage TeleCodex launchd jobs.
+- Use this registry plus Linear as the active control-plane roster for Codex dispatcher bots.
+- Keep Memory/Graphiti disabled for both Codex dispatcher routes unless Albert separately authorizes that line.
+
 ## Verified Evidence
 
 - Unit/build before post-build restart: `npm test` and `npm run build -- --pretty false` passed on Mac mini.
@@ -40,6 +55,7 @@ Linear is the source of truth. This file is a local recovery pointer for the act
 - Official plugin install checkpoint: ALB-917 comment `761f63af-71ae-4358-a1f8-02c2adbb09f1`, ALB-716 comment `8d54d619-74be-429b-b336-4e5fd5ef4638`; installed/enabled `linear`, `github`, `notion`, `gmail`, `canva`, and `superpowers` from `openai-curated` into the testbot dedicated `CODEX_HOME`; dry-run exec probe still passed; live smoke `/tmp/alb917-plugin-install-smoke.json`, `27719 -> 27720`, final `ALB917_PLUGIN_INSTALL_SMOKE_20260624T1248_OK`, Bot API pending 0. Figma intentionally skipped per Albert's latest priority call.
 - Natural-language skill fire probe: ALB-714 comment `6c87f586-6d5e-48d5-bdc6-4611088b573d`, ALB-917 comment `18957fed-b2ae-4142-b074-da3d82d1a320`, ALB-716 comment `0537f76c-3225-4524-a67c-ba40a95a0505`; direct Codex runtime marker `ALB917_SKILL_FIRE_DIRECT_20260624T1252`, exit 0, `/tmp/alb917-skill-fire-direct.txt` final `ALB917_SKILL_FIRE_DIRECT_20260624T1252_OK`, and `/tmp/alb917-skill-fire-direct.log` contains loaded `verification-before-completion` skill text.
 - GitHub runtime read probe: ALB-917 comment `a3daa2e8-c814-4436-8c30-6aa8781c00cd`, ALB-716 comment `5289914f-eeaa-43fa-ae2a-7ea1e3507f6b`; direct Codex runtime marker `ALB917_GITHUB_READ_PROBE_20260624T1256`, exit 0, final `ALB917_GITHUB_READ_PROBE_20260624T1256_OK b7e193a`; log shows GitHub plugin skill loaded and `codex_apps/github.compare_commits` completed; host `gh auth status` is logged in as `albertyang101` with repo scope.
+- Runtime registry/status checkpoint on 2026-06-24 13:07-13:15 AEST: `Theo （Developer -Codex）` / `@albert_v3_xpx_bot` Bot API `getMe` succeeded, `getWebhookInfo.pending_update_count=0`, and `com.albert.albert-v3-codex-dispatcher` was bootstrapped back into launchd with model `gpt-5.5`, effort `xhigh`, sandbox `danger-full-access`, approval `never`, pid `11837`, runs `1`, last exit `(never exited)`. `Albert Codex Dev` / `@albert_codex_e2e_4ad0_bot` Bot API `getMe` succeeded, `getWebhookInfo.pending_update_count=0`, and launchd `com.albert.albert-codex-e2e-codex-dispatcher` remained running with pid `94117`. A stale ALB-714 validation orphan process with cwd `/Users/albertyang0888/code/codex-telegram-research/telecodex-alb714-lifecycle-wt` was identified as unrelated to live service ownership and removed to reduce future Telegram polling conflict risk.
 
 ## Open Gates
 
