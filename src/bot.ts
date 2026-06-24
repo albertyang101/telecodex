@@ -37,6 +37,12 @@ import { getThread } from "./codex-state.js";
 import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
+import {
+  type EnqueueForegroundTextPromptResult,
+  type ForegroundTextPromptEntry,
+  type ForegroundTextPromptClaim,
+  ForegroundTextPromptQueue,
+} from "./foreground-prompt-queue.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { stripVisiblePromptGuardEcho, withTelegramReplyStyleGuard } from "./prompt-guard.js";
 import { SessionRegistry } from "./session-registry.js";
@@ -45,6 +51,7 @@ import { getTranscriptionBackendStatus, transcribeAudio } from "./voice.js";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
+const DURABLE_FOREGROUND_CLAIM_HEARTBEAT_MS = 10_000;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
@@ -98,6 +105,8 @@ type QueuedPrompt = {
   session: CodexSessionService;
   status: "pending" | "ready" | "skipped";
   input?: CodexPromptInput;
+  durableTextPromptIds?: string[];
+  durableHeartbeat?: ReturnType<typeof setInterval>;
   receiptReaction?: Promise<void>;
   reactionTargets?: PromptReaction[];
   afterPrompt?: () => Promise<void>;
@@ -114,8 +123,20 @@ type PendingTextCoalesce = {
   chatId: TelegramChatId;
   session: CodexSessionService;
   texts: string[];
+  durableTextPromptIds: string[];
   reactionTargets: PromptReaction[];
   timer: ReturnType<typeof setTimeout>;
+  heartbeat: ReturnType<typeof setInterval>;
+};
+
+type DurableForegroundTextPrompt = Pick<EnqueueForegroundTextPromptResult, "id" | "inserted"> & {
+  claimedForScheduling: boolean;
+  claimToken?: string;
+};
+
+type ClaimedForegroundTextReplay = {
+  entry: ForegroundTextPromptEntry;
+  durableTextPrompt: DurableForegroundTextPrompt;
 };
 
 export function formatTelegramIngressAuditLine(ctx: Context, authorized: boolean): string {
@@ -444,6 +465,7 @@ export function createBot(
 ): Bot<Context> {
   const bot = new Bot<Context>(config.telegramBotToken);
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
+  const foregroundTextQueue = new ForegroundTextPromptQueue(config.workspace);
 
   const contextBusy = new Map<TelegramContextKey, BusyState>();
   const pendingSessionPicks = new Map<TelegramContextKey, string[]>();
@@ -459,8 +481,25 @@ export function createBot(
   const pendingPromptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
   const drainingPromptQueues = new Set<TelegramContextKey>();
   const pendingTextCoalesces = new Map<string, PendingTextCoalesce>();
+  const scheduledDurableForegroundTextPromptIds = new Set<string>();
+  const durableForegroundTextPromptClaimTokens = new Map<string, string>();
+  const durableForegroundTextPromptScheduleHeartbeats = new Map<string, ReturnType<typeof setInterval>>();
+  const durableForegroundTextPromptReleasePromises = new Map<string, Promise<void>>();
+  let foregroundReplayScheduling: Promise<void> | undefined;
 
   registry.onRemove((key) => {
+    const queuedPrompts = pendingPromptQueues.get(key) ?? [];
+    for (const queuedPrompt of queuedPrompts) {
+      stopQueuedPromptHeartbeat(queuedPrompt);
+    }
+    const queuedDurableTextPromptIds = queuedPrompts.flatMap((item) => item.durableTextPromptIds ?? []);
+    if (queuedDurableTextPromptIds.length > 0) {
+      void releaseDurableForegroundTextPromptIds(
+        queuedDurableTextPromptIds,
+        "pending",
+        "Failed to preserve durable queued foreground text prompts after context removal:",
+      );
+    }
     contextBusy.delete(key);
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
@@ -471,7 +510,13 @@ export function createBot(
     for (const [coalesceKey, pending] of pendingTextCoalesces) {
       if (pending.contextKey === key) {
         clearTimeout(pending.timer);
+        clearInterval(pending.heartbeat);
         pendingTextCoalesces.delete(coalesceKey);
+        void releaseDurableForegroundTextPromptIds(
+          pending.durableTextPromptIds,
+          "pending",
+          "Failed to preserve durable coalesced foreground text prompts after context removal:",
+        );
         void failPromptReactions(pending.reactionTargets).catch((error) => {
           console.error("Failed to clear coalesced Telegram text reactions after context removal:", error);
         });
@@ -536,6 +581,13 @@ export function createBot(
     });
   };
 
+  const waitForForegroundReplayScheduling = async (): Promise<void> => {
+    if (!foregroundReplayScheduling) {
+      return;
+    }
+    await foregroundReplayScheduling;
+  };
+
   const getContextSession = async (
     ctx: Context,
     options?: { deferThreadStart?: boolean },
@@ -545,6 +597,7 @@ export function createBot(
       return null;
     }
 
+    await waitForForegroundReplayScheduling();
     const session = await registry.getOrCreate(contextKey, options);
     return { contextKey, session };
   };
@@ -679,6 +732,162 @@ export function createBot(
     return item.reactionTargets ?? [{ ctx: item.ctx, receiptReaction: item.receiptReaction }];
   };
 
+  const durableForegroundTextPromptIdFor = (
+    contextKey: TelegramContextKey,
+    ctx: Context,
+  ): string | undefined => {
+    const messageId = ctx.message?.message_id;
+    if (messageId === undefined) {
+      return undefined;
+    }
+    return `${contextKey}:${messageId}`;
+  };
+
+  const isDurableForegroundTextPromptScheduled = (id: string): boolean => {
+    return scheduledDurableForegroundTextPromptIds.has(id);
+  };
+
+  const markDurableForegroundTextPromptIdsScheduled = (ids: string[] | undefined): void => {
+    for (const id of ids ?? []) {
+      scheduledDurableForegroundTextPromptIds.add(id);
+    }
+  };
+
+  const stopDurableForegroundTextPromptScheduleHeartbeat = (id: string): void => {
+    const heartbeat = durableForegroundTextPromptScheduleHeartbeats.get(id);
+    if (!heartbeat) {
+      return;
+    }
+    clearInterval(heartbeat);
+    durableForegroundTextPromptScheduleHeartbeats.delete(id);
+  };
+
+  const markDurableForegroundTextPromptIdsUnscheduled = (ids: string[] | undefined): void => {
+    for (const id of ids ?? []) {
+      scheduledDurableForegroundTextPromptIds.delete(id);
+      durableForegroundTextPromptClaimTokens.delete(id);
+      stopDurableForegroundTextPromptScheduleHeartbeat(id);
+    }
+  };
+
+  const durableForegroundTextPromptClaimsFor = (ids: string[] | undefined): ForegroundTextPromptClaim[] => {
+    const claims: ForegroundTextPromptClaim[] = [];
+    for (const id of ids ?? []) {
+      const claimToken = durableForegroundTextPromptClaimTokens.get(id);
+      if (claimToken) {
+        claims.push({ id, claimToken });
+      }
+    }
+    return claims;
+  };
+
+  const startDurableForegroundTextPromptHeartbeat = (
+    ids: string[] | undefined,
+    errorMessage: string,
+  ): ReturnType<typeof setInterval> | undefined => {
+    const durableIds = ids?.filter((id, index, allIds) => allIds.indexOf(id) === index) ?? [];
+    if (durableIds.length === 0) {
+      return undefined;
+    }
+
+    return setInterval(() => {
+      const claims = durableForegroundTextPromptClaimsFor(durableIds);
+      if (claims.length === 0) {
+        return;
+      }
+      void foregroundTextQueue.touchClaimedMany(claims).catch((error) => {
+        console.error(errorMessage, formatError(error));
+      });
+    }, DURABLE_FOREGROUND_CLAIM_HEARTBEAT_MS);
+  };
+
+  const startDurableForegroundTextPromptScheduleHeartbeat = (id: string): void => {
+    if (durableForegroundTextPromptScheduleHeartbeats.has(id)) {
+      return;
+    }
+    const heartbeat = startDurableForegroundTextPromptHeartbeat(
+      [id],
+      "Failed to heartbeat scheduled durable foreground text prompt claim:",
+    );
+    if (heartbeat) {
+      durableForegroundTextPromptScheduleHeartbeats.set(id, heartbeat);
+    }
+  };
+
+  function stopQueuedPromptHeartbeat(item: QueuedPrompt): void {
+    if (!item.durableHeartbeat) {
+      return;
+    }
+    clearInterval(item.durableHeartbeat);
+    item.durableHeartbeat = undefined;
+  }
+
+  const waitForDurableForegroundTextPromptRelease = async (id: string): Promise<void> => {
+    await durableForegroundTextPromptReleasePromises.get(id);
+  };
+
+  const releaseDurableForegroundTextPromptIds = async (
+    ids: string[] | undefined,
+    action: "pending" | "remove",
+    errorMessage: string,
+  ): Promise<void> => {
+    const durableIds = ids ?? [];
+    if (durableIds.length === 0) {
+      return;
+    }
+
+    const claims = durableForegroundTextPromptClaimsFor(durableIds);
+    const releasePromise = Promise.resolve()
+      .then(async () => {
+        if (claims.length === 0) {
+          return;
+        }
+        if (action === "pending") {
+          await foregroundTextQueue.markPendingClaimedMany(claims);
+        } else {
+          await foregroundTextQueue.removeClaimedMany(claims);
+        }
+      })
+      .catch((error) => {
+        console.error(errorMessage, formatError(error));
+      })
+      .finally(() => {
+        markDurableForegroundTextPromptIdsUnscheduled(durableIds);
+        for (const id of durableIds) {
+          if (durableForegroundTextPromptReleasePromises.get(id) === releasePromise) {
+            durableForegroundTextPromptReleasePromises.delete(id);
+          }
+        }
+      });
+
+    for (const id of durableIds) {
+      durableForegroundTextPromptReleasePromises.set(id, releasePromise);
+    }
+
+    await releasePromise;
+  };
+
+  const claimDurableForegroundTextPromptForScheduling = async (
+    id: string,
+    inserted: boolean,
+  ): Promise<DurableForegroundTextPrompt> => {
+    if (scheduledDurableForegroundTextPromptIds.has(id)) {
+      return { id, inserted, claimedForScheduling: false };
+    }
+
+    const claimed = await foregroundTextQueue.claim(id);
+    if (!claimed) {
+      return { id, inserted, claimedForScheduling: false };
+    }
+
+    markDurableForegroundTextPromptIdsScheduled([id]);
+    if (claimed.claimToken) {
+      durableForegroundTextPromptClaimTokens.set(id, claimed.claimToken);
+      startDurableForegroundTextPromptScheduleHeartbeat(id);
+    }
+    return { id, inserted, claimedForScheduling: true, claimToken: claimed.claimToken };
+  };
+
   const completePromptReactions = async (targets: PromptReaction[]): Promise<void> => {
     await Promise.all(targets.map((target) => completeReaction(target.ctx, target.receiptReaction)));
   };
@@ -712,6 +921,10 @@ export function createBot(
     item: QueuedPrompt,
   ): QueuedPrompt => {
     const queue = pendingPromptQueues.get(contextKey) ?? [];
+    item.durableHeartbeat ??= startDurableForegroundTextPromptHeartbeat(
+      item.durableTextPromptIds,
+      "Failed to heartbeat queued durable foreground text prompt claim:",
+    );
     queue.push(item);
     pendingPromptQueues.set(contextKey, queue);
     return item;
@@ -740,6 +953,7 @@ export function createBot(
         if (queue && queue.length === 0) {
           pendingPromptQueues.delete(contextKey);
         }
+        stopQueuedPromptHeartbeat(next);
 
         if (next.status === "skipped") {
           await failPromptReactions(promptReactionTargets(next));
@@ -757,7 +971,14 @@ export function createBot(
         }
 
         try {
-          await handleUserPrompt(next.ctx, contextKey, next.chatId, next.session, next.input);
+          await handleUserPrompt(
+            next.ctx,
+            contextKey,
+            next.chatId,
+            next.session,
+            next.input,
+            next.durableTextPromptIds,
+          );
           await completePromptReactions(promptReactionTargets(next));
         } catch {
           await failPromptReactions(promptReactionTargets(next));
@@ -778,22 +999,32 @@ export function createBot(
     chatId: TelegramChatId,
     session: CodexSessionService,
     input: CodexPromptInput,
-    options?: { reactionAlreadySet?: boolean; reactionTargets?: PromptReaction[] },
+    options?: { reactionAlreadySet?: boolean; reactionTargets?: PromptReaction[]; durableTextPromptIds?: string[] },
   ): Promise<void> => {
     rememberPromptInput(contextKey, input);
+    markDurableForegroundTextPromptIdsScheduled(options?.durableTextPromptIds);
     const receiptReaction = options?.reactionAlreadySet ? undefined : setReaction(ctx, "👀");
     const reactionTargets = options?.reactionTargets ?? [{ ctx, receiptReaction }];
 
     const hasQueuedPrompts = (pendingPromptQueues.get(contextKey)?.length ?? 0) > 0;
     if (isBusy(contextKey) || hasQueuedPrompts) {
-      enqueuePrompt(contextKey, { ctx, chatId, session, status: "ready", input, receiptReaction, reactionTargets });
+      enqueuePrompt(contextKey, {
+        ctx,
+        chatId,
+        session,
+        status: "ready",
+        input,
+        durableTextPromptIds: options?.durableTextPromptIds,
+        receiptReaction,
+        reactionTargets,
+      });
       interruptActivePrompt(contextKey);
       await drainQueuedPrompts(contextKey);
       return;
     }
 
     try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, input);
+      await handleUserPrompt(ctx, contextKey, chatId, session, input, options?.durableTextPromptIds);
       await completePromptReactions(reactionTargets);
     } catch {
       await failPromptReactions(reactionTargets);
@@ -816,49 +1047,100 @@ export function createBot(
     ].join("\n\n");
   };
 
-  const flushTextCoalescedPrompt = (key: string): void => {
+  const startTextCoalesceHeartbeat = (key: string): ReturnType<typeof setInterval> => {
+    return setInterval(() => {
+      const pending = pendingTextCoalesces.get(key);
+      if (!pending) {
+        return;
+      }
+      const claims = durableForegroundTextPromptClaimsFor(pending.durableTextPromptIds);
+      if (claims.length === 0) {
+        return;
+      }
+      void foregroundTextQueue.touchClaimedMany(claims).catch((error) => {
+        console.error("Failed to heartbeat durable coalesced foreground text prompt claim:", formatError(error));
+      });
+    }, DURABLE_FOREGROUND_CLAIM_HEARTBEAT_MS);
+  };
+
+  const persistForegroundTextPrompt = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    text: string,
+  ): Promise<DurableForegroundTextPrompt> => {
+    const knownId = durableForegroundTextPromptIdFor(contextKey, ctx);
+    if (knownId && isDurableForegroundTextPromptScheduled(knownId)) {
+      return { id: knownId, inserted: false, claimedForScheduling: false };
+    }
+
+    const result = await foregroundTextQueue.enqueue({
+      contextKey,
+      chatId,
+      fromId: ctx.from?.id,
+      messageId: ctx.message?.message_id,
+      messageThreadId: ctx.message?.message_thread_id,
+      text,
+    });
+    return await claimDurableForegroundTextPromptForScheduling(result.id, result.inserted);
+  };
+
+  const flushTextCoalescedPrompt = async (key: string): Promise<void> => {
     const pending = pendingTextCoalesces.get(key);
     if (!pending) {
       return;
     }
 
     clearTimeout(pending.timer);
+    clearInterval(pending.heartbeat);
     pendingTextCoalesces.delete(key);
     const input = formatCoalescedTextInput(pending.texts);
-    void runOrQueuePrompt(pending.ctx, pending.contextKey, pending.chatId, pending.session, input, {
+    await runOrQueuePrompt(pending.ctx, pending.contextKey, pending.chatId, pending.session, input, {
       reactionAlreadySet: true,
       reactionTargets: pending.reactionTargets,
-    }).catch((error) => {
-      console.error("Failed to flush coalesced Telegram text prompt:", formatError(error));
+      durableTextPromptIds: pending.durableTextPromptIds,
     });
   };
 
-  const flushTextCoalesceForSender = (contextKey: TelegramContextKey, ctx: Context): void => {
-    flushTextCoalescedPrompt(textCoalesceKey(contextKey, ctx));
+  const flushTextCoalesceForSender = async (contextKey: TelegramContextKey, ctx: Context): Promise<void> => {
+    await flushTextCoalescedPrompt(textCoalesceKey(contextKey, ctx));
   };
 
-  const flushTextCoalescesForContext = (contextKey: TelegramContextKey): void => {
+  const flushTextCoalescesForContext = async (contextKey: TelegramContextKey): Promise<void> => {
+    const flushes: Promise<void>[] = [];
     for (const [coalesceKey, pending] of [...pendingTextCoalesces]) {
       if (pending.contextKey === contextKey) {
-        flushTextCoalescedPrompt(coalesceKey);
+        flushes.push(flushTextCoalescedPrompt(coalesceKey));
       }
     }
+    await Promise.all(flushes);
   };
 
   const cancelPendingTextCoalescesForContext = async (contextKey: TelegramContextKey): Promise<void> => {
     const reactionTargets: PromptReaction[] = [];
+    const durableTextPromptIds: string[] = [];
     for (const [coalesceKey, pending] of pendingTextCoalesces) {
       if (pending.contextKey !== contextKey) {
         continue;
       }
 
       clearTimeout(pending.timer);
+      clearInterval(pending.heartbeat);
       pendingTextCoalesces.delete(coalesceKey);
       reactionTargets.push(...pending.reactionTargets);
+      durableTextPromptIds.push(...pending.durableTextPromptIds);
     }
 
     if (reactionTargets.length > 0) {
       await failPromptReactions(reactionTargets);
+    }
+
+    if (durableTextPromptIds.length > 0) {
+      await releaseDurableForegroundTextPromptIds(
+        durableTextPromptIds,
+        "remove",
+        "Failed to remove durable coalesced foreground text prompts after cancellation:",
+      );
     }
   };
 
@@ -868,10 +1150,17 @@ export function createBot(
     chatId: TelegramChatId,
     session: CodexSessionService,
     userText: string,
+    durableTextPrompt: DurableForegroundTextPrompt,
   ): Promise<void> => {
+    if (!durableTextPrompt.claimedForScheduling) {
+      return;
+    }
+
     const windowMs = config.telegramTextCoalesceMs;
     if (windowMs <= 0) {
-      await runOrQueuePrompt(ctx, contextKey, chatId, session, userText);
+      await runOrQueuePrompt(ctx, contextKey, chatId, session, userText, {
+        durableTextPromptIds: [durableTextPrompt.id],
+      });
       return;
     }
 
@@ -880,12 +1169,20 @@ export function createBot(
     const existing = pendingTextCoalesces.get(key);
     if (existing) {
       clearTimeout(existing.timer);
+      clearInterval(existing.heartbeat);
       existing.ctx = ctx;
       existing.chatId = chatId;
       existing.session = session;
       existing.texts.push(userText);
+      existing.durableTextPromptIds.push(durableTextPrompt.id);
+      markDurableForegroundTextPromptIdsScheduled([durableTextPrompt.id]);
       existing.reactionTargets.push({ ctx, receiptReaction });
-      existing.timer = setTimeout(() => flushTextCoalescedPrompt(key), windowMs);
+      existing.timer = setTimeout(() => {
+        void flushTextCoalescedPrompt(key).catch((error) => {
+          console.error("Failed to flush coalesced Telegram text prompt:", formatError(error));
+        });
+      }, windowMs);
+      existing.heartbeat = startTextCoalesceHeartbeat(key);
       interruptActivePrompt(contextKey);
       return;
     }
@@ -896,10 +1193,17 @@ export function createBot(
       chatId,
       session,
       texts: [userText],
+      durableTextPromptIds: [durableTextPrompt.id],
       reactionTargets: [{ ctx, receiptReaction }],
-      timer: setTimeout(() => flushTextCoalescedPrompt(key), windowMs),
+      timer: setTimeout(() => {
+        void flushTextCoalescedPrompt(key).catch((error) => {
+          console.error("Failed to flush coalesced Telegram text prompt:", formatError(error));
+        });
+      }, windowMs),
+      heartbeat: startTextCoalesceHeartbeat(key),
     };
     pendingTextCoalesces.set(key, pending);
+    markDurableForegroundTextPromptIdsScheduled([durableTextPrompt.id]);
     interruptActivePrompt(contextKey);
   };
 
@@ -930,6 +1234,7 @@ export function createBot(
     chatId: TelegramChatId,
     session: CodexSessionService,
     userInput: CodexPromptInput,
+    durableTextPromptIds?: string[],
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
@@ -967,6 +1272,17 @@ export function createBot(
     let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
     let finalizePromise: Promise<string> | undefined;
     const userVisibleText = visibleUserText(userInput);
+    const durableIds = durableTextPromptIds?.filter((id, index, ids) => ids.indexOf(id) === index) ?? [];
+    const durableClaims = durableForegroundTextPromptClaimsFor(durableIds);
+    let durableTextPromptHandled = durableIds.length === 0;
+    const durableClaimHeartbeat =
+      durableClaims.length > 0
+        ? setInterval(() => {
+            void foregroundTextQueue.touchClaimedMany(durableClaims).catch((error) => {
+              console.error("Failed to heartbeat durable foreground text prompt claim:", formatError(error));
+            });
+          }, DURABLE_FOREGROUND_CLAIM_HEARTBEAT_MS)
+        : undefined;
 
     const typingInterval = setInterval(() => {
       void bot.api
@@ -1400,10 +1716,12 @@ export function createBot(
             ].join("\n"),
           },
         );
+        durableTextPromptHandled = true;
         return;
       }
 
       if (!(await ensureActiveThread(ctx, contextKey, session))) {
+        durableTextPromptHandled = true;
         return;
       }
 
@@ -1444,6 +1762,7 @@ export function createBot(
       ).catch((error) => {
         console.error("Failed to append memory bot turn:", error instanceof Error ? error.message : String(error));
       });
+      durableTextPromptHandled = true;
     } catch (error) {
       stopTyping();
       clearFlushTimer();
@@ -1457,11 +1776,31 @@ export function createBot(
 
       if (finalized) {
         console.error("Codex prompt error after finalization:", formatError(error));
+        try {
+          const finalVisibleText = await ensureFinalized();
+          await appendMemoryTranscriptTurn(
+            config,
+            ctx,
+            contextKey,
+            session,
+            "bot-raw",
+            finalVisibleText,
+          ).catch((appendError) => {
+            console.error(
+              "Failed to append memory bot turn:",
+              appendError instanceof Error ? appendError.message : String(appendError),
+            );
+          });
+          durableTextPromptHandled = true;
+        } catch (finalizeError) {
+          console.error("Finalized Telegram response did not complete after Codex prompt error:", formatError(finalizeError));
+        }
       } else {
         const suppressInterruptedFailure =
           (busyState.supersededByFollowUp || hasQueuedFollowUp(contextKey)) &&
           (isAbortLikeError(error) || error instanceof CodexTurnTimeoutError);
         if (suppressInterruptedFailure) {
+          durableTextPromptHandled = true;
           await removeInterruptedResponseMessage();
           console.error("Codex prompt interrupted by newer Telegram input:", formatError(error));
           return;
@@ -1474,6 +1813,7 @@ export function createBot(
         const chunks = splitMarkdownForTelegram(combinedText);
         try {
           await deliverRenderedChunks(chunks);
+          durableTextPromptHandled = !(error instanceof CodexTurnTimeoutError);
           await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "bot-raw", combinedText).catch(
             (appendError) => {
               console.error(
@@ -1489,6 +1829,24 @@ export function createBot(
     } finally {
       stopTyping();
       clearFlushTimer();
+      if (durableClaimHeartbeat) {
+        clearInterval(durableClaimHeartbeat);
+      }
+      if (durableIds.length > 0) {
+        if (durableTextPromptHandled) {
+          await releaseDurableForegroundTextPromptIds(
+            durableIds,
+            "remove",
+            "Failed to remove durable foreground text prompt:",
+          );
+        } else {
+          await releaseDurableForegroundTextPromptIds(
+            durableIds,
+            "pending",
+            "Failed to mark durable foreground text prompt pending:",
+          );
+        }
+      }
       busyState.processing = false;
       busyState.activeSession = undefined;
       if (!session.isProcessing()) {
@@ -1607,6 +1965,8 @@ export function createBot(
   });
 
   bot.command("login", async (ctx) => {
+    await waitForForegroundReplayScheduling();
+
     if (!ctx.chat) {
       return;
     }
@@ -1652,6 +2012,8 @@ export function createBot(
   });
 
   bot.command("logout", async (ctx) => {
+    await waitForForegroundReplayScheduling();
+
     if (!ctx.chat) {
       return;
     }
@@ -2285,6 +2647,8 @@ export function createBot(
   handlePageCallback(/^effort_page_(\d+)$/, "effort", pendingEffortButtons, "Expired, run /effort again");
 
   bot.callbackQuery(/^codex_abort:(.+)$/, async (ctx) => {
+    await waitForForegroundReplayScheduling();
+
     const contextKey = ctx.match?.[1];
     if (!contextKey) {
       await ctx.answerCallbackQuery();
@@ -2688,8 +3052,8 @@ export function createBot(
   });
 
   bot.on("message:text", async (ctx) => {
-    const contextSession = await getContextSession(ctx);
-    if (!contextSession) {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
       return;
     }
 
@@ -2698,11 +3062,36 @@ export function createBot(
       return;
     }
 
-    const { contextKey, session } = contextSession;
-    await runOrCoalesceTextPrompt(ctx, contextKey, ctx.chat.id, session, userText);
+    let durableTextPrompt = await persistForegroundTextPrompt(ctx, contextKey, ctx.chat.id, userText);
+    if (!durableTextPrompt.claimedForScheduling) {
+      await waitForForegroundReplayScheduling();
+      await waitForDurableForegroundTextPromptRelease(durableTextPrompt.id);
+      durableTextPrompt = await claimDurableForegroundTextPromptForScheduling(
+        durableTextPrompt.id,
+        durableTextPrompt.inserted,
+      );
+      if (!durableTextPrompt.claimedForScheduling) {
+        return;
+      }
+    } else {
+      await waitForForegroundReplayScheduling();
+    }
+    try {
+      const session = await registry.getOrCreate(contextKey);
+      await runOrCoalesceTextPrompt(ctx, contextKey, ctx.chat.id, session, userText, durableTextPrompt);
+    } catch (error) {
+      await releaseDurableForegroundTextPromptIds(
+        [durableTextPrompt.id],
+        "pending",
+        "Failed to release durable foreground text prompt after scheduling failure:",
+      );
+      throw error;
+    }
   });
 
   bot.on(["message:voice", "message:audio"], async (ctx) => {
+    await waitForForegroundReplayScheduling();
+
     const contextSession = await getContextSession(ctx);
     if (!contextSession) {
       return;
@@ -2716,7 +3105,7 @@ export function createBot(
       return;
     }
 
-    flushTextCoalescesForContext(contextKey);
+    await flushTextCoalescesForContext(contextKey);
 
     const receiptReaction = setReaction(ctx, "👀");
     const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
@@ -2759,6 +3148,8 @@ export function createBot(
   });
 
   bot.on("message:photo", async (ctx) => {
+    await waitForForegroundReplayScheduling();
+
     const contextSession = await getContextSession(ctx);
     if (!contextSession) {
       return;
@@ -2773,7 +3164,7 @@ export function createBot(
       return;
     }
 
-    flushTextCoalescesForContext(contextKey);
+    await flushTextCoalescesForContext(contextKey);
 
     const receiptReaction = setReaction(ctx, "👀");
     const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
@@ -2809,6 +3200,8 @@ export function createBot(
   });
 
   bot.on("message:document", async (ctx) => {
+    await waitForForegroundReplayScheduling();
+
     const contextSession = await getContextSession(ctx);
     if (!contextSession) {
       return;
@@ -2831,7 +3224,7 @@ export function createBot(
       return;
     }
 
-    flushTextCoalescesForContext(contextKey);
+    await flushTextCoalescesForContext(contextKey);
 
     const receiptReaction = setReaction(ctx, "👀");
     const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
@@ -2920,6 +3313,144 @@ export function createBot(
       }
     };
     await drainQueuedPrompts(contextKey);
+  });
+
+  const canCoalesceForegroundTextReplay = (
+    previous: ForegroundTextPromptEntry,
+    next: ForegroundTextPromptEntry,
+  ): boolean => {
+    if (config.telegramTextCoalesceMs <= 0) {
+      return false;
+    }
+    return (
+      previous.contextKey === next.contextKey &&
+      previous.chatId === next.chatId &&
+      previous.fromId !== undefined &&
+      previous.fromId === next.fromId &&
+      next.createdAt - previous.createdAt <= config.telegramTextCoalesceMs
+    );
+  };
+
+  const groupClaimedForegroundTextReplays = (
+    items: ClaimedForegroundTextReplay[],
+  ): ClaimedForegroundTextReplay[][] => {
+    const openGroupsByBucket = new Map<string, ClaimedForegroundTextReplay[]>();
+    const openBucketsByContext = new Map<string, Set<string>>();
+    const allGroups: ClaimedForegroundTextReplay[][] = [];
+    for (const item of items) {
+      const bucketKey = `${item.entry.contextKey}\u0000${item.entry.fromId ?? "unknown"}`;
+      const contextOpenBuckets = openBucketsByContext.get(item.entry.contextKey) ?? new Set<string>();
+      if (!openBucketsByContext.has(item.entry.contextKey)) {
+        openBucketsByContext.set(item.entry.contextKey, contextOpenBuckets);
+      }
+
+      for (const openBucketKey of contextOpenBuckets) {
+        if (openBucketKey !== bucketKey) {
+          openGroupsByBucket.delete(openBucketKey);
+        }
+      }
+      contextOpenBuckets.clear();
+      contextOpenBuckets.add(bucketKey);
+
+      const lastGroup = openGroupsByBucket.get(bucketKey);
+      const lastItem = lastGroup?.[lastGroup.length - 1];
+      if (lastItem && canCoalesceForegroundTextReplay(lastItem.entry, item.entry)) {
+        lastGroup.push(item);
+      } else {
+        const group = [item];
+        openGroupsByBucket.set(bucketKey, group);
+        allGroups.push(group);
+      }
+    }
+    return allGroups;
+  };
+
+  const replayForegroundTextPrompts = async (): Promise<void> => {
+    const claimedReplays: ClaimedForegroundTextReplay[] = [];
+    const enqueuedReplayDurableTextPromptIds = new Set<string>();
+    const contextsToDrain = new Set<TelegramContextKey>();
+
+    try {
+      const entries = await foregroundTextQueue.list();
+      for (const entry of entries) {
+        if (entry.fromId === undefined || !config.telegramAllowedUserIdSet.has(entry.fromId)) {
+          await foregroundTextQueue.remove(entry.id);
+          continue;
+        }
+
+        const durableTextPrompt = await claimDurableForegroundTextPromptForScheduling(entry.id, false);
+        if (!durableTextPrompt.claimedForScheduling) {
+          continue;
+        }
+
+        claimedReplays.push({ entry, durableTextPrompt });
+      }
+
+      for (const group of groupClaimedForegroundTextReplays(claimedReplays)) {
+        const first = group[0];
+        const last = group[group.length - 1];
+        if (!first || !last) {
+          continue;
+        }
+
+        const durableTextPromptIds = group.map((item) => item.durableTextPrompt.id);
+        const input = formatCoalescedTextInput(group.map((item) => item.entry.text));
+
+        try {
+          const session = await registry.getOrCreate(first.entry.contextKey);
+          const replayCtx = {
+            api: bot.api,
+            chat: { id: last.entry.chatId, type: "private" },
+            from: last.entry.fromId !== undefined ? { id: last.entry.fromId } : undefined,
+            message: {
+              message_id: last.entry.messageId ?? 0,
+              text: input,
+              ...(last.entry.messageThreadId ? { message_thread_id: last.entry.messageThreadId } : {}),
+            },
+          } as unknown as Context;
+          enqueuePrompt(first.entry.contextKey, {
+            ctx: replayCtx,
+            chatId: last.entry.chatId,
+            session,
+            status: "ready",
+            input,
+            durableTextPromptIds,
+            reactionTargets: [],
+          });
+          for (const durableTextPromptId of durableTextPromptIds) {
+            enqueuedReplayDurableTextPromptIds.add(durableTextPromptId);
+          }
+          contextsToDrain.add(first.entry.contextKey);
+        } catch (error) {
+          await releaseDurableForegroundTextPromptIds(
+            durableTextPromptIds,
+            "pending",
+            "Failed to release durable foreground text prompt after replay scheduling failure:",
+          );
+          console.error("Failed to schedule durable foreground text prompt replay:", formatError(error));
+        }
+      }
+
+      for (const contextKey of contextsToDrain) {
+        void drainQueuedPrompts(contextKey).catch((error) => {
+          console.error("Failed to drain replayed durable foreground text prompts:", formatError(error));
+        });
+      }
+    } catch (error) {
+      const claimedButNotEnqueuedIds = claimedReplays
+        .map((item) => item.durableTextPrompt.id)
+        .filter((id) => !enqueuedReplayDurableTextPromptIds.has(id));
+      await releaseDurableForegroundTextPromptIds(
+        claimedButNotEnqueuedIds,
+        "pending",
+        "Failed to release claimed durable foreground text prompts after replay abort:",
+      );
+      throw error;
+    }
+  };
+
+  foregroundReplayScheduling = replayForegroundTextPrompts().catch((error) => {
+    console.error("Failed to replay durable foreground text prompts:", formatError(error));
   });
 
   bot.catch((error) => {

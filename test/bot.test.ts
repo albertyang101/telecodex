@@ -2,11 +2,12 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, vi } from "vitest";
+import { afterAll, afterEach, vi } from "vitest";
 
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
 import type { CodexSessionCallbacks } from "../src/codex-session.js";
 import type { TeleCodexConfig } from "../src/config.js";
+import { ForegroundTextPromptQueue } from "../src/foreground-prompt-queue.js";
 
 const mockGrammy = vi.hoisted(() => {
   const bots: any[] = [];
@@ -111,12 +112,13 @@ describe("createBot response delivery", () => {
   const originalTelegramFileDownloadTimeoutMs = process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS;
   const originalVoiceTranscriptionTimeoutMs = process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS;
   const tempDirs: string[] = [];
+  let defaultWorkspace = path.join(tmpdir(), "telecodex-bot-test-workspace-initial");
 
   const createConfig = (overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig => ({
     telegramBotToken: "bot-token",
     telegramAllowedUserIds: [123],
     telegramAllowedUserIdSet: new Set([123]),
-    workspace: "/workspace/base",
+    workspace: defaultWorkspace,
     maxFileSize: 20 * 1024 * 1024,
     codexApiKey: "codex-key",
     codexModel: "gpt-5.5",
@@ -151,14 +153,14 @@ describe("createBot response delivery", () => {
     isProcessing: vi.fn(() => false),
     hasActiveThread: vi.fn(() => true),
     newThread: vi.fn(),
-    getCurrentWorkspace: vi.fn(() => "/workspace/base"),
+    getCurrentWorkspace: vi.fn(() => defaultWorkspace),
     prompt: vi.fn(async (input, callbacks: CodexSessionCallbacks) => {
       await onPrompt(callbacks, input);
     }),
     abort: vi.fn(async () => undefined),
     getInfo: vi.fn(() => ({
       threadId: "thread-1",
-      workspace: "/workspace/base",
+      workspace: defaultWorkspace,
       model: "gpt-5.5",
       reasoningEffort: "xhigh",
       launchProfileId: "default",
@@ -184,9 +186,21 @@ describe("createBot response delivery", () => {
   };
 
   beforeEach(() => {
+    defaultWorkspace = path.join(
+      tmpdir(),
+      `telecodex-bot-test-workspace-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    );
+    tempDirs.push(defaultWorkspace);
     mockGrammy.bots.length = 0;
     mockGrammy.Bot.mockClear();
-    mockAuth.checkAuthStatus.mockClear();
+    mockAuth.checkAuthStatus.mockReset();
+    mockAuth.checkAuthStatus.mockResolvedValue({
+      authenticated: true,
+      method: "cli",
+      detail: "authenticated",
+    });
+    mockAuth.startLogin.mockReset();
+    mockAuth.startLogout.mockReset();
     process.env.VOICE_TRANSCRIPTION_BACKEND = "parakeet";
     process.env.QWEN_ASR_SOCKET = "/tmp/telecodex-test-missing-qwen-asr.sock";
   });
@@ -194,7 +208,6 @@ describe("createBot response delivery", () => {
   afterEach(async () => {
     vi.unstubAllGlobals();
     _resetImportHook();
-    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
     if (originalVoiceBackend === undefined) {
       delete process.env.VOICE_TRANSCRIPTION_BACKEND;
     } else {
@@ -220,6 +233,11 @@ describe("createBot response delivery", () => {
     } else {
       process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = originalVoiceTranscriptionTimeoutMs;
     }
+  });
+
+  afterAll(async () => {
+    await delay(25);
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
 
   it("shows the active voice backend separately from available backends", async () => {
@@ -1239,6 +1257,114 @@ describe("createBot response delivery", () => {
     }
   });
 
+  it("removes durable text that is superseded by a follow-up instead of replaying the old turn", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-superseded-remove-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("old partial");
+        await firstTurn.promise;
+        throw new Error("The operation was aborted");
+      }
+
+      callbacks.onTextDelta("new reply");
+      callbacks.onAgentMessage?.("new reply");
+      callbacks.onAgentEnd();
+    });
+    session.abort.mockImplementation(async () => {
+      firstTurn.resolve();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace, telegramTextCoalesceMs: 25 }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 425, text: "old instruction that gets superseded" },
+      api: bot.api,
+    });
+    await vi.advanceTimersByTimeAsync(25);
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 426, text: "new instruction replaces it" },
+      api: bot.api,
+    });
+
+    try {
+      await vi.waitFor(() => expect(session.abort).toHaveBeenCalledTimes(1), { timeout: 100 });
+      await firstPromise;
+      await vi.advanceTimersByTimeAsync(25);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+      await waitForForegroundQueueEmpty(workspace);
+    } finally {
+      firstTurn.resolve();
+      await firstPromise;
+      vi.useRealTimers();
+    }
+  });
+
+  it("removes a durable text prompt after sending a visible non-timeout failure", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-visible-failure-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const session = createSession(async () => {
+      throw new Error("provider exploded");
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 427, text: "this should fail visibly once" },
+      api: bot.api,
+    });
+
+    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).toContain(
+      "provider exploded",
+    );
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("removes durable text after a visible final answer even if Codex rejects during cleanup", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-finalized-reject-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("visible final answer");
+      callbacks.onAgentMessage?.("visible final answer");
+      callbacks.onAgentEnd();
+      throw new Error("cleanup failed after final answer");
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 436, text: "this receives a final answer before cleanup fails" },
+      api: bot.api,
+    });
+
+    const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(visibleReplies).toContain("visible final answer");
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
   it("deletes an already streamed partial reply when a text follow-up interrupts the active turn", async () => {
     vi.useFakeTimers();
     const firstTurn = deferred<void>();
@@ -1344,7 +1470,7 @@ describe("createBot response delivery", () => {
 
       await vi.advanceTimersByTimeAsync(25);
 
-      expect(session.prompt).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
       const prompt = String(session.prompt.mock.calls[0][0]);
       expect(prompt).toContain("第一段：先说明背景");
       expect(prompt).toContain("第二段：补充约束");
@@ -1404,7 +1530,7 @@ describe("createBot response delivery", () => {
         callbacks.onAgentMessage?.("待处理文本回复。");
         callbacks.onAgentEnd();
       });
-      (session as any).listWorkspaces = vi.fn(() => ["/workspace/base"]);
+      (session as any).listWorkspaces = vi.fn(() => [defaultWorkspace]);
       session.newThread.mockResolvedValue(session.getInfo());
       const registry = createRegistry(session);
 
@@ -1432,7 +1558,7 @@ describe("createBot response delivery", () => {
       );
 
       await vi.advanceTimersByTimeAsync(25);
-      expect(session.prompt).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
       expect(String(session.prompt.mock.calls[0][0])).toContain("这条还在 coalescing window 里");
     } finally {
       vi.useRealTimers();
@@ -1485,7 +1611,7 @@ describe("createBot response delivery", () => {
       expect(answerCallbackQuery).toHaveBeenCalledWith({ text: "Wait for the current prompt to finish" });
 
       await vi.advanceTimersByTimeAsync(25);
-      expect(session.prompt).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
       expect(String(session.prompt.mock.calls[0][0])).toContain("这条 pending 文本应挡住 effort callback");
     } finally {
       vi.useRealTimers();
@@ -1787,6 +1913,1560 @@ describe("createBot response delivery", () => {
     expect(String(onFatalRecovery.mock.calls[0]?.[0]?.message)).toContain(
       "Codex turn remained active after timeout abort grace",
     );
+  });
+
+  it("persists text follow-ups queued behind a stuck timed-out turn before recovery can restart the process", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-queue-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace, codexTurnTimeoutMs: 5 } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 301, text: "第一条会超时且 session 不释放" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    await firstPromise;
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 302, text: "第二条不能只放内存队列，否则重启会丢" },
+      api: bot.api,
+    });
+
+    const queuePath = path.join(workspace, ".telecodex", "foreground_text_prompts.json");
+    const queue = JSON.parse(await readFile(queuePath, "utf8"));
+    expect(queue.entries["42:302"]).toMatchObject({
+      contextKey: "42",
+      chatId: 42,
+      fromId: 123,
+      messageId: 302,
+      text: "第二条不能只放内存队列，否则重启会丢",
+      status: "processing",
+    });
+  });
+
+  it("persists coalesced text immediately when Telegram delivers it, before the coalescing timer fires", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-coalesce-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("should not run yet");
+      callbacks.onAgentMessage?.("should not run yet");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace, telegramTextCoalesceMs: 60_000 } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 303, text: "这条在 coalescing window 里也必须已经 durable" },
+      api: bot.api,
+    });
+
+    const queue = JSON.parse(
+      await readFile(path.join(workspace, ".telecodex", "foreground_text_prompts.json"), "utf8"),
+    );
+    expect(queue.entries["42:303"]).toMatchObject({
+      status: "processing",
+      text: "这条在 coalescing window 里也必须已经 durable",
+    });
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("heartbeats a long coalescing durable text claim so another startup replay does not steal it", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-coalesce-heartbeat-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("coalesced reply");
+      callbacks.onAgentMessage?.("coalesced reply");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace, telegramTextCoalesceMs: 60_000 } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 431, text: "long coalesce must stay owned" },
+      api: bot.api,
+    });
+
+    const queuePath = path.join(workspace, ".telecodex", "foreground_text_prompts.json");
+    const claimedQueue = JSON.parse(await readFile(queuePath, "utf8"));
+    claimedQueue.entries["42:431"].claimProcessId = 1;
+    claimedQueue.entries["42:431"].updatedAt = Date.now() - 31_000;
+    await writeFile(queuePath, `${JSON.stringify(claimedQueue, null, 2)}\n`, "utf8");
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    const replaySession = createSession(async (callbacks) => {
+      callbacks.onTextDelta("should not replay");
+      callbacks.onAgentMessage?.("should not replay");
+      callbacks.onAgentEnd();
+    });
+    createBot(createConfig({ workspace } as any), createRegistry(replaySession) as any);
+    await vi.advanceTimersByTimeAsync(20);
+
+    try {
+      expect(replaySession.prompt).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("heartbeats durable text while it is queued behind a stuck active turn so startup replay does not steal it", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-queued-heartbeat-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const releaseFirstTurn = deferred<void>();
+    let promptCalls = 0;
+    const activeSession = createSession(async (callbacks) => {
+      promptCalls += 1;
+      if (promptCalls === 1) {
+        await releaseFirstTurn.promise;
+        callbacks.onTextDelta("first done");
+        callbacks.onAgentMessage?.("first done");
+        callbacks.onAgentEnd();
+        return;
+      }
+      callbacks.onTextDelta("queued done");
+      callbacks.onAgentMessage?.("queued done");
+      callbacks.onAgentEnd();
+    });
+    activeSession.abort.mockResolvedValue(undefined);
+    const activeBot = createBot(createConfig({ workspace } as any), createRegistry(activeSession) as any) as any;
+    const textHandler = activeBot.__handlers.on.get("message:text");
+
+    const activePrompt = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 432, text: "active turn blocks the queue" },
+      api: activeBot.api,
+    });
+    await vi.waitFor(() => expect(activeSession.prompt).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 433, text: "queued durable text must stay owned" },
+      api: activeBot.api,
+    });
+
+    const queuePath = path.join(workspace, ".telecodex", "foreground_text_prompts.json");
+    const claimedQueue = JSON.parse(await readFile(queuePath, "utf8"));
+    claimedQueue.entries["42:433"].claimProcessId = 1;
+    claimedQueue.entries["42:433"].updatedAt = Date.now() - 31_000;
+    await writeFile(queuePath, `${JSON.stringify(claimedQueue, null, 2)}\n`, "utf8");
+
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(async () => {
+        const queue = JSON.parse(await readFile(queuePath, "utf8"));
+        expect(queue.entries["42:433"].updatedAt).toBeGreaterThan(Date.now() - 30_000);
+      }, { timeout: 100 });
+
+      releaseFirstTurn.resolve();
+      await activePrompt;
+      await waitForForegroundQueueEmpty(workspace);
+    } finally {
+      releaseFirstTurn.resolve();
+      await activePrompt;
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a durable text prompt after timeout instead of deleting it before recovery", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-timeout-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace, codexTurnTimeoutMs: 5 } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 304, text: "这条 timeout 后必须留给 recovery" },
+      api: bot.api,
+    });
+
+    const queue = JSON.parse(
+      await readFile(path.join(workspace, ".telecodex", "foreground_text_prompts.json"), "utf8"),
+    );
+    expect(queue.entries["42:304"]).toMatchObject({
+      text: "这条 timeout 后必须留给 recovery",
+      status: "pending",
+    });
+  });
+
+  it("replays stale durable text prompts on startup after launchd recovery", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-replay-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:401": {
+              id: "42:401",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 401,
+              text: "这是 launchd recovery 后必须自动重放的消息",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("recovered reply");
+      callbacks.onAgentMessage?.("recovered reply");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    createBot(createConfig({ workspace } as any), registry as any);
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1), { timeout: 100 });
+    expect(String(session.prompt.mock.calls[0][0])).toContain("这是 launchd recovery 后必须自动重放的消息");
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("heartbeats startup replay claims while session lookup is still scheduling", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-replay-scheduling-heartbeat-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:443": {
+              id: "42:443",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 443,
+              text: "startup replay claim must heartbeat before enqueue",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const replayLookupStarted = deferred<void>();
+    const releaseReplayLookup = deferred<void>();
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("recovered reply");
+      callbacks.onAgentMessage?.("recovered reply");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockImplementation(async () => {
+      replayLookupStarted.resolve();
+      await releaseReplayLookup.promise;
+      return session;
+    });
+
+    createBot(createConfig({ workspace } as any), registry as any);
+    await replayLookupStarted.promise;
+    const queuePath = path.join(queueDir, "foreground_text_prompts.json");
+    const claimedQueue = JSON.parse(await readFile(queuePath, "utf8"));
+    expect(claimedQueue.entries["42:443"]).toMatchObject({
+      status: "processing",
+      attempts: 1,
+    });
+    claimedQueue.entries["42:443"].updatedAt = Date.now() - 31_000;
+    await writeFile(queuePath, `${JSON.stringify(claimedQueue, null, 2)}\n`, "utf8");
+
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(async () => {
+        const queue = JSON.parse(await readFile(queuePath, "utf8"));
+        expect(queue.entries["42:443"].updatedAt).toBeGreaterThan(Date.now() - 30_000);
+      }, { timeout: 100 });
+
+      releaseReplayLookup.resolve();
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+      await waitForForegroundQueueEmpty(workspace);
+    } finally {
+      releaseReplayLookup.resolve();
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases startup replay claims if replay aborts before scheduling groups", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-replay-abort-release-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:446": {
+              id: "42:446",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 446,
+              text: "first replay claim must be released if later replay aborts",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+            "42:447": {
+              id: "42:447",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 447,
+              text: "second replay claim throws before groups schedule",
+              status: "pending",
+              attempts: 0,
+              createdAt: 2,
+              updatedAt: 2,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const originalClaim = ForegroundTextPromptQueue.prototype.claim;
+    const claimSpy = vi
+      .spyOn(ForegroundTextPromptQueue.prototype, "claim")
+      .mockImplementation(function (this: ForegroundTextPromptQueue, id: string) {
+        if (id === "42:447") {
+          throw new Error("claim failed after first replay claim");
+        }
+        return originalClaim.call(this, id);
+      });
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("should not run");
+      callbacks.onAgentMessage?.("should not run");
+      callbacks.onAgentEnd();
+    });
+
+    try {
+      createBot(createConfig({ workspace } as any), createRegistry(session) as any);
+
+      await vi.waitFor(async () => {
+        const queue = JSON.parse(await readFile(path.join(queueDir, "foreground_text_prompts.json"), "utf8"));
+        expect(queue.entries["42:446"]).toMatchObject({
+          status: "pending",
+          attempts: 1,
+        });
+        expect(queue.entries["42:446"].claimToken).toBeUndefined();
+      });
+      expect(session.prompt).not.toHaveBeenCalled();
+    } finally {
+      claimSpy.mockRestore();
+    }
+  });
+
+  it("replays consecutive durable coalesced texts as one turn after a crash before the timer fires", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-coalesce-replay-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:434": {
+              id: "42:434",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 434,
+              text: "第一段 crash 前 coalescing",
+              status: "processing",
+              attempts: 1,
+              claimProcessId: 1,
+              claimToken: "1:old-a",
+              createdAt: 1_000,
+              updatedAt: Date.now() - 31_000,
+            },
+            "42:435": {
+              id: "42:435",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 435,
+              text: "第二段 crash 前 coalescing",
+              status: "processing",
+              attempts: 1,
+              claimProcessId: 1,
+              claimToken: "1:old-b",
+              createdAt: 2_000,
+              updatedAt: Date.now() - 31_000,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("coalesced replay reply");
+      callbacks.onAgentMessage?.("coalesced replay reply");
+      callbacks.onAgentEnd();
+    });
+
+    createBot(createConfig({ workspace, telegramTextCoalesceMs: 60_000 } as any), createRegistry(session) as any);
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    const prompt = String(session.prompt.mock.calls[0][0]);
+    expect(prompt).toContain("Albert sent these Telegram messages consecutively");
+    expect(prompt).toContain("第一段 crash 前 coalescing");
+    expect(prompt).toContain("第二段 crash 前 coalescing");
+    expect(prompt.indexOf("第一段 crash 前 coalescing")).toBeLessThan(
+      prompt.indexOf("第二段 crash 前 coalescing"),
+    );
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("replays interleaved durable coalesced texts by sender bucket after a crash before the timer fires", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-coalesce-replay-interleaved-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:437": {
+              id: "42:437",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 437,
+              text: "A 第一段 crash 前 coalescing",
+              status: "processing",
+              attempts: 1,
+              claimProcessId: 1,
+              claimToken: "1:old-a1",
+              createdAt: 1_000,
+              updatedAt: Date.now() - 31_000,
+            },
+            "99:438": {
+              id: "99:438",
+              contextKey: "99",
+              chatId: 99,
+              fromId: 123,
+              messageId: 438,
+              text: "B context 插队消息",
+              status: "processing",
+              attempts: 1,
+              claimProcessId: 1,
+              claimToken: "1:old-b",
+              createdAt: 1_100,
+              updatedAt: Date.now() - 31_000,
+            },
+            "42:439": {
+              id: "42:439",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 439,
+              text: "A 第二段 crash 前 coalescing",
+              status: "processing",
+              attempts: 1,
+              claimProcessId: 1,
+              claimToken: "1:old-a2",
+              createdAt: 1_200,
+              updatedAt: Date.now() - 31_000,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("replayed reply");
+      callbacks.onAgentMessage?.("replayed reply");
+      callbacks.onAgentEnd();
+    });
+
+    createBot(createConfig({ workspace, telegramTextCoalesceMs: 60_000 } as any), createRegistry(session) as any);
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    const prompts = session.prompt.mock.calls.map((call) => String(call[0]));
+    const coalescedA = prompts.find((prompt) => prompt.includes("A 第一段 crash 前 coalescing"));
+    expect(coalescedA).toBeTruthy();
+    expect(coalescedA).toContain("A 第二段 crash 前 coalescing");
+    expect(coalescedA).not.toContain("B context 插队消息");
+    expect(prompts.find((prompt) => prompt.includes("B context 插队消息"))).toBeTruthy();
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("does not reorder same-context multi-sender durable replay while preserving cross-context coalescing", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-coalesce-replay-same-context-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:440": {
+              id: "42:440",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 440,
+              text: "A1 same context",
+              status: "processing",
+              attempts: 1,
+              claimProcessId: 1,
+              claimToken: "1:old-a1",
+              createdAt: 1_000,
+              updatedAt: Date.now() - 31_000,
+            },
+            "42:441": {
+              id: "42:441",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 456,
+              messageId: 441,
+              text: "B same context interleaves",
+              status: "processing",
+              attempts: 1,
+              claimProcessId: 1,
+              claimToken: "1:old-b",
+              createdAt: 1_100,
+              updatedAt: Date.now() - 31_000,
+            },
+            "42:442": {
+              id: "42:442",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 442,
+              text: "A2 same context must stay after B",
+              status: "processing",
+              attempts: 1,
+              claimProcessId: 1,
+              claimToken: "1:old-a2",
+              createdAt: 1_200,
+              updatedAt: Date.now() - 31_000,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("replayed reply");
+      callbacks.onAgentMessage?.("replayed reply");
+      callbacks.onAgentEnd();
+    });
+
+    createBot(
+      createConfig({
+        workspace,
+        telegramAllowedUserIds: [123, 456],
+        telegramAllowedUserIdSet: new Set([123, 456]),
+        telegramTextCoalesceMs: 60_000,
+      } as any),
+      createRegistry(session) as any,
+    );
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+    const prompts = session.prompt.mock.calls.map((call) => String(call[0]));
+    expect(prompts[0]).toContain("A1 same context");
+    expect(prompts[0]).not.toContain("A2 same context must stay after B");
+    expect(prompts[1]).toContain("B same context interleaves");
+    expect(prompts[2]).toContain("A2 same context must stay after B");
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("claims startup durable text replay once across concurrent bot instances", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-cross-instance-replay-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:404": {
+              id: "42:404",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 404,
+              text: "only one dispatcher instance may replay this",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const firstSession = createSession(async (callbacks) => {
+      callbacks.onTextDelta("first reply");
+      callbacks.onAgentMessage?.("first reply");
+      callbacks.onAgentEnd();
+    });
+    const secondSession = createSession(async (callbacks) => {
+      callbacks.onTextDelta("second reply");
+      callbacks.onAgentMessage?.("second reply");
+      callbacks.onAgentEnd();
+    });
+
+    createBot(createConfig({ workspace } as any), createRegistry(firstSession) as any);
+    createBot(createConfig({ workspace } as any), createRegistry(secondSession) as any);
+
+    await vi.waitFor(() => {
+      expect(firstSession.prompt.mock.calls.length + secondSession.prompt.mock.calls.length).toBe(1);
+    });
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("does not replay durable text prompts from users who are no longer authorized", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-unauthorized-replay-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:402": {
+              id: "42:402",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 999,
+              messageId: 402,
+              text: "unauthorized replay must not reach Codex",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("should not run");
+      callbacks.onAgentMessage?.("should not run");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    createBot(createConfig({ workspace } as any), registry as any);
+
+    await delay(20);
+    expect(session.prompt).not.toHaveBeenCalled();
+    const queue = JSON.parse(await readFile(path.join(queueDir, "foreground_text_prompts.json"), "utf8"));
+    expect(queue.entries).toEqual({});
+  });
+
+  it("does not submit a duplicate Codex turn when Telegram redelivers a durable message id during startup replay", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-duplicate-replay-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:403": {
+              id: "42:403",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 403,
+              text: "redelivered durable message",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("reply");
+      callbacks.onAgentMessage?.("reply");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 403, text: "redelivered durable message" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    expect(String(session.prompt.mock.calls[0][0])).toContain("redelivered durable message");
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("persists live text before waiting for startup replay scheduling", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-live-before-replay-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:410": {
+              id: "42:410",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 410,
+              text: "startup replay is deliberately blocked",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const replayBlocked = deferred<void>();
+    let getOrCreateCalls = 0;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("reply");
+      callbacks.onAgentMessage?.("reply");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockImplementation(async () => {
+      getOrCreateCalls += 1;
+      if (getOrCreateCalls === 1) {
+        await replayBlocked.promise;
+      }
+      return session;
+    });
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const livePromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 411, text: "live text must be durable before replay finishes" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(async () => {
+      const queue = JSON.parse(await readFile(path.join(queueDir, "foreground_text_prompts.json"), "utf8"));
+      expect(queue.entries["42:411"]).toMatchObject({
+        text: "live text must be durable before replay finishes",
+        status: "processing",
+      });
+    });
+    expect(session.prompt).not.toHaveBeenCalled();
+
+    replayBlocked.resolve();
+    await livePromise;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("heartbeats live claims while waiting for startup replay scheduling", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-live-scheduling-heartbeat-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:444": {
+              id: "42:444",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 444,
+              text: "startup replay blocks live scheduling heartbeat",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const replayBlocked = deferred<void>();
+    let getOrCreateCalls = 0;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("reply");
+      callbacks.onAgentMessage?.("reply");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockImplementation(async () => {
+      getOrCreateCalls += 1;
+      if (getOrCreateCalls === 1) {
+        await replayBlocked.promise;
+      }
+      return session;
+    });
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const livePromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 445, text: "live claim must heartbeat before session lookup" },
+      api: bot.api,
+    });
+
+    const queuePath = path.join(queueDir, "foreground_text_prompts.json");
+    await vi.waitFor(async () => {
+      const queue = JSON.parse(await readFile(queuePath, "utf8"));
+      expect(queue.entries["42:445"]).toMatchObject({
+        text: "live claim must heartbeat before session lookup",
+        status: "processing",
+      });
+    });
+    const claimedQueue = JSON.parse(await readFile(queuePath, "utf8"));
+    claimedQueue.entries["42:445"].updatedAt = Date.now() - 31_000;
+    await writeFile(queuePath, `${JSON.stringify(claimedQueue, null, 2)}\n`, "utf8");
+
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(async () => {
+        const queue = JSON.parse(await readFile(queuePath, "utf8"));
+        expect(queue.entries["42:445"].updatedAt).toBeGreaterThan(Date.now() - 30_000);
+      }, { timeout: 100 });
+
+      replayBlocked.resolve();
+      await livePromise;
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+      await waitForForegroundQueueEmpty(workspace);
+    } finally {
+      replayBlocked.resolve();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not double-submit concurrent live redelivery of the same durable message id", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-concurrent-redelivery-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const firstSessionLookupStarted = deferred<void>();
+    const releaseFirstSessionLookup = deferred<void>();
+    let getOrCreateCalls = 0;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("reply");
+      callbacks.onAgentMessage?.("reply");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockImplementation(async () => {
+      getOrCreateCalls += 1;
+      if (getOrCreateCalls === 1) {
+        firstSessionLookupStarted.resolve();
+        await releaseFirstSessionLookup.promise;
+      }
+      return session;
+    });
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const first = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 422, text: "same update delivered concurrently" },
+      api: bot.api,
+    });
+    await firstSessionLookupStarted.promise;
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 422, text: "same update delivered concurrently" },
+      api: bot.api,
+    });
+    releaseFirstSessionLookup.resolve();
+    await first;
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(String(session.prompt.mock.calls[0][0])).toContain("same update delivered concurrently");
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("heartbeats an active durable text turn so another startup replay does not steal it", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-active-heartbeat-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const firstTurn = deferred<void>();
+    const activeSession = createSession(async () => {
+      await firstTurn.promise;
+    });
+    const activeRegistry = createRegistry(activeSession);
+
+    const activeBot = createBot(createConfig({ workspace } as any), activeRegistry as any) as any;
+    const textHandler = activeBot.__handlers.on.get("message:text");
+    const activePrompt = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 428, text: "long active turn must stay owned" },
+      api: activeBot.api,
+    });
+    await vi.waitFor(() => expect(activeSession.prompt).toHaveBeenCalledTimes(1));
+
+    const queuePath = path.join(workspace, ".telecodex", "foreground_text_prompts.json");
+    const claimedQueue = JSON.parse(await readFile(queuePath, "utf8"));
+    claimedQueue.entries["42:428"].claimProcessId = 1;
+    claimedQueue.entries["42:428"].updatedAt = Date.now() - 31_000;
+    await writeFile(queuePath, `${JSON.stringify(claimedQueue, null, 2)}\n`, "utf8");
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    const replaySession = createSession(async (callbacks) => {
+      callbacks.onTextDelta("should not replay");
+      callbacks.onAgentMessage?.("should not replay");
+      callbacks.onAgentEnd();
+    });
+    createBot(createConfig({ workspace } as any), createRegistry(replaySession) as any);
+    await vi.advanceTimersByTimeAsync(20);
+
+    try {
+      expect(replaySession.prompt).not.toHaveBeenCalled();
+
+      firstTurn.resolve();
+      await activePrompt;
+      await waitForForegroundQueueEmpty(workspace);
+    } finally {
+      firstTurn.resolve();
+      await activePrompt;
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not drop same-process redelivery of a durable text prompt left pending after timeout", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-timeout-redelivery-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    let processing = false;
+    let promptCalls = 0;
+    const session = createSession(async (callbacks) => {
+      promptCalls += 1;
+      if (promptCalls === 1) {
+        processing = true;
+        await new Promise(() => undefined);
+        return;
+      }
+      callbacks.onTextDelta("retried reply");
+      callbacks.onAgentMessage?.("retried reply");
+      callbacks.onAgentEnd();
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockImplementation(async () => {
+      processing = false;
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace, codexTurnTimeoutMs: 5 } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 412, text: "timeout redelivery must not be eaten" },
+      api: bot.api,
+    });
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 412, text: "timeout redelivery must not be eaten" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("timeout redelivery must not be eaten");
+  });
+
+  it("keeps /new behind startup durable replay scheduling", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-command-gate-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:413": {
+              id: "42:413",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 413,
+              text: "stale text must be scheduled before /new mutates the thread",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const replayBlocked = deferred<void>();
+    let getOrCreateCalls = 0;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("replayed");
+      callbacks.onAgentMessage?.("replayed");
+      callbacks.onAgentEnd();
+    });
+    (session as any).listWorkspaces = vi.fn(() => [workspace]);
+    session.newThread.mockResolvedValue(session.getInfo());
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockImplementation(async () => {
+      getOrCreateCalls += 1;
+      if (getOrCreateCalls === 1) {
+        await replayBlocked.promise;
+      }
+      return session;
+    });
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const newCommand = bot.__handlers.commands.get("new");
+    const newPromise = newCommand({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 414, text: "/new" },
+      api: bot.api,
+    });
+
+    await delay(20);
+    expect(session.newThread).not.toHaveBeenCalled();
+
+    replayBlocked.resolve();
+    await newPromise;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("does not drop same-process redelivery after startup durable replay scheduling fails", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-replay-failure-redelivery-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:415": {
+              id: "42:415",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 415,
+              text: "redelivery after replay scheduling failure",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("retried after failed replay");
+      callbacks.onAgentMessage?.("retried after failed replay");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockRejectedValueOnce(new Error("startup session unavailable")).mockResolvedValue(session);
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 415, text: "redelivery after replay scheduling failure" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    expect(String(session.prompt.mock.calls[0][0])).toContain("redelivery after replay scheduling failure");
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("does not eat live redelivery while startup durable replay is failing", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-replay-failure-interleaving-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:423": {
+              id: "42:423",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 423,
+              text: "redelivery races with replay failure",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const replayLookupStarted = deferred<void>();
+    const releaseReplayLookup = deferred<void>();
+    let getOrCreateCalls = 0;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("live retry reply");
+      callbacks.onAgentMessage?.("live retry reply");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockImplementation(async () => {
+      getOrCreateCalls += 1;
+      if (getOrCreateCalls === 1) {
+        replayLookupStarted.resolve();
+        await releaseReplayLookup.promise;
+        throw new Error("startup session unavailable");
+      }
+      return session;
+    });
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    await replayLookupStarted.promise;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const liveRedelivery = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 423, text: "redelivery races with replay failure" },
+      api: bot.api,
+    });
+
+    await delay(20);
+    expect(session.prompt).not.toHaveBeenCalled();
+
+    releaseReplayLookup.resolve();
+    await liveRedelivery;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    expect(String(session.prompt.mock.calls[0][0])).toContain("redelivery races with replay failure");
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("keeps /logout replies behind startup durable replay scheduling", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-logout-gate-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:416": {
+              id: "42:416",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 416,
+              text: "stale text must be scheduled before logout mutates auth",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const replayBlocked = deferred<void>();
+    let getOrCreateCalls = 0;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("replayed before logout");
+      callbacks.onAgentMessage?.("replayed before logout");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockImplementation(async () => {
+      getOrCreateCalls += 1;
+      if (getOrCreateCalls === 1) {
+        await replayBlocked.promise;
+      }
+      return session;
+    });
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const logoutCommand = bot.__handlers.commands.get("logout");
+    const logoutPromise = logoutCommand({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 417, text: "/logout" },
+      api: bot.api,
+    });
+
+    await delay(20);
+    expect(bot.api.sendMessage).not.toHaveBeenCalled();
+
+    replayBlocked.resolve();
+    await logoutPromise;
+    expect(bot.api.sendMessage).toHaveBeenCalled();
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("keeps /login replies behind startup durable replay scheduling", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-login-gate-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const queueDir = path.join(workspace, ".telecodex");
+    await mkdir(queueDir, { recursive: true });
+    await writeFile(
+      path.join(queueDir, "foreground_text_prompts.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: {
+            "42:418": {
+              id: "42:418",
+              contextKey: "42",
+              chatId: 42,
+              fromId: 123,
+              messageId: 418,
+              text: "stale text must be scheduled before login mutates auth",
+              status: "pending",
+              attempts: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const replayBlocked = deferred<void>();
+    let getOrCreateCalls = 0;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("replayed before login");
+      callbacks.onAgentMessage?.("replayed before login");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    registry.getOrCreate.mockImplementation(async () => {
+      getOrCreateCalls += 1;
+      if (getOrCreateCalls === 1) {
+        await replayBlocked.promise;
+      }
+      return session;
+    });
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const loginCommand = bot.__handlers.commands.get("login");
+    const loginPromise = loginCommand({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 419, text: "/login" },
+      api: bot.api,
+    });
+
+    await delay(20);
+    expect(bot.api.sendMessage).not.toHaveBeenCalled();
+
+    replayBlocked.resolve();
+    await loginPromise;
+    expect(bot.api.sendMessage).toHaveBeenCalled();
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("does not drop durable queued text after registry removal in the same process", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-remove-redelivery-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    let processing = false;
+    let promptCalls = 0;
+    const releaseFirstTurn = deferred<void>();
+    const session = createSession(async (callbacks) => {
+      promptCalls += 1;
+      if (promptCalls === 1) {
+        processing = true;
+        await releaseFirstTurn.promise;
+        processing = false;
+        callbacks.onTextDelta("first done");
+        callbacks.onAgentMessage?.("first done");
+        callbacks.onAgentEnd();
+        return;
+      }
+      callbacks.onTextDelta("redelivered after remove");
+      callbacks.onAgentMessage?.("redelivered after remove");
+      callbacks.onAgentEnd();
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockImplementation(async () => {
+      processing = false;
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 420, text: "active turn" },
+      api: bot.api,
+    });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 421, text: "queued text survives registry removal" },
+      api: bot.api,
+    });
+    registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
+    releaseFirstTurn.resolve();
+    await firstPromise;
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 421, text: "queued text survives registry removal" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("queued text survives registry removal");
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("waits for registry removal to mark durable queued text pending before live redelivery claims it", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-remove-redelivery-race-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    let promptCalls = 0;
+    const releaseFirstTurn = deferred<void>();
+    const session = createSession(async (callbacks) => {
+      promptCalls += 1;
+      if (promptCalls === 1) {
+        await releaseFirstTurn.promise;
+        callbacks.onTextDelta("first done");
+        callbacks.onAgentMessage?.("first done");
+        callbacks.onAgentEnd();
+        return;
+      }
+      callbacks.onTextDelta("redelivery after pending release");
+      callbacks.onAgentMessage?.("redelivery after pending release");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 429, text: "active turn" },
+      api: bot.api,
+    });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 430, text: "queued text waits for pending release" },
+      api: bot.api,
+    });
+
+    const lockPath = path.join(workspace, ".telecodex", "foreground_text_prompts.json.lock");
+    await writeFile(lockPath, "external-lock", "utf8");
+    registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
+    const redelivery = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 430, text: "queued text waits for pending release" },
+      api: bot.api,
+    });
+
+    await delay(20);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+
+    await rm(lockPath, { force: true });
+    await redelivery;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+
+    releaseFirstTurn.resolve();
+    await firstPromise;
+    await waitForForegroundQueueEmpty(workspace);
+  });
+
+  it("does not delete durable coalesced text when a registry removal happens before the timer fires", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-foreground-coalesce-remove-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("should not run yet");
+      callbacks.onAgentMessage?.("should not run yet");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace, telegramTextCoalesceMs: 60_000 } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 424, text: "coalesced text must survive context removal" },
+      api: bot.api,
+    });
+
+    registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
+
+    await vi.waitFor(async () => {
+      const queue = JSON.parse(
+        await readFile(path.join(workspace, ".telecodex", "foreground_text_prompts.json"), "utf8"),
+      );
+      expect(queue.entries["42:424"]).toMatchObject({
+        text: "coalesced text must survive context removal",
+        status: "pending",
+      });
+    });
+    expect(session.prompt).not.toHaveBeenCalled();
   });
 
   it("preserves text arrival order when the first receipt reaction is slow", async () => {
@@ -3584,6 +5264,26 @@ function deferred<T>(): Deferred<T> {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readForegroundQueueEntries(workspace: string): Promise<Record<string, unknown>> {
+  try {
+    const queue = JSON.parse(
+      await readFile(path.join(workspace, ".telecodex", "foreground_text_prompts.json"), "utf8"),
+    );
+    return queue.entries ?? {};
+  } catch (error) {
+    if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {};
+    }
+    throw error;
+  }
+}
+
+async function waitForForegroundQueueEmpty(workspace: string): Promise<void> {
+  await vi.waitFor(async () => {
+    expect(await readForegroundQueueEntries(workspace)).toEqual({});
+  });
 }
 
 function reactionEmojiFromCall(call: unknown[] | undefined): string | undefined {
