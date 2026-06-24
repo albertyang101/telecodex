@@ -200,7 +200,15 @@ describe("createBot response delivery", () => {
       detail: "authenticated",
     });
     mockAuth.startLogin.mockReset();
+    mockAuth.startLogin.mockResolvedValue({
+      success: true,
+      message: "login started",
+    });
     mockAuth.startLogout.mockReset();
+    mockAuth.startLogout.mockResolvedValue({
+      success: true,
+      message: "logged out",
+    });
     process.env.VOICE_TRANSCRIPTION_BACKEND = "parakeet";
     process.env.QWEN_ASR_SOCKET = "/tmp/telecodex-test-missing-qwen-asr.sock";
   });
