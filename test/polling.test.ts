@@ -217,6 +217,95 @@ describe("startTelegramPolling", () => {
     }
   });
 
+  it("keeps the pending-update watchdog alive when getWebhookInfo hangs", async () => {
+    vi.useFakeTimers();
+    try {
+      let firstProbeSignal: AbortSignal | undefined;
+      const staleHandle = {
+        ...runnerMock.handle,
+        isRunning: vi.fn(() => true),
+        size: vi.fn(() => 0),
+        stop: vi.fn(async () => undefined),
+        task: vi.fn(() => new Promise<void>(() => undefined)),
+      };
+      const recoveredHandle = {
+        ...runnerMock.handle,
+        task: vi.fn(() => Promise.resolve()),
+      };
+      runnerMock.run.mockReturnValueOnce(staleHandle).mockReturnValueOnce(recoveredHandle);
+      const bot = {
+        api: {
+          deleteWebhook: vi.fn(async () => true),
+          getWebhookInfo: vi
+            .fn()
+            .mockImplementationOnce((signal?: AbortSignal) => {
+              firstProbeSignal = signal;
+              return new Promise(() => undefined);
+            })
+            .mockResolvedValueOnce({ pending_update_count: 3 })
+            .mockResolvedValueOnce({ pending_update_count: 3 }),
+        },
+      };
+      const runPromise = runTelegramPollingWithRetry(bot as any, {
+        pendingUpdateWatchdogIntervalMs: 10,
+        pendingUpdateWatchdogStaleMs: 10,
+        pendingUpdateWatchdogOperationTimeoutMs: 5,
+      });
+
+      await vi.advanceTimersByTimeAsync(45);
+      await runPromise;
+
+      expect(bot.api.getWebhookInfo).toHaveBeenCalledTimes(3);
+      expect(firstProbeSignal?.aborted).toBe(true);
+      expect(staleHandle.stop).toHaveBeenCalledTimes(1);
+      expect(runnerMock.run).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails fatally instead of starting a second poller when the stalled runner handle refuses to stop", async () => {
+    vi.useFakeTimers();
+    try {
+      const staleHandle = {
+        ...runnerMock.handle,
+        isRunning: vi.fn(() => true),
+        size: vi.fn(() => 0),
+        stop: vi.fn(() => new Promise<void>(() => undefined)),
+        task: vi.fn(() => new Promise<void>(() => undefined)),
+      };
+      const recoveredHandle = {
+        ...runnerMock.handle,
+        task: vi.fn(() => Promise.resolve()),
+      };
+      runnerMock.run.mockReturnValueOnce(staleHandle).mockReturnValueOnce(recoveredHandle);
+      const bot = {
+        api: {
+          deleteWebhook: vi.fn(async () => true),
+          getWebhookInfo: vi
+            .fn()
+            .mockResolvedValueOnce({ pending_update_count: 3 })
+            .mockResolvedValueOnce({ pending_update_count: 3 }),
+        },
+      };
+      const runPromise = runTelegramPollingWithRetry(bot as any, {
+        pendingUpdateWatchdogIntervalMs: 10,
+        pendingUpdateWatchdogStaleMs: 10,
+        pendingUpdateWatchdogOperationTimeoutMs: 5,
+      });
+      const fatalExpectation = expect(runPromise).rejects.toThrow("Telegram polling handle stop timed out after 5ms");
+
+      await vi.advanceTimersByTimeAsync(25);
+      await fatalExpectation;
+
+      expect(staleHandle.stop).toHaveBeenCalledTimes(1);
+      expect(runnerMock.run).toHaveBeenCalledTimes(1);
+      expect(bot.api.deleteWebhook).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not drop queued updates when the pending-update watchdog restarts after an explicit clean startup", async () => {
     vi.useFakeTimers();
     try {

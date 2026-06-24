@@ -53,9 +53,12 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `TELEGRAM_BOT_TOKEN` | ✅ | Bot token from @BotFather |
    | `TELEGRAM_ALLOWED_USER_IDS` | ✅ | Comma-separated Telegram user IDs |
    | `CODEX_API_KEY` | — | API key for Codex (alternative to ChatGPT login) |
+   | `CODEX_PATH` | — | Optional absolute path to the Codex executable or wrapper. For supervised dispatcher runs, use `scripts/codex-no-user-config-wrapper.sh` so SDK aborts clean up the Codex process group. |
+   | `REAL_CODEX` | — | Real Codex CLI path used by `scripts/codex-no-user-config-wrapper.sh`; if unset, the wrapper discovers `codex` from `PATH`, Homebrew, or `~/.local/bin`. |
+   | `CODEX_WRAPPER_KILL_GRACE_SECONDS` | — | Grace period used by the Codex wrapper between `TERM` and `KILL` for the supervised process group (default `2`). |
    | `CODEX_MODEL` | — | Default model, e.g. `gpt-5.4`, `o3` |
    | `CODEX_REASONING_EFFORT` | — | Default reasoning effort for new threads: `minimal`, `low`, `medium`, `high`, or `xhigh` |
-   | `CODEX_TURN_TIMEOUT_MS` | — | Optional foreground Telegram turn lease in milliseconds; on timeout TeleCodex aborts the current Codex turn, sends a timeout reply, and drains queued follow-ups. Unset by default. |
+   | `CODEX_TURN_TIMEOUT_MS` | — | Optional foreground Telegram turn lease in milliseconds; on timeout TeleCodex aborts the current Codex turn, sends a timeout reply, and drains queued follow-ups. If `CODEX_TURN_ABORT_GRACE_MS` is unset, this timeout also becomes the default foreground abort grace. Unset by default. |
    | `CODEX_TURN_ABORT_GRACE_MS` | — | Optional post-timeout grace in milliseconds; if an aborted foreground or mailbox turn still has not settled after this grace, TeleCodex fails loud so launchd can restart it. For mailbox turns, `MAILBOX_PROMPT_TIMEOUT_MS` alone defaults the grace to the mailbox timeout. |
    | `CODEX_SANDBOX_MODE` | — | `read-only`, `workspace-write` *(default)*, `danger-full-access` |
    | `CODEX_APPROVAL_POLICY` | — | `never` *(default)*, `on-request`, `on-failure`, `untrusted` |
@@ -88,6 +91,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `QWEN_ASR_CONTEXT` | — | Optional Qwen3-ASR context/hotword prompt for names and domain terms |
    | `QWEN_ASR_LANGUAGE` | — | Optional Qwen3-ASR language hint |
    | `QWEN_ASR_TIMEOUT_MS` | — | Qwen3-ASR socket timeout in milliseconds (default `270000`) |
+   | `TELEGRAM_API_CALL_TIMEOUT_MS` | — | Telegram Bot API write timeout for replies, edits, chat actions, artifact uploads, keyboard cleanup, and delete calls in milliseconds (default `30000`). Operations that support grammY abort signals are aborted on timeout. |
    | `TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS` | — | Telegram media download timeout in milliseconds (default `60000`) |
    | `MAILBOX_PROMPT_TIMEOUT_MS` | — | Optional mailbox Codex turn lease in milliseconds; on timeout the bridge aborts the turn, keeps the inbox file unread for inspection, marks it `failed_prompt_timeout`, and escalates to fatal recovery if the aborted turn remains active after the abort grace |
    | `OPENAI_API_KEY` | — | Enables OpenAI voice transcription |

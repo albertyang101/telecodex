@@ -45,6 +45,7 @@ const mockGrammy = vi.hoisted(() => {
       editMessageText: vi.fn().mockResolvedValue(true),
       editMessageReplyMarkup: vi.fn().mockResolvedValue(true),
       deleteMessage: vi.fn().mockResolvedValue(true),
+      sendDocument: vi.fn().mockResolvedValue({ message_id: 1000 }),
       setMyCommands: vi.fn().mockResolvedValue(true),
       setMessageReaction: vi.fn().mockResolvedValue(true),
     };
@@ -110,6 +111,7 @@ describe("createBot response delivery", () => {
   const originalVoiceBackend = process.env.VOICE_TRANSCRIPTION_BACKEND;
   const originalQwenSocket = process.env.QWEN_ASR_SOCKET;
   const originalTelegramFileDownloadTimeoutMs = process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS;
+  const originalTelegramApiCallTimeoutMs = process.env.TELEGRAM_API_CALL_TIMEOUT_MS;
   const originalVoiceTranscriptionTimeoutMs = process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS;
   const tempDirs: string[] = [];
   let defaultWorkspace = path.join(tmpdir(), "telecodex-bot-test-workspace-initial");
@@ -235,6 +237,11 @@ describe("createBot response delivery", () => {
       delete process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS;
     } else {
       process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = originalTelegramFileDownloadTimeoutMs;
+    }
+    if (originalTelegramApiCallTimeoutMs === undefined) {
+      delete process.env.TELEGRAM_API_CALL_TIMEOUT_MS;
+    } else {
+      process.env.TELEGRAM_API_CALL_TIMEOUT_MS = originalTelegramApiCallTimeoutMs;
     }
     if (originalVoiceTranscriptionTimeoutMs === undefined) {
       delete process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS;
@@ -1429,7 +1436,7 @@ describe("createBot response delivery", () => {
 
     try {
       await vi.waitFor(() => expect(session.abort).toHaveBeenCalledTimes(1), { timeout: 100 });
-      await vi.waitFor(() => expect(bot.api.deleteMessage).toHaveBeenCalledWith(42, expect.any(Number)));
+      await vi.waitFor(() => expect(bot.api.deleteMessage).toHaveBeenCalledWith(42, expect.any(Number), expect.anything()));
       await vi.advanceTimersByTimeAsync(25);
       await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
 
@@ -1920,6 +1927,37 @@ describe("createBot response delivery", () => {
     expect(session.abort).toHaveBeenCalledTimes(1);
     expect(String(onFatalRecovery.mock.calls[0]?.[0]?.message)).toContain(
       "Codex turn remained active after timeout abort grace",
+    );
+  });
+
+  it("uses the foreground turn timeout as default abort grace when no global grace is configured", async () => {
+    let processing = false;
+    const session = createSession(async () => {
+      processing = true;
+      await new Promise(() => undefined);
+    });
+    session.isProcessing.mockImplementation(() => processing);
+    session.abort.mockResolvedValue(undefined);
+    const registry = createRegistry(session);
+    const onFatalRecovery = vi.fn();
+
+    const bot = createBot(
+      createConfig({ codexTurnTimeoutMs: 5, codexTurnAbortGraceMs: undefined } as any),
+      registry as any,
+      { onFatalRecovery },
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 218, text: "这条只配置 turn timeout，也必须触发恢复" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(onFatalRecovery).toHaveBeenCalledTimes(1));
+    expect(String(onFatalRecovery.mock.calls[0]?.[0]?.message)).toContain(
+      "Codex turn remained active after timeout abort grace (5ms + 5ms)",
     );
   });
 
@@ -3863,7 +3901,7 @@ describe("createBot response delivery", () => {
       api: bot.api,
     });
 
-    expect(bot.api.getFile).toHaveBeenCalledWith("voice-file-1");
+    expect(bot.api.getFile).toHaveBeenCalledWith("voice-file-1", expect.anything());
     expect(transcribeCalls).toBe(1);
 
     firstTurn.resolve();
@@ -4660,6 +4698,194 @@ describe("createBot response delivery", () => {
     expect(String(session.prompt.mock.calls[1][0])).toContain("文档 outbox 失败后这条也必须进 Codex");
   });
 
+  it("does not let a stuck document chat action block later queued prompts after the API timeout", async () => {
+    process.env.TELEGRAM_API_CALL_TIMEOUT_MS = "5";
+    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-chat-action-stuck-"));
+    tempDirs.push(workspace);
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
+      callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
+      callbacks.onAgentEnd();
+    });
+    session.getCurrentWorkspace.mockReturnValue(workspace);
+    session.getInfo.mockReturnValue({
+      ...session.getInfo(),
+      workspace,
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace }), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "documents/chat-action-stuck.txt",
+      file_size: 5,
+    });
+    bot.api.sendChatAction.mockImplementation(() => new Promise(() => undefined));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
+      })),
+    );
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const documentHandler = bot.__handlers.on.get("message:document");
+
+    const documentPromise = documentHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 64,
+        document: { file_id: "doc-file-chat-action-stuck", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
+        caption: "先总结这个文档",
+      },
+      api: bot.api,
+    });
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 65, text: "文档 chat action 卡住后这条也必须进 Codex" },
+      api: bot.api,
+    });
+
+    await expect(
+      Promise.race([documentPromise.then(() => "resolved"), delay(100).then(() => "timed-out")]),
+    ).resolves.toBe("resolved");
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("文档 chat action 卡住后这条也必须进 Codex");
+  });
+
+  it("bounds foreground typing indicators so stuck Telegram chat actions do not accumulate", async () => {
+    vi.useFakeTimers();
+    try {
+      process.env.TELEGRAM_API_CALL_TIMEOUT_MS = "5";
+      const turnStarted = deferred<void>();
+      const finishTurn = deferred<void>();
+      let promptCount = 0;
+      const session = createSession(async (callbacks) => {
+        promptCount += 1;
+        if (promptCount === 1) {
+          turnStarted.resolve();
+          await finishTurn.promise;
+        }
+        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
+        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig(), registry as any) as any;
+      const activeChatActionSignals = new Set<AbortSignal>();
+      bot.api.sendChatAction.mockImplementation(
+        (_chatId: number, _action: string, _options: unknown, signal?: AbortSignal) => {
+          if (!signal) {
+            return new Promise(() => undefined);
+          }
+          activeChatActionSignals.add(signal);
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener(
+              "abort",
+              () => {
+                activeChatActionSignals.delete(signal);
+                reject(new Error("chat action aborted"));
+              },
+              { once: true },
+            );
+          });
+        },
+      );
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      const firstPromise = textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 70, text: "typing 卡住时仍然要能结束 turn" },
+        api: bot.api,
+      });
+
+      await turnStarted.promise;
+      expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(13_510);
+      expect(bot.api.sendChatAction.mock.calls.length).toBeGreaterThan(1);
+      expect(activeChatActionSignals.size).toBe(0);
+      finishTurn.resolve();
+
+      await firstPromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let a stuck artifact upload block later queued prompts after the API timeout", async () => {
+    process.env.TELEGRAM_API_CALL_TIMEOUT_MS = "5";
+    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-artifact-send-stuck-"));
+    tempDirs.push(workspace);
+    let promptCount = 0;
+    const session = createSession(async (callbacks, input) => {
+      promptCount += 1;
+      const stagedFileInstructions = (input as { stagedFileInstructions?: string }).stagedFileInstructions;
+      const outDir = stagedFileInstructions?.match(/Write any output files to: (.+)/)?.[1];
+      if (outDir) {
+        await mkdir(outDir, { recursive: true });
+        await writeFile(path.join(outDir, "artifact.txt"), "artifact body");
+      }
+      callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
+      callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
+      callbacks.onAgentEnd();
+    });
+    session.getCurrentWorkspace.mockReturnValue(workspace);
+    session.getInfo.mockReturnValue({
+      ...session.getInfo(),
+      workspace,
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ workspace }), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "documents/artifact-send-stuck.txt",
+      file_size: 5,
+    });
+    bot.api.sendDocument.mockImplementation(() => new Promise(() => undefined));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
+      })),
+    );
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const documentHandler = bot.__handlers.on.get("message:document");
+
+    const documentPromise = documentHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 66,
+        document: { file_id: "doc-file-artifact-send-stuck", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
+        caption: "先总结这个文档",
+      },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 67, text: "artifact 发送卡住后这条也必须进 Codex" },
+      api: bot.api,
+    });
+
+    await expect(
+      Promise.race([documentPromise.then(() => "resolved"), delay(100).then(() => "timed-out")]),
+    ).resolves.toBe("resolved");
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("artifact 发送卡住后这条也必须进 Codex");
+  });
+
   it("drains later queued text after an earlier voice transcription fails", async () => {
     const firstTurn = deferred<void>();
     const transcribeStarted = deferred<void>();
@@ -5251,6 +5477,159 @@ describe("createBot response delivery", () => {
 
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
     expect(String(session.prompt.mock.calls[1][0])).toContain("第二条必须等第一条真正发完");
+  });
+
+  it("does not let a stuck final Telegram send block later queued prompts after the API timeout", async () => {
+    process.env.TELEGRAM_API_CALL_TIMEOUT_MS = "5";
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      callbacks.onTextDelta(promptCount === 1 ? "第一轮回复。" : "第二轮回复。");
+      callbacks.onAgentMessage?.(promptCount === 1 ? "第一轮回复。" : "第二轮回复。");
+      if (promptCount === 1) {
+        await firstTurn.promise;
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    let sendCount = 0;
+    bot.api.sendMessage.mockImplementation(async () => {
+      sendCount += 1;
+      if (sendCount === 1) {
+        await new Promise(() => undefined);
+      }
+      return { message_id: sendCount };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 52, text: "第一条，最终发送永久卡住" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 53, text: "第二条不能被第一条 Telegram send 卡死" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await expect(Promise.race([firstPromise.then(() => "resolved"), delay(100).then(() => "timed-out")])).resolves.toBe(
+      "resolved",
+    );
+    const entriesAfterTimeout = Object.values(await readForegroundQueueEntries(defaultWorkspace)) as Array<{
+      status?: string;
+      text?: string;
+    }>;
+    expect(
+      entriesAfterTimeout.some(
+        (entry) => entry.status === "pending" && entry.text?.includes("第一条，最终发送永久卡住"),
+      ),
+    ).toBe(true);
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条不能被第一条 Telegram send 卡死");
+  });
+
+  it("aborts the underlying Telegram send when the final send API timeout fires", async () => {
+    process.env.TELEGRAM_API_CALL_TIMEOUT_MS = "5";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("第一轮回复。");
+      callbacks.onAgentMessage?.("第一轮回复。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    let sendSignal: AbortSignal | undefined;
+    bot.api.sendMessage.mockImplementation(
+      (_chatId: number, _text: string, _options: unknown, signal?: AbortSignal) => {
+        sendSignal = signal;
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("send aborted")), { once: true });
+        });
+      },
+    );
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 56, text: "第一条，最终发送必须真实 abort" },
+      api: bot.api,
+    });
+
+    expect(sendSignal?.aborted).toBe(true);
+  });
+
+  it("does not let a stuck final Telegram edit block later queued prompts after the API timeout", async () => {
+    process.env.TELEGRAM_API_CALL_TIMEOUT_MS = "5";
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮流式预览。");
+        callbacks.onAgentMessage?.("第一轮最终回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("第二轮回复。");
+        callbacks.onAgentMessage?.("第二轮回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    bot.api.editMessageText.mockImplementation(async (_chatId: number, _messageId: number, text: string) => {
+      if (String(text).includes("第一轮流式预览")) {
+        await new Promise(() => undefined);
+      }
+      return true;
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 54, text: "第一条，最终 edit 永久卡住" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalledTimes(1));
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 55, text: "第二条不能被第一条 Telegram edit 卡死" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await expect(Promise.race([firstPromise.then(() => "resolved"), delay(100).then(() => "timed-out")])).resolves.toBe(
+      "resolved",
+    );
+    const entriesAfterTimeout = Object.values(await readForegroundQueueEntries(defaultWorkspace)) as Array<{
+      status?: string;
+      text?: string;
+    }>;
+    expect(
+      entriesAfterTimeout.some(
+        (entry) => entry.status === "pending" && entry.text?.includes("第一条，最终 edit 永久卡住"),
+      ),
+    ).toBe(true);
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条不能被第一条 Telegram edit 卡死");
   });
 });
 

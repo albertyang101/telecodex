@@ -1,4 +1,5 @@
 import { run, type RunnerHandle } from "@grammyjs/runner";
+import { AbortController as TelegramAbortController, type AbortSignal as TelegramAbortSignal } from "abort-controller";
 import type { Bot, Context } from "grammy";
 
 export type TelegramPollingOptions = {
@@ -15,6 +16,7 @@ export type TelegramPollingRetryOptions = TelegramPollingOptions & {
   pendingUpdateWatchdogIntervalMs?: number;
   pendingUpdateWatchdogStaleMs?: number;
   pendingUpdateWatchdogMinPendingUpdates?: number;
+  pendingUpdateWatchdogOperationTimeoutMs?: number;
   onHandle?: (handle: RunnerHandle) => void;
   shouldStop?: () => boolean;
   logger?: Pick<Console, "warn">;
@@ -23,6 +25,7 @@ export type TelegramPollingRetryOptions = TelegramPollingOptions & {
 const DEFAULT_PENDING_UPDATE_WATCHDOG_INTERVAL_MS = 10_000;
 const DEFAULT_PENDING_UPDATE_WATCHDOG_STALE_MS = 60_000;
 const DEFAULT_PENDING_UPDATE_WATCHDOG_MIN_UPDATES = 1;
+const DEFAULT_PENDING_UPDATE_WATCHDOG_OPERATION_TIMEOUT_MS = 5_000;
 
 export async function startTelegramPolling(
   bot: Bot<Context>,
@@ -121,6 +124,8 @@ function watchForStalePendingUpdates(
   const intervalMs = options.pendingUpdateWatchdogIntervalMs ?? DEFAULT_PENDING_UPDATE_WATCHDOG_INTERVAL_MS;
   const staleMs = options.pendingUpdateWatchdogStaleMs ?? DEFAULT_PENDING_UPDATE_WATCHDOG_STALE_MS;
   const minPendingUpdates = options.pendingUpdateWatchdogMinPendingUpdates ?? DEFAULT_PENDING_UPDATE_WATCHDOG_MIN_UPDATES;
+  const operationTimeoutMs =
+    options.pendingUpdateWatchdogOperationTimeoutMs ?? DEFAULT_PENDING_UPDATE_WATCHDOG_OPERATION_TIMEOUT_MS;
   if (intervalMs <= 0 || staleMs <= 0 || minPendingUpdates <= 0) {
     return undefined;
   }
@@ -138,7 +143,12 @@ function watchForStalePendingUpdates(
 
       let pendingUpdates = 0;
       try {
-        const webhookInfo = await getWebhookInfo();
+        const webhookInfo = await runWatchdogOperation(
+          (operationSignal) => getWebhookInfo(operationSignal),
+          operationTimeoutMs,
+          "Telegram getWebhookInfo watchdog probe",
+          logger,
+        );
         pendingUpdates = webhookInfo.pending_update_count ?? 0;
       } catch (error) {
         logger.warn(`Failed to inspect Telegram pending updates: ${formatError(error)}`);
@@ -163,7 +173,17 @@ function watchForStalePendingUpdates(
         continue;
       }
 
-      await handle.stop();
+      try {
+        await runWatchdogOperation(
+          () => handle.stop(),
+          operationTimeoutMs,
+          "Telegram polling handle stop",
+          logger,
+        );
+      } catch (error) {
+        logger.warn(`Failed to stop Telegram polling handle cleanly; escalating to process recovery: ${formatError(error)}`);
+        throw error;
+      }
       throw new PendingUpdatesStalledError(lastPendingUpdates, now - firstStalePendingAt);
     }
   })();
@@ -194,4 +214,39 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
       { once: true },
     );
   });
+}
+
+async function runWatchdogOperation<T>(
+  task: (signal: TelegramAbortSignal) => T | Promise<T>,
+  timeoutMs: number,
+  label: string,
+  logger: Pick<Console, "warn">,
+): Promise<T> {
+  const controller = new TelegramAbortController();
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const taskPromise = Promise.resolve()
+    .then(() => task(controller.signal))
+    .catch((error) => {
+      if (timedOut) {
+        logger.warn(`${label} later failed after timeout: ${formatError(error)}`);
+        return new Promise<T>(() => undefined);
+      }
+      throw error;
+    });
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([taskPromise, timeoutPromise]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }

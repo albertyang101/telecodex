@@ -26,6 +26,62 @@ CODEX_HOME="${CODEX_HOME:-$REPO_ROOT/.telecodex/codex-runtime-home}"
 mkdir -p "$CODEX_HOME"
 export CODEX_HOME
 
+child_pid=""
+kill_grace_seconds="${CODEX_WRAPPER_KILL_GRACE_SECONDS:-2}"
+
+terminate_child_group() {
+  if [ -z "$child_pid" ]; then
+    return
+  fi
+
+  if ! kill -0 "-$child_pid" >/dev/null 2>&1 && ! kill -0 "$child_pid" >/dev/null 2>&1; then
+    return
+  fi
+
+  kill -TERM "-$child_pid" >/dev/null 2>&1 || kill -TERM "$child_pid" >/dev/null 2>&1 || true
+  sleep "$kill_grace_seconds"
+  if kill -0 "-$child_pid" >/dev/null 2>&1 || kill -0 "$child_pid" >/dev/null 2>&1; then
+    kill -KILL "-$child_pid" >/dev/null 2>&1 || kill -KILL "$child_pid" >/dev/null 2>&1 || true
+  fi
+}
+
+handle_term() {
+  terminate_child_group
+  exit 143
+}
+
+handle_int() {
+  terminate_child_group
+  exit 130
+}
+
+handle_hup() {
+  terminate_child_group
+  exit 129
+}
+
+run_real_codex() {
+  set -m
+  trap handle_term TERM
+  trap handle_int INT
+  trap handle_hup HUP
+
+  "$@" &
+  child_pid=$!
+
+  set +e
+  wait "$child_pid"
+  status=$?
+  set -e
+
+  terminate_child_group
+  child_pid=""
+  trap - TERM
+  trap - INT
+  trap - HUP
+  exit "$status"
+}
+
 if [ "${1:-}" = "exec" ]; then
   shift
   args=()
@@ -40,7 +96,7 @@ if [ "${1:-}" = "exec" ]; then
     esac
   done
 
-  exec "$REAL_CODEX" exec --dangerously-bypass-hook-trust "${args[@]}"
+  run_real_codex "$REAL_CODEX" exec --dangerously-bypass-hook-trust "${args[@]}"
 fi
 
-exec "$REAL_CODEX" "$@"
+run_real_codex "$REAL_CODEX" "$@"

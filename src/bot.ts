@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { autoRetry } from "@grammyjs/auto-retry";
 import type { ModelReasoningEffort } from "@openai/codex-sdk";
+import { AbortController as TelegramAbortController, type AbortSignal as TelegramAbortSignal } from "abort-controller";
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 
 import {
@@ -56,6 +57,7 @@ const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
 const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
+const DEFAULT_TELEGRAM_API_CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = 60_000;
 const KEYBOARD_PAGE_SIZE = 6;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
@@ -322,6 +324,8 @@ async function waitForCodexPrompt(
   let notifiedPostTimeoutSettle = false;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let abortGraceTimeout: ReturnType<typeof setTimeout> | undefined;
+  const abortGraceMs = options?.abortGraceMs ?? timeoutMs;
+  const onFatalRecovery = options?.onFatalRecovery;
   const notifyPromptSettledAfterTimeout = (error?: unknown): void => {
     if (!timedOut || notifiedPostTimeoutSettle) {
       return;
@@ -361,13 +365,13 @@ async function waitForCodexPrompt(
           console.error("Failed to abort timed-out Codex turn:", formatError(error));
         });
       }
-      if (options?.abortGraceMs && options.onFatalRecovery) {
+      if (abortGraceMs && onFatalRecovery) {
         abortGraceTimeout = setTimeout(() => {
           if (notifiedPostTimeoutSettle || !session.isProcessing()) {
             return;
           }
-          options.onFatalRecovery?.(new CodexTurnAbortGraceError(timeoutMs, options.abortGraceMs!));
-        }, options.abortGraceMs);
+          onFatalRecovery(new CodexTurnAbortGraceError(timeoutMs, abortGraceMs));
+        }, abortGraceMs);
       }
       reject(new CodexTurnTimeoutError(timeoutMs));
     }, timeoutMs);
@@ -485,6 +489,7 @@ export function createBot(
   const durableForegroundTextPromptClaimTokens = new Map<string, string>();
   const durableForegroundTextPromptScheduleHeartbeats = new Map<string, ReturnType<typeof setInterval>>();
   const durableForegroundTextPromptReleasePromises = new Map<string, Promise<void>>();
+  const activeTelegramChatActions = new Set<string>();
   let foregroundReplayScheduling: Promise<void> | undefined;
 
   registry.onRemove((key) => {
@@ -641,7 +646,9 @@ export function createBot(
       await ctx.answerCallbackQuery();
       try {
         const keyboard = paginateKeyboard(buttons, page, prefix);
-        await bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: keyboard });
+        await withTelegramApiTimeout("Telegram editMessageReplyMarkup", (signal) =>
+          bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: keyboard }, signal),
+        );
       } catch (error) {
         if (!isMessageNotModifiedError(error)) {
           console.error(`Failed to update ${prefix} keyboard page`, error);
@@ -902,18 +909,39 @@ export function createBot(
     task: () => Promise<T>,
     messageThreadId?: number,
   ): Promise<T> => {
-    const options = messageThreadId ? { message_thread_id: messageThreadId } : {};
     const interval = setInterval(() => {
-      void bot.api.sendChatAction(chatId, action, options).catch(() => {});
+      sendChatActionBestEffort(chatId, action, messageThreadId);
     }, TYPING_INTERVAL_MS);
 
-    void bot.api.sendChatAction(chatId, action, options).catch(() => {});
+    sendChatActionBestEffort(chatId, action, messageThreadId);
 
     try {
       return await task();
     } finally {
       clearInterval(interval);
     }
+  };
+
+  const sendChatActionBestEffort = (
+    chatId: TelegramChatId,
+    action: TelegramChatAction,
+    messageThreadId?: number,
+  ): void => {
+    const key = `${chatId}:${messageThreadId ?? ""}:${action}`;
+    if (activeTelegramChatActions.has(key)) {
+      return;
+    }
+    activeTelegramChatActions.add(key);
+    const options = messageThreadId ? { message_thread_id: messageThreadId } : {};
+    void withTelegramApiTimeout("Telegram sendChatAction", (signal) =>
+      bot.api.sendChatAction(chatId, action, options, signal),
+    )
+      .catch((error) => {
+        console.warn(`Failed to send Telegram chat action: ${friendlyErrorText(error)}`);
+      })
+      .finally(() => {
+        activeTelegramChatActions.delete(key);
+      });
   };
 
   const enqueuePrompt = (
@@ -1285,17 +1313,9 @@ export function createBot(
         : undefined;
 
     const typingInterval = setInterval(() => {
-      void bot.api
-        .sendChatAction(chatId, "typing", {
-          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-        })
-        .catch(() => {});
+      sendChatActionBestEffort(chatId, "typing", messageThreadId);
     }, TYPING_INTERVAL_MS);
-    void bot.api
-      .sendChatAction(chatId, "typing", {
-        ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-      })
-      .catch(() => {});
+    sendChatActionBestEffort(chatId, "typing", messageThreadId);
 
     const stopTyping = (): void => {
       clearInterval(typingInterval);
@@ -1435,9 +1455,11 @@ export function createBot(
       }
 
       try {
-        await bot.api.editMessageReplyMarkup(chatId, responseMessageId, {
-          reply_markup: new InlineKeyboard(),
-        });
+        await withTelegramApiTimeout("Telegram editMessageReplyMarkup", (signal) =>
+          bot.api.editMessageReplyMarkup(chatId, responseMessageId!, {
+            reply_markup: new InlineKeyboard(),
+          }, signal),
+        );
       } catch (error) {
         if (!isMessageNotModifiedError(error)) {
           console.error("Failed to clear Abort button", error);
@@ -1452,7 +1474,9 @@ export function createBot(
 
       const interruptedMessageId = responseMessageId;
       try {
-        await bot.api.deleteMessage(chatId, interruptedMessageId);
+        await withTelegramApiTimeout("Telegram deleteMessage", (signal) =>
+          bot.api.deleteMessage(chatId, interruptedMessageId, signal),
+        );
         responseMessageId = undefined;
         lastRenderedText = "";
       } catch (deleteError) {
@@ -1869,18 +1893,16 @@ export function createBot(
       return;
     }
 
-    await ctx.api
-      .sendChatAction(chatId, "upload_document", {
-        ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-      })
-      .catch(() => {});
+    sendChatActionBestEffort(chatId, "upload_document", messageThreadId);
 
     let failedCount = 0;
     for (const artifact of artifacts) {
       try {
-        await ctx.api.sendDocument(chatId, new InputFile(artifact.localPath, artifact.name), {
-          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-        });
+        await withTelegramApiTimeout("Telegram sendDocument", (signal) =>
+          ctx.api.sendDocument(chatId, new InputFile(artifact.localPath, artifact.name), {
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          }, signal),
+        );
       } catch (error) {
         failedCount += 1;
         console.error(`Failed to send artifact ${artifact.name}:`, error);
@@ -3172,7 +3194,7 @@ export function createBot(
     let tempFilePath: string | undefined;
 
     try {
-      await ctx.api.sendChatAction(chatId, "upload_photo");
+      sendChatActionBestEffort(chatId, "upload_photo");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, photo.file_id, 20 * 1024 * 1024);
     } catch (error) {
       queuedPrompt.status = "skipped";
@@ -3232,7 +3254,7 @@ export function createBot(
     let tempFilePath: string | undefined;
 
     try {
-      await ctx.api.sendChatAction(chatId, "typing");
+      sendChatActionBestEffort(chatId, "typing");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, doc.file_id, config.maxFileSize);
     } catch (error) {
       queuedPrompt.status = "skipped";
@@ -3275,8 +3297,8 @@ export function createBot(
       fallbackText: `📎 Received: ${stagedFile.safeName}`,
     }).catch(() => {});
 
-    // Keep typing visible during the gap between staging and prompt execution
-    await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+    // Keep typing visible during the gap between staging and prompt execution.
+    sendChatActionBestEffort(chatId, "typing");
 
     const outDir = outboxPath(workspace, turnId);
     try {
@@ -3665,17 +3687,21 @@ async function sendTextMessage(
   const parseMode = Object.prototype.hasOwnProperty.call(options, "parseMode") ? options.parseMode : "HTML";
 
   try {
-    return await api.sendMessage(chatId, text, {
-      ...(parseMode ? { parse_mode: parseMode } : {}),
-      ...(options.messageThreadId ? { message_thread_id: options.messageThreadId } : {}),
-      reply_markup: options.replyMarkup,
-    });
-  } catch (error) {
-    if (parseMode && options.fallbackText !== undefined && isTelegramParseError(error)) {
-      return await api.sendMessage(chatId, options.fallbackText, {
+    return await withTelegramApiTimeout("Telegram sendMessage", (signal) =>
+      api.sendMessage(chatId, text, {
+        ...(parseMode ? { parse_mode: parseMode } : {}),
         ...(options.messageThreadId ? { message_thread_id: options.messageThreadId } : {}),
         reply_markup: options.replyMarkup,
-      });
+      }, signal),
+    );
+  } catch (error) {
+    if (parseMode && options.fallbackText !== undefined && isTelegramParseError(error)) {
+      return await withTelegramApiTimeout("Telegram sendMessage fallback", (signal) =>
+        api.sendMessage(chatId, options.fallbackText!, {
+          ...(options.messageThreadId ? { message_thread_id: options.messageThreadId } : {}),
+          reply_markup: options.replyMarkup,
+        }, signal),
+      );
     }
     throw error;
   }
@@ -3691,24 +3717,33 @@ async function safeEditMessage(
   const parseMode = Object.prototype.hasOwnProperty.call(options, "parseMode") ? options.parseMode : "HTML";
 
   try {
-    await bot.api.editMessageText(chatId, messageId, text, {
-      ...(parseMode ? { parse_mode: parseMode } : {}),
-      reply_markup: options.replyMarkup,
-    });
+    await withTelegramApiTimeout("Telegram editMessageText", (signal) =>
+      bot.api.editMessageText(chatId, messageId, text, {
+        ...(parseMode ? { parse_mode: parseMode } : {}),
+        reply_markup: options.replyMarkup,
+      }, signal),
+    );
   } catch (error) {
     if (isMessageNotModifiedError(error)) {
       return;
     }
 
     if (parseMode && options.fallbackText !== undefined && isTelegramParseError(error)) {
-      await bot.api.editMessageText(chatId, messageId, options.fallbackText, {
-        reply_markup: options.replyMarkup,
-      });
+      await withTelegramApiTimeout("Telegram editMessageText fallback", (signal) =>
+        bot.api.editMessageText(chatId, messageId, options.fallbackText!, {
+          reply_markup: options.replyMarkup,
+        }, signal),
+      );
       return;
     }
 
     throw error;
   }
+}
+
+async function withTelegramApiTimeout<T>(label: string, task: (signal: TelegramAbortSignal) => Promise<T>): Promise<T> {
+  const timeoutMs = getPositiveIntegerEnv("TELEGRAM_API_CALL_TIMEOUT_MS", DEFAULT_TELEGRAM_API_CALL_TIMEOUT_MS);
+  return await withTelegramAbortTimeout(timeoutMs, label, task);
 }
 
 async function downloadTelegramFile(
@@ -3721,8 +3756,8 @@ async function downloadTelegramFile(
     "TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS",
     DEFAULT_TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS,
   );
-  const file = await withAbortTimeout(timeoutMs, "Telegram file download", async () => {
-    return await api.getFile(fileId);
+  const file = await withTelegramAbortTimeout(timeoutMs, "Telegram file download", async (signal) => {
+    return await api.getFile(fileId, signal);
   });
 
   if (!file.file_path) {
@@ -3754,6 +3789,36 @@ async function withAbortTimeout<T>(
   task: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
   const controller = new AbortController();
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([task(controller.signal), timeoutPromise]);
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+async function withTelegramAbortTimeout<T>(
+  timeoutMs: number,
+  label: string,
+  task: (signal: TelegramAbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new TelegramAbortController();
   let timedOut = false;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
