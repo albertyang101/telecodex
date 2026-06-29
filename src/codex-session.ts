@@ -79,6 +79,13 @@ export type CodexPromptInput = string | { text?: string; imagePaths?: string[]; 
 type CodexConfigValue = string | number | boolean | CodexConfigValue[] | CodexConfigObject;
 type CodexConfigObject = { [key: string]: CodexConfigValue };
 
+export class CodexTurnAbortedError extends Error {
+  constructor() {
+    super("The operation was aborted");
+    this.name = "CodexTurnAbortedError";
+  }
+}
+
 export class CodexSessionService {
   private codex: Codex | null = null;
   private thread: Thread | null = null;
@@ -216,7 +223,7 @@ export class CodexSessionService {
     try {
       const { events } = await this.thread.runStreamed(this.buildSdkInput(input), { signal: controller.signal });
 
-      for await (const event of events) {
+      for await (const event of this.withAbort(events, controller.signal)) {
         this.handleThreadEvent(event);
 
         switch (event.type) {
@@ -332,6 +339,34 @@ export class CodexSessionService {
     this.abortController?.abort();
   }
 
+  private async *withAbort<T>(source: AsyncIterable<T>, signal: AbortSignal): AsyncGenerator<T> {
+    const iterator = source[Symbol.asyncIterator]();
+    let fireAbort: (() => void) | undefined;
+    const abortPromise = new Promise<never>((_, reject) => {
+      fireAbort = () => reject(new CodexTurnAbortedError());
+      if (signal.aborted) {
+        fireAbort();
+      } else {
+        signal.addEventListener("abort", fireAbort, { once: true });
+      }
+    });
+    abortPromise.catch(() => {});
+
+    try {
+      while (true) {
+        const result = await Promise.race([iterator.next(), abortPromise]);
+        if (result.done) {
+          return;
+        }
+        yield result.value;
+      }
+    } finally {
+      if (fireAbort) {
+        signal.removeEventListener("abort", fireAbort);
+      }
+      void Promise.resolve(iterator.return?.()).catch(() => {});
+    }
+  }
   async newThread(workspace?: string, model?: string): Promise<CodexSessionInfo> {
     this.ensureIdle("start a new thread");
 

@@ -5,6 +5,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 ## Features
 
 - **Per-context sessions** — each Telegram chat or forum topic gets its own independent Codex session with separate thread, model, and busy state
+- **Automatic thread rotation** — when a thread nears the configured context threshold, TeleCodex starts a fresh Codex thread and prepends a compact handoff so long-running bots keep responding
 - **Streaming responses** — agent text edits in-place as Codex generates it
 - **Full tool visibility** — shell commands, file changes, web searches, MCP calls, and error items shown with configurable verbosity
 - **Live plan display** — Codex's todo list rendered as a separate message and updated as steps complete
@@ -57,6 +58,9 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `CODEX_REASONING_EFFORT` | — | Default reasoning effort for new threads: `minimal`, `low`, `medium`, `high`, or `xhigh` |
    | `CODEX_TURN_TIMEOUT_MS` | — | Optional foreground Telegram turn lease in milliseconds; on timeout TeleCodex aborts the current Codex turn, sends a timeout reply, and drains queued follow-ups. Unset by default. |
    | `CODEX_TURN_ABORT_GRACE_MS` | — | Optional post-timeout grace in milliseconds; if an aborted foreground or mailbox turn still has not settled after this grace, TeleCodex fails loud so launchd can restart it. For mailbox turns, `MAILBOX_PROMPT_TIMEOUT_MS` alone defaults the grace to the mailbox timeout. |
+   | `CODEX_AUTO_ROTATE` | — | Enable automatic thread rotation when a turn approaches the context window threshold (`true` by default). Set to `false` for rollback or diagnosis. |
+   | `CODEX_ROTATE_THRESHOLD` | — | Fraction of the model context window that triggers rotation on the next turn (default `0.45`). Invalid values fall back to the default. |
+   | `CODEX_MODEL_CONTEXT_WINDOW` | — | Model context window used by the auto-rotation decision (default `258400`). |
    | `CODEX_SANDBOX_MODE` | — | `read-only`, `workspace-write` *(default)*, `danger-full-access` |
    | `CODEX_APPROVAL_POLICY` | — | `never` *(default)*, `on-request`, `on-failure`, `untrusted` |
    | `CODEX_LAUNCH_PROFILES_JSON` | — | Optional JSON array of named launch profiles for `/launch_profiles` |
@@ -184,6 +188,8 @@ The `SessionRegistry` maps context keys to `CodexSessionService` instances:
 - **`/attach <id>`** → resumes a specific Codex CLI thread (useful for picking up work started in the terminal)
 
 Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecodex/contexts.json` and restored on restart so threads survive bot reboots.
+
+Auto-rotation state is persisted beside it as `.telecodex/handoff-<context>.json`. This keeps the recent handoff buffer and a pending rotation flag durable across launchd restarts. New bots inherit rotation by default from source; operators can disable it with `CODEX_AUTO_ROTATE=false` without changing code.
 
 Each context has independent busy-state tracking, so a running prompt in one topic doesn't block another.
 

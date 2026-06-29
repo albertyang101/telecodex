@@ -23,6 +23,9 @@ describe("loadConfig", () => {
     delete process.env.CODEX_TURN_ABORT_GRACE_MS;
     delete process.env.CODEX_SANDBOX_MODE;
     delete process.env.CODEX_APPROVAL_POLICY;
+    delete process.env.CODEX_AUTO_ROTATE;
+    delete process.env.CODEX_ROTATE_THRESHOLD;
+    delete process.env.CODEX_MODEL_CONTEXT_WINDOW;
     delete process.env.CODEX_LAUNCH_PROFILES_JSON;
     delete process.env.CODEX_DEFAULT_LAUNCH_PROFILE;
     delete process.env.ENABLE_UNSAFE_LAUNCH_PROFILES;
@@ -180,7 +183,37 @@ describe("loadConfig", () => {
         startupTimeoutMs: 10_000,
         toolTimeoutMs: 30_000,
       },
+      autoRotate: {
+        enabled: true,
+        threshold: 0.45,
+        contextWindow: 258400,
+      },
     });
+  });
+
+  it("parses the CODEX auto-rotate knobs and falls back on invalid values", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_AUTO_ROTATE = "false";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.CODEX_ROTATE_THRESHOLD = "0.6";
+    process.env.CODEX_MODEL_CONTEXT_WINDOW = "400000";
+
+    expect((loadConfig() as any).autoRotate).toEqual({
+      enabled: false,
+      threshold: 0.6,
+      contextWindow: 400000,
+    });
+
+    process.env.CODEX_AUTO_ROTATE = "true";
+    process.env.CODEX_ROTATE_THRESHOLD = "1.5";
+    process.env.CODEX_MODEL_CONTEXT_WINDOW = "-1";
+    expect((loadConfig() as any).autoRotate).toEqual({
+      enabled: true,
+      threshold: 0.45,
+      contextWindow: 258400,
+    });
+    expect(warn).toHaveBeenCalled();
   });
 
   it("applies default values for optional fields", () => {
@@ -228,6 +261,7 @@ describe("loadConfig", () => {
     expect(config.enableTelegramReactions).toBe(false);
     expect(config.memoryTranscriptRoot).toBeUndefined();
     expect(config.mailboxBridge.promptTimeoutMs).toBeUndefined();
+    expect((config as any).autoRotate).toEqual({ enabled: true, threshold: 0.45, contextWindow: 258400 });
     expect(config.workspace).toBe(process.cwd());
   });
 

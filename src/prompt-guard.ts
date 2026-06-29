@@ -1,4 +1,5 @@
 import type { CodexPromptInput, CodexSessionInfo } from "./codex-session.js";
+import { HANDOFF_MARKER } from "./handoff-buffer.js";
 
 const TELEGRAM_REPLY_STYLE_GUARD = [
   "[TELEGRAM REPLY STYLE]",
@@ -52,12 +53,17 @@ export function withDispatcherDisciplineGuard(input: CodexPromptInput, info: Cod
   return appendPromptPostamble(prependPromptPreamble(input, preamble), CODEX_EXEC_ADAPTER_OVERRIDE);
 }
 
+export function withRotationHandoff(input: CodexPromptInput, handoff: string): CodexPromptInput {
+  return prependPromptPreamble(input, handoff);
+}
+
 export function stripVisiblePromptGuardEcho(replyText: string): string {
+  const withoutHandoff = stripRotationHandoffEcho(replyText);
   const guardHeadings = new Set(["[TELEGRAM REPLY STYLE]", "[DEVELOPER DISCIPLINE]", "[CURRENT CONTEXT]"]);
   const keptLines: string[] = [];
   let inGuardBlock = false;
 
-  for (const line of replyText.split("\n")) {
+  for (const line of withoutHandoff.split("\n")) {
     const trimmed = line.trim();
     const normalized = normalizePotentialPromptGuardLine(trimmed);
     if (guardHeadings.has(normalized)) {
@@ -86,6 +92,36 @@ export function stripVisiblePromptGuardEcho(replyText: string): string {
   return keptLines.join("\n").replace(/^\n+/, "").replace(/\n{3,}/g, "\n\n").trimEnd();
 }
 
+function stripRotationHandoffEcho(replyText: string): string {
+  const footer = "--- 交接结束，请接着回应用户接下来的消息 ---";
+  let remaining = replyText;
+
+  while (true) {
+    const start = remaining.indexOf(HANDOFF_MARKER);
+    if (start === -1) {
+      return remaining;
+    }
+
+    const afterMarker = remaining.slice(start);
+    const footerOffset = afterMarker.indexOf(footer);
+    if (footerOffset === -1) {
+      const lineEnd = remaining.indexOf(String.fromCharCode(10), start);
+      remaining = remaining.slice(0, start) + (lineEnd === -1 ? "" : remaining.slice(lineEnd + 1));
+      continue;
+    }
+
+    const end = start + footerOffset + footer.length;
+    let afterBlock = remaining.slice(end);
+    while (afterBlock.length > 0) {
+      const code = afterBlock.charCodeAt(0);
+      if (code !== 9 && code !== 10 && code !== 13 && code !== 32) {
+        break;
+      }
+      afterBlock = afterBlock.slice(1);
+    }
+    remaining = remaining.slice(0, start) + afterBlock;
+  }
+}
 function prependPromptPreamble(input: CodexPromptInput, promptPreamble: string): CodexPromptInput {
   if (typeof input === "string") {
     return `${promptPreamble}\n\n${input}`;

@@ -102,6 +102,7 @@ vi.mock("@grammyjs/auto-retry", () => ({
 vi.mock("../src/codex-auth.js", () => mockAuth);
 
 import { createBot, registerCommands } from "../src/bot.js";
+import { HANDOFF_MARKER } from "../src/handoff-buffer.js";
 import { _resetImportHook, _setDecodeHook, _setImportHook } from "../src/voice.js";
 
 describe("createBot response delivery", () => {
@@ -142,6 +143,7 @@ describe("createBot response delivery", () => {
       autoReply: false,
       maxMessagesPerTick: 1,
     },
+    autoRotate: { enabled: false, threshold: 0.45, contextWindow: 258400 },
     ...overrides,
   });
 
@@ -151,6 +153,20 @@ describe("createBot response delivery", () => {
     isProcessing: vi.fn(() => false),
     hasActiveThread: vi.fn(() => true),
     newThread: vi.fn(),
+    switchSession: vi.fn(async () => ({
+      threadId: "thread-switched",
+      workspace: "/workspace/base",
+      model: "gpt-5.5",
+      reasoningEffort: "xhigh",
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "workspace-write / never",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      unsafeLaunch: false,
+    })),
+    listWorkspaces: vi.fn(() => []),
+    listAllSessions: vi.fn(() => []),
     getCurrentWorkspace: vi.fn(() => defaultWorkspace),
     prompt: vi.fn(async (input, callbacks: CodexSessionCallbacks) => {
       await onPrompt(callbacks, input);
@@ -181,6 +197,12 @@ describe("createBot response delivery", () => {
       getOrCreate: vi.fn(async () => session),
       updateMetadata: vi.fn(),
     };
+  };
+
+  const createWorkspace = async (prefix: string): Promise<string> => {
+    const workspace = await mkdtemp(path.join(tmpdir(), prefix));
+    tempDirs.push(workspace);
+    return workspace;
   };
 
   beforeEach(() => {
@@ -232,6 +254,195 @@ describe("createBot response delivery", () => {
     } else {
       process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = originalVoiceTranscriptionTimeoutMs;
     }
+  });
+
+  it("auto-rotates to a fresh thread and injects a HANDOFF after a context-heavy turn (ALB-1011)", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("收到，我看一下");
+      callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 10 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-heavy-");
+    const bot = createBot(createConfig({ workspace, autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 } } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({ chat: { id: 4242 }, from: { id: 123 }, message: { message_id: 1, text: "第一条：部署脚本超时没兜住" }, api: bot.api });
+    expect(session.newThread).not.toHaveBeenCalled();
+
+    await textHandler({ chat: { id: 4242 }, from: { id: 123 }, message: { message_id: 2, text: "第二条：继续修" }, api: bot.api });
+    expect(session.newThread).toHaveBeenCalledTimes(1);
+    const secondInput = JSON.stringify(session.prompt.mock.calls[1][0]);
+    expect(secondInput).toContain(HANDOFF_MARKER);
+    expect(secondInput).toContain("第一条：部署脚本超时没兜住");
+    expect(secondInput).toContain("第二条：继续修");
+  });
+
+  it("does not rotate while turns stay light (ALB-1011)", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onTurnComplete?.({ inputTokens: 40000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-light-");
+    const bot = createBot(createConfig({ workspace, autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 } } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({ chat: { id: 7373 }, from: { id: 123 }, message: { message_id: 1, text: "light-1" }, api: bot.api });
+    await textHandler({ chat: { id: 7373 }, from: { id: 123 }, message: { message_id: 2, text: "light-2" }, api: bot.api });
+    await textHandler({ chat: { id: 7373 }, from: { id: 123 }, message: { message_id: 3, text: "light-3" }, api: bot.api });
+    expect(session.newThread).not.toHaveBeenCalled();
+  });
+
+  it("never rotates when auto-rotate is disabled, even after a heavy turn (ALB-1011)", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onTurnComplete?.({ inputTokens: 200000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-disabled-");
+    const bot = createBot(createConfig({ workspace, autoRotate: { enabled: false, threshold: 0.45, contextWindow: 258400 } } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({ chat: { id: 8484 }, from: { id: 123 }, message: { message_id: 1, text: "heavy-1" }, api: bot.api });
+    await textHandler({ chat: { id: 8484 }, from: { id: 123 }, message: { message_id: 2, text: "heavy-2" }, api: bot.api });
+    expect(session.newThread).not.toHaveBeenCalled();
+  });
+
+  it("keeps the pending rotation alive when newThread() fails, so a later turn still rotates (ALB-1011)", async () => {
+    let inputTokens = 130000;
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onTurnComplete?.({ inputTokens, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    session.newThread.mockRejectedValueOnce(new Error("transient newThread failure")).mockResolvedValue(session.getInfo());
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-retry-");
+    const bot = createBot(createConfig({ workspace, autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 } } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({ chat: { id: 5151 }, from: { id: 123 }, message: { message_id: 1, text: "第一条：重活把上下文顶上去" }, api: bot.api });
+    expect(session.newThread).not.toHaveBeenCalled();
+
+    inputTokens = 40000;
+    await textHandler({ chat: { id: 5151 }, from: { id: 123 }, message: { message_id: 2, text: "第二条：轻活" }, api: bot.api });
+    expect(session.newThread).toHaveBeenCalledTimes(1);
+    const turn2Input = JSON.stringify(session.prompt.mock.calls[1][0]);
+    expect(turn2Input).not.toContain(HANDOFF_MARKER);
+
+    await textHandler({ chat: { id: 5151 }, from: { id: 123 }, message: { message_id: 3, text: "第三条：还是轻活" }, api: bot.api });
+    expect(session.newThread).toHaveBeenCalledTimes(2);
+    const turn3Input = JSON.stringify(session.prompt.mock.calls[2][0]);
+    expect(turn3Input).toContain(HANDOFF_MARKER);
+    expect(turn3Input).toContain("第一条：重活把上下文顶上去");
+  });
+
+  it("keeps a pending rotation when the rotated prompt fails after newThread succeeds (ALB-1011)", async () => {
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onAgentMessage?.("heavy ok");
+        callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 5 });
+        callbacks.onAgentEnd();
+        return;
+      }
+      if (promptCount === 2) {
+        throw new Error("post-rotation prompt failure");
+      }
+      callbacks.onAgentMessage?.("recovered");
+      callbacks.onTurnComplete?.({ inputTokens: 40000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-prompt-fail-");
+    const bot = createBot(createConfig({ workspace, autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 } } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({ chat: { id: 6161 }, from: { id: 123 }, message: { message_id: 1, text: "第一条：重活" }, api: bot.api });
+    await textHandler({ chat: { id: 6161 }, from: { id: 123 }, message: { message_id: 2, text: "第二条：旋转后失败" }, api: bot.api });
+    expect(session.newThread).toHaveBeenCalledTimes(1);
+
+    await textHandler({ chat: { id: 6161 }, from: { id: 123 }, message: { message_id: 3, text: "第三条：应该重试 handoff" }, api: bot.api });
+    expect(session.newThread).toHaveBeenCalledTimes(2);
+    const turn3Input = JSON.stringify(session.prompt.mock.calls[2][0]);
+    expect(turn3Input).toContain(HANDOFF_MARKER);
+    expect(turn3Input).toContain("第一条：重活");
+  });
+
+  it("clears pending rotation when the user manually switches sessions (ALB-1011)", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-switch-clear-");
+    const bot = createBot(createConfig({ workspace, autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 } } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const switchHandler = [...bot.__handlers.commands.entries()].find(([key]: [unknown, unknown]) => Array.isArray(key) && key.includes("switch"))?.[1];
+    expect(switchHandler).toBeTypeOf("function");
+
+    await textHandler({ chat: { id: 6262 }, from: { id: 123 }, message: { message_id: 1, text: "第一条：触发 pending" }, api: bot.api });
+    await switchHandler({ chat: { id: 6262 }, from: { id: 123 }, message: { message_id: 2, text: "/switch thread-other" }, api: bot.api });
+    await textHandler({ chat: { id: 6262 }, from: { id: 123 }, message: { message_id: 3, text: "切换后继续" }, api: bot.api });
+
+    expect(session.switchSession).toHaveBeenCalledWith("thread-other");
+    expect(session.newThread).not.toHaveBeenCalled();
+    const turn2Input = JSON.stringify(session.prompt.mock.calls[1][0]);
+    expect(turn2Input).not.toContain(HANDOFF_MARKER);
+  });
+
+  it("strips echoed rotation handoff blocks from visible Telegram replies (ALB-1011)", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(HANDOFF_MARKER + "\n[用户] 旧内容\n--- 交接结束，请接着回应用户接下来的消息 ---\n\n真正回复");
+      callbacks.onAgentMessage?.(HANDOFF_MARKER + "\n[用户] 旧内容\n--- 交接结束，请接着回应用户接下来的消息 ---\n\n真正回复");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({ chat: { id: 6363 }, from: { id: 123 }, message: { message_id: 1, text: "hi" }, api: bot.api });
+
+    const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(visible).toContain("真正回复");
+    expect(visible).not.toContain(HANDOFF_MARKER);
+    expect(visible).not.toContain("旧内容");
+  });
+
+  it("loads a persisted pending rotation after restart and consumes it on the next turn (ALB-1011)", async () => {
+    const workspace = await createWorkspace("telecodex-rotation-restart-");
+    const firstSession = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("heavy ok");
+      callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const firstBot = createBot(createConfig({ workspace, autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 } } as any), createRegistry(firstSession) as any) as any;
+    const firstTextHandler = firstBot.__handlers.on.get("message:text");
+    await firstTextHandler({ chat: { id: 6464 }, from: { id: 123 }, message: { message_id: 1, text: "第一条：重启前重活" }, api: firstBot.api });
+
+    const secondSession = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("after restart");
+      callbacks.onTurnComplete?.({ inputTokens: 40000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const secondBot = createBot(createConfig({ workspace, autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 } } as any), createRegistry(secondSession) as any) as any;
+    const secondTextHandler = secondBot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await secondTextHandler({ chat: { id: 6464 }, from: { id: 123 }, message: { message_id: 2, text: "重启后继续" }, api: secondBot.api });
+
+    expect(secondSession.newThread).toHaveBeenCalledTimes(1);
+    const input = JSON.stringify(secondSession.prompt.mock.calls[0][0]);
+    expect(input).toContain(HANDOFF_MARKER);
+    expect(input).toContain("第一条：重启前重活");
   });
 
   it("shows the active voice backend separately from available backends", async () => {

@@ -955,6 +955,29 @@ describe("CodexSessionService", () => {
     expect(service.isProcessing()).toBe(false);
   });
 
+  it("clears isProcessing on abort even when the SDK stream ignores the abort signal (ALB-1011 soft-wedge)", async () => {
+    const service = await CodexSessionService.create(createConfig());
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+
+    thread.runStreamed.mockImplementationOnce(async () => ({
+      events: (async function* () {
+        await new Promise<void>(() => {});
+        yield { type: "turn.completed", usage };
+      })(),
+    }));
+
+    const promptPromise = service.prompt("stuck", callbacks);
+    promptPromise.catch(() => {});
+    await Promise.resolve();
+    expect(service.isProcessing()).toBe(true);
+
+    await service.abort();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(service.isProcessing()).toBe(false);
+  });
+
   it("creates a new thread in a different workspace", async () => {
     const service = await CodexSessionService.create(createConfig());
     const codexInstance = mockState.codexInstances[0];

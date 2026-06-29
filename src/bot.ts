@@ -38,7 +38,9 @@ import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
-import { stripVisiblePromptGuardEcho, withTelegramReplyStyleGuard } from "./prompt-guard.js";
+import { stripVisiblePromptGuardEcho, withRotationHandoff, withTelegramReplyStyleGuard } from "./prompt-guard.js";
+import { clearChatState, loadChatState, saveChatState } from "./handoff-store.js";
+import { type ChatRotationState, type RotationConfig, recordTurn, takeRotationHandoff } from "./thread-rotation.js";
 import { SessionRegistry } from "./session-registry.js";
 import { getTranscriptionBackendStatus, transcribeAudio } from "./voice.js";
 
@@ -724,6 +726,38 @@ export function createBot(
     }
   };
 
+  const rotationStates = new Map<string, ChatRotationState>();
+  const rotationStateDir = path.join(config.workspace, ".telecodex");
+  const rotationCfg: RotationConfig = {
+    enabled: config.autoRotate.enabled,
+    threshold: config.autoRotate.threshold,
+    contextWindow: config.autoRotate.contextWindow,
+  };
+  const getRotationState = (key: string): ChatRotationState => {
+    let state = rotationStates.get(key);
+    if (!state) {
+      state = loadChatState(rotationStateDir, key);
+      rotationStates.set(key, state);
+    }
+    return state;
+  };
+  const setRotationState = (key: string, state: ChatRotationState): void => {
+    rotationStates.set(key, state);
+    try {
+      saveChatState(rotationStateDir, key, state);
+    } catch (error) {
+      console.error("Failed to persist rotation state:", formatError(error));
+    }
+  };
+  const clearRotationState = (key: string): void => {
+    rotationStates.delete(key);
+    try {
+      clearChatState(rotationStateDir, key);
+    } catch (error) {
+      console.error("Failed to clear rotation state:", formatError(error));
+    }
+  };
+
   const ensureActiveThread = async (
     ctx: Context,
     contextKey: TelegramContextKey,
@@ -1223,7 +1257,29 @@ export function createBot(
         return;
       }
 
-      if (!(await ensureActiveThread(ctx, contextKey, session))) {
+      let rotationHandoff: string | null = null;
+      let rotationStateAfterSuccessfulHandoff: ChatRotationState | null = null;
+      if (rotationCfg.enabled) {
+        const rotationStateBeforeRotation = getRotationState(contextKey);
+        const takenRotation = takeRotationHandoff(rotationStateBeforeRotation, rotationCfg);
+        if (takenRotation.handoff) {
+          try {
+            await session.newThread();
+            updateSessionMetadata(contextKey, session);
+            rotationStateAfterSuccessfulHandoff = takenRotation.state;
+            rotationHandoff = takenRotation.handoff;
+            console.error("Auto-rotated Codex thread for " + contextKey + " on context pressure (ALB-1011).");
+          } catch (error) {
+            console.error("Auto-rotation newThread failed; continuing on the existing thread:", formatError(error));
+            setRotationState(contextKey, rotationStateBeforeRotation);
+            if (!(await ensureActiveThread(ctx, contextKey, session))) {
+              return;
+            }
+          }
+        } else if (!(await ensureActiveThread(ctx, contextKey, session))) {
+          return;
+        }
+      } else if (!(await ensureActiveThread(ctx, contextKey, session))) {
         return;
       }
 
@@ -1231,7 +1287,14 @@ export function createBot(
         console.error("Failed to append memory user turn:", error instanceof Error ? error.message : String(error));
       });
 
-      await session.prompt(withTelegramReplyStyleGuard(userInput, session.getInfo()), callbacks);
+      // ALB-1205: live prod path runs prompts unbounded (no-turn-timeout, 2026-06-29
+      // live decision preserved); rotation handoff still prepends on a rotated turn.
+      await session.prompt(
+        rotationHandoff
+          ? withRotationHandoff(withTelegramReplyStyleGuard(userInput, session.getInfo()), rotationHandoff)
+          : withTelegramReplyStyleGuard(userInput, session.getInfo()),
+        callbacks,
+      );
       updateSessionMetadata(contextKey, session);
       const finalVisibleText = await ensureFinalized();
       await appendMemoryTranscriptTurn(
@@ -1244,6 +1307,16 @@ export function createBot(
       ).catch((error) => {
         console.error("Failed to append memory bot turn:", error instanceof Error ? error.message : String(error));
       });
+      if (rotationCfg.enabled) {
+        setRotationState(
+          contextKey,
+          recordTurn(
+            rotationStateAfterSuccessfulHandoff ?? getRotationState(contextKey),
+            { userText: userVisibleText, assistantText: finalVisibleText, lastInputTokens: lastTurnUsage?.inputTokens },
+            rotationCfg,
+          ),
+        );
+      }
     } catch (error) {
       stopTyping();
       clearFlushTimer();
@@ -1608,6 +1681,7 @@ export function createBot(
       try {
         const info = await session.newThread();
         updateSessionMetadata(contextKey, session);
+        clearRotationState(contextKey);
         const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
         const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
         const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
@@ -1897,6 +1971,7 @@ export function createBot(
     try {
       const info = await session.switchSession(threadId);
       updateSessionMetadata(contextKey, session);
+      clearRotationState(contextKey);
       const html = `<b>Attached to thread.</b>\n\n${renderSessionInfoHTML(info)}`;
       const plain = `Attached to thread.\n\n${renderSessionInfoPlain(info)}`;
       await safeReply(ctx, html, { fallbackText: plain });
@@ -1937,6 +2012,7 @@ export function createBot(
       try {
         const info = await session.switchSession(threadId);
         updateSessionMetadata(contextKey, session);
+        clearRotationState(contextKey);
         const html = `<b>Switched thread.</b>\n\n${renderSessionInfoHTML(info)}`;
         const plain = `Switched thread.\n\n${renderSessionInfoPlain(info)}`;
         await safeReply(ctx, html, { fallbackText: plain });
@@ -2143,6 +2219,7 @@ export function createBot(
     try {
       const info = await session.switchSession(threadId);
       updateSessionMetadata(contextKey, session);
+      clearRotationState(contextKey);
       const plainText = `Switched session.\n\n${renderSessionInfoPlain(info)}`;
       const html = `<b>Switched session.</b>\n\n${renderSessionInfoHTML(info)}`;
 
@@ -2200,6 +2277,7 @@ export function createBot(
     try {
       const info = await session.newThread(workspace);
       updateSessionMetadata(contextKey, session);
+      clearRotationState(contextKey);
       const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
       const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
       const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;

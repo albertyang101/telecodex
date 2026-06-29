@@ -13,6 +13,7 @@ import {
   type CodexLaunchProfile,
   type CodexSandboxMode,
 } from "./codex-launch.js";
+import { DEFAULT_CONTEXT_WINDOW, DEFAULT_ROTATE_THRESHOLD } from "./rotation-policy.js";
 
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
 export type CodexReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -52,6 +53,12 @@ export interface LinearControlConfig {
   toolTimeoutMs: number;
 }
 
+export interface AutoRotateConfig {
+  enabled: boolean;
+  threshold: number;
+  contextWindow: number;
+}
+
 export interface TeleCodexConfig {
   telegramBotToken: string;
   telegramAllowedUserIds: number[];
@@ -77,6 +84,7 @@ export interface TeleCodexConfig {
   mailboxBridge: MailboxBridgeConfig;
   telegramTransport: TelegramTransportConfig;
   linearControl: LinearControlConfig;
+  autoRotate: AutoRotateConfig;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -125,6 +133,7 @@ export function loadConfig(): TeleCodexConfig {
   const mailboxBridge = parseMailboxBridgeConfig();
   const telegramTransport = parseTelegramTransportConfig();
   const linearControl = parseLinearControlConfig();
+  const autoRotate = parseAutoRotateConfig();
   validateMcpServerNames(telegramTransport, linearControl);
   validateMailboxBridgeLaunch(mailboxBridge, launchProfiles, defaultLaunchProfileId);
 
@@ -153,6 +162,7 @@ export function loadConfig(): TeleCodexConfig {
     mailboxBridge,
     telegramTransport,
     linearControl,
+    autoRotate,
   };
 }
 
@@ -290,6 +300,36 @@ function parseBooleanEnv(raw: string | undefined, defaultValue: boolean): boolea
 
   console.warn(`Invalid boolean env value: "${raw}". Falling back to ${defaultValue}.`);
   return defaultValue;
+}
+
+function parseRatioEnv(raw: string | undefined, defaultValue: number, name: string): number {
+  if (!raw) {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+    console.warn(name + " must be a fraction in (0, 1]. Falling back to " + defaultValue + ".");
+    return defaultValue;
+  }
+
+  return parsed;
+}
+
+function parseAutoRotateConfig(): AutoRotateConfig {
+  return {
+    enabled: parseBooleanEnv(optionalString(process.env.CODEX_AUTO_ROTATE), true),
+    threshold: parseRatioEnv(
+      optionalString(process.env.CODEX_ROTATE_THRESHOLD),
+      DEFAULT_ROTATE_THRESHOLD,
+      "CODEX_ROTATE_THRESHOLD",
+    ),
+    contextWindow: parsePositiveIntegerEnv(
+      optionalString(process.env.CODEX_MODEL_CONTEXT_WINDOW),
+      DEFAULT_CONTEXT_WINDOW,
+      "CODEX_MODEL_CONTEXT_WINDOW",
+    ),
+  };
 }
 
 function parseMaxFileSize(raw: string | undefined): number {
