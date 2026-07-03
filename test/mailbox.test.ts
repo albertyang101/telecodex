@@ -6,6 +6,7 @@ import { describe, expect, it, vi, afterEach, beforeEach } from "vitest";
 
 import type { CodexSessionCallbacks } from "../src/codex-session.js";
 import type { TeleCodexConfig } from "../src/config.js";
+import { HANDOFF_MARKER } from "../src/handoff-buffer.js";
 import { runMailboxDeliveryOnce, startMailboxBridge } from "../src/mailbox.js";
 
 describe("mailbox bridge", () => {
@@ -1130,9 +1131,100 @@ describe("mailbox bridge", () => {
     const replies = await readdir(path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox"));
     expect(replies).toHaveLength(1);
   });
+
+  it("rotates the mailbox thread when a turn goes heavy and snapshots the still-queued messages (ALB-1205)", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    for (const [msgId, subject] of [
+      ["mbx-a", "重活A"],
+      ["mbx-b", "接着B"],
+      ["mbx-c", "排队C"],
+    ] as const) {
+      writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId, subject, body: subject });
+    }
+
+    let turn = 0;
+    const session = createSession(async (_input, callbacks) => {
+      turn += 1;
+      callbacks.onAgentMessage?.(`ok-${turn}`);
+      // Turn 1 crosses the rotate threshold (130000/258400 ≈ 0.50 ≥ 0.45).
+      callbacks.onTurnComplete?.({ inputTokens: turn === 1 ? 130000 : 40000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const result = await runMailboxDeliveryOnce(
+      createConfig({
+        personasRoot,
+        workspace,
+        maxMessagesPerTick: 3,
+        autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 } as never,
+      }),
+      registry as never,
+    );
+
+    expect(result.processed).toBe(3);
+    // Only message B rotates (turn 1 has no pending rotation yet).
+    expect(session.newThread).toHaveBeenCalledTimes(1);
+    const rotatedInput = JSON.stringify(session.prompt.mock.calls[1]![0]);
+    expect(rotatedInput).toContain(HANDOFF_MARKER);
+    expect(rotatedInput).toContain("未答消息");
+    // Message C is still queued behind B at the instant B rotates.
+    expect(rotatedInput).toContain("排队C");
+  });
+
+  it("carries a 最后断点 into the next mailbox rotation when a heavy turn times out (ALB-1205)", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const rotateCfg = {
+      personasRoot,
+      workspace,
+      promptTimeoutMs: 40,
+      autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 } as never,
+    };
+
+    let turn = 0;
+    const session = createSession(async (_input, callbacks) => {
+      turn += 1;
+      if (turn === 2) {
+        // The rotated turn hangs → the mailbox turn timeout aborts it.
+        await new Promise(() => {});
+        return;
+      }
+      callbacks.onAgentMessage?.(`ok-${turn}`);
+      callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Tick 1: message A completes heavy → last known ratio ≈ 0.50, pending rotation persisted.
+    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-1", subject: "重活一", body: "重活一" });
+    await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+
+    // Tick 2: message B rotates onto a fresh thread, then times out mid-answer.
+    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-2", subject: "会超时的二", body: "会超时的二" });
+    await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    expect(session.abort).toHaveBeenCalled();
+
+    // Tick 3: message C rotates again and its HANDOFF carries the interrupted turn.
+    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-3", subject: "续上的三", body: "续上的三" });
+    await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+
+    const lastPrompt = JSON.stringify(session.prompt.mock.calls.at(-1)![0]);
+    expect(lastPrompt).toContain(HANDOFF_MARKER);
+    expect(lastPrompt).toContain("最后断点");
+    expect(lastPrompt).toContain("会超时的二");
+  });
 });
 
-function createConfig(overrides: { personasRoot: string; workspace: string }): TeleCodexConfig {
+function createConfig(overrides: {
+  personasRoot: string;
+  workspace: string;
+  autoRotate?: TeleCodexConfig["autoRotate"];
+  maxMessagesPerTick?: number;
+  promptTimeoutMs?: number;
+}): TeleCodexConfig {
   return {
     telegramBotToken: "bot-token",
     telegramAllowedUserIds: [123],
@@ -1150,6 +1242,7 @@ function createConfig(overrides: { personasRoot: string; workspace: string }): T
     showTurnTokenUsage: false,
     enableTelegramLogin: false,
     enableTelegramReactions: false,
+    ...(overrides.autoRotate ? { autoRotate: overrides.autoRotate } : {}),
     mailboxBridge: {
       enabled: true,
       persona: "albert-v3",
@@ -1159,11 +1252,11 @@ function createConfig(overrides: { personasRoot: string; workspace: string }): T
       pollMs: 500,
       fullScanMs: 10_000,
       autoReply: true,
-      maxMessagesPerTick: 1,
+      maxMessagesPerTick: overrides.maxMessagesPerTick ?? 1,
       minSentAt: undefined,
-      promptTimeoutMs: undefined,
+      promptTimeoutMs: overrides.promptTimeoutMs,
     },
-  };
+  } as TeleCodexConfig;
 }
 
 function createSession(onPrompt: (input: unknown, callbacks: CodexSessionCallbacks) => Promise<void>) {

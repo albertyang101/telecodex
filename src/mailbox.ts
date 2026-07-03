@@ -5,8 +5,17 @@ import path from "node:path";
 import type { CodexPromptInput, CodexSessionCallbacks, CodexSessionService } from "./codex-session.js";
 import type { MailboxBridgeConfig, TeleCodexConfig } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
-import { stripVisiblePromptGuardEcho, withDispatcherDisciplineGuard } from "./prompt-guard.js";
+import { loadChatState, saveChatState } from "./handoff-store.js";
+import { stripVisiblePromptGuardEcho, withDispatcherDisciplineGuard, withRotationHandoff } from "./prompt-guard.js";
 import type { SessionRegistry } from "./session-registry.js";
+import {
+  type ChatRotationState,
+  type RotationConfig,
+  emptyChatState,
+  recordInterruptedTurn,
+  recordTurn,
+  takeRotationHandoff,
+} from "./thread-rotation.js";
 
 const MAILBOX_REL = ["_shared", "memory", "mailbox"] as const;
 const BRIDGE_DELIVERED_BY = "telecodex-mailbox-bridge";
@@ -89,33 +98,97 @@ export async function runMailboxDeliveryOnce(
   let replied = 0;
   let skipped = historicalSkipped;
 
-  for (const message of messages) {
+  // Auto-rotation for the mailbox thread (ALB-1205). Worker bots (Theo/Ada) run
+  // most of their turns through this bridge on a thread that persists across
+  // ticks, so this is the main path where context grows to the ceiling. State is
+  // persisted per mailbox contextKey and survives ticks / restarts.
+  const rotationCfg = mailboxRotationConfig(config);
+  const rotationStateDir = path.join(config.workspace, ".telecodex");
+  let rotationState: ChatRotationState = rotationCfg.enabled
+    ? loadChatState(rotationStateDir, contextKey)
+    : emptyChatState();
+  const persistRotationState = (): void => {
+    if (!rotationCfg.enabled) {
+      return;
+    }
+    try {
+      saveChatState(rotationStateDir, contextKey, rotationState);
+    } catch (error) {
+      console.error("mailbox rotation state persist failed:", error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]!;
     if (session.isProcessing()) {
       skipped += 1;
       break;
     }
 
-    if (!session.hasActiveThread()) {
+    // Rotate before the turn when a prior turn crossed the threshold; otherwise
+    // keep the existing thread (opening one only if none is active yet).
+    let rotationHandoff: string | null = null;
+    if (rotationCfg.enabled) {
+      const unanswered = messages.slice(index + 1).map(mailboxTurnDescriptor);
+      const taken = takeRotationHandoff(rotationState, rotationCfg, { unanswered });
+      if (taken.handoff) {
+        try {
+          await session.newThread();
+          rotationState = taken.state;
+          rotationHandoff = taken.handoff;
+          persistRotationState();
+        } catch (error) {
+          console.error(
+            "mailbox auto-rotation newThread failed; continuing on the existing thread:",
+            error instanceof Error ? error.message : String(error),
+          );
+          if (!session.hasActiveThread()) {
+            await session.newThread();
+          }
+        }
+      } else if (!session.hasActiveThread()) {
+        await session.newThread();
+      }
+    } else if (!session.hasActiveThread()) {
       await session.newThread();
     }
 
     let finalText: string;
+    let turnUsage: { inputTokens: number } | undefined;
     try {
-      finalText = await promptMailboxMessage(
+      const outcome = await promptMailboxMessage(
         session,
         message,
         settings.promptTimeoutMs,
         abortGraceMs,
+        rotationHandoff,
       );
+      finalText = outcome.text;
+      turnUsage = outcome.usage;
     } catch (error) {
       if (!(error instanceof MailboxPromptTimeoutError)) {
         throw error;
+      }
+      // A turn cut short by the timeout on an already-heavy thread becomes a
+      // rotation breakpoint: the next thread's HANDOFF resumes it (ALB-1205).
+      if (rotationCfg.enabled) {
+        rotationState = recordInterruptedTurn(rotationState, mailboxTurnDescriptor(message), rotationCfg);
+        persistRotationState();
       }
       await quarantineTimedOutMailboxMessage(settings, statePath, seen, message);
       error.startAbortGrace(onFatalRecovery);
       registry.updateMetadata(contextKey, session);
       skipped += 1;
       break;
+    }
+
+    if (rotationCfg.enabled) {
+      rotationState = recordTurn(
+        rotationState,
+        { userText: mailboxTurnDescriptor(message), assistantText: finalText, lastInputTokens: turnUsage?.inputTokens },
+        rotationCfg,
+      );
+      persistRotationState();
     }
 
     if (shouldWriteReply(settings, message, finalText)) {
@@ -387,9 +460,11 @@ async function promptMailboxMessage(
   message: MailboxMessage,
   timeoutMs?: number,
   abortGraceMs?: number,
-): Promise<string> {
+  rotationHandoff?: string | null,
+): Promise<{ text: string; usage?: { inputTokens: number } }> {
   let accumulatedText = "";
   let completedAgentText = "";
+  let lastUsage: { inputTokens: number } | undefined;
   const callbacks: CodexSessionCallbacks = {
     onTextDelta: (delta) => {
       accumulatedText += delta;
@@ -400,15 +475,34 @@ async function promptMailboxMessage(
     onAgentMessage: (text) => {
       completedAgentText = text;
     },
+    onTurnComplete: (usage) => {
+      lastUsage = usage;
+    },
     onAgentEnd: () => undefined,
   };
 
+  const basePrompt = withDispatcherDisciplineGuard(renderCodexMailboxPrompt(message), session.getInfo());
   const promptPromise = session.prompt(
-    withDispatcherDisciplineGuard(renderCodexMailboxPrompt(message), session.getInfo()),
+    rotationHandoff ? withRotationHandoff(basePrompt, rotationHandoff) : basePrompt,
     callbacks,
   );
   await awaitMailboxPrompt(session, promptPromise, timeoutMs, abortGraceMs);
-  return stripVisiblePromptGuardEcho(completedAgentText || accumulatedText);
+  return { text: stripVisiblePromptGuardEcho(completedAgentText || accumulatedText), usage: lastUsage };
+}
+
+/** Compact one-line descriptor of a mailbox turn for the rotation buffer/HANDOFF. */
+function mailboxTurnDescriptor(message: MailboxMessage): string {
+  return `[内部信] ${message.from} → ${message.subject}`;
+}
+
+function mailboxRotationConfig(config: TeleCodexConfig): RotationConfig {
+  const rotate = config.autoRotate;
+  return {
+    enabled: rotate?.enabled ?? false,
+    threshold: rotate?.threshold ?? 0,
+    hardCap: rotate?.hardCap,
+    contextWindow: rotate?.contextWindow ?? 0,
+  };
 }
 
 async function awaitMailboxPrompt(
