@@ -90,6 +90,69 @@ describe("handoff-store", () => {
       }
     });
 
+    it("round-trips the ALB-1205 fields (pendingMandatory / interruptedTurn / lastKnownRatio)", () => {
+      const dir = tmp();
+      try {
+        const state = {
+          buffer: [{ role: "user" as const, text: "重活" }],
+          pendingRotation: true,
+          pendingMandatory: true,
+          interruptedTurn: "这条被打断了",
+          lastKnownRatio: 0.62,
+        };
+        saveChatState(dir, "6872058088", state);
+        const loaded = loadChatState(dir, "6872058088");
+        expect(loaded.pendingMandatory).toBe(true);
+        expect(loaded.interruptedTurn).toBe("这条被打断了");
+        expect(loaded.lastKnownRatio).toBeCloseTo(0.62, 5);
+        expect(loaded.buffer).toEqual(state.buffer);
+        expect(loaded.pendingRotation).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reads a pre-ALB-1205 JSON without the new fields as false/undefined", () => {
+      const dir = tmp();
+      try {
+        writeFileSync(
+          handoffStatePath(dir, "legacy"),
+          JSON.stringify({ buffer: [{ role: "user", text: "旧数据" }], pendingRotation: true }),
+          "utf8",
+        );
+        const loaded = loadChatState(dir, "legacy");
+        expect(loaded.pendingRotation).toBe(true);
+        expect(loaded.pendingMandatory).toBeFalsy();
+        expect(loaded.interruptedTurn).toBeUndefined();
+        expect(loaded.lastKnownRatio).toBeUndefined();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("drops malformed ALB-1205 field values instead of throwing", () => {
+      const dir = tmp();
+      try {
+        writeFileSync(
+          handoffStatePath(dir, "bad"),
+          JSON.stringify({
+            buffer: [],
+            pendingRotation: false,
+            pendingMandatory: "yes",
+            interruptedTurn: 42,
+            lastKnownRatio: "0.62",
+          }),
+          "utf8",
+        );
+        const loaded = loadChatState(dir, "bad");
+        expect(loaded.pendingMandatory).toBeFalsy();
+        expect(loaded.interruptedTurn).toBeUndefined();
+        expect(loaded.lastKnownRatio).toBeUndefined();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("writes atomically (no leftover .tmp file)", () => {
       const dir = tmp();
       try {

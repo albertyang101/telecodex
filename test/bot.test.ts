@@ -445,6 +445,109 @@ describe("createBot response delivery", () => {
     expect(input).toContain("第一条：重启前重活");
   });
 
+  it("retries newThread once on a mandatory (hard-cap) rotation and refuses the turn when both attempts fail (ALB-1205)", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onTurnComplete?.({ inputTokens: 200000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    session.newThread
+      .mockRejectedValueOnce(new Error("newThread failure #1"))
+      .mockRejectedValueOnce(new Error("newThread failure #2"))
+      .mockResolvedValue(session.getInfo());
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-hardcap-");
+    const bot = createBot(
+      createConfig({
+        workspace,
+        autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 },
+      } as any),
+      registry as any,
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Turn 1 crosses the hard cap (200000/258400 ≈ 0.77 ≥ 0.60) → mandatory pending.
+    await textHandler({ chat: { id: 9191 }, from: { id: 123 }, message: { message_id: 1, text: "第一条：把上下文顶过硬上限" }, api: bot.api });
+    expect(session.newThread).not.toHaveBeenCalled();
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+
+    // Turn 2: mandatory rotation → newThread tried twice, both fail → the turn is
+    // refused (no prompt on the over-cap thread) and the user is told.
+    await textHandler({ chat: { id: 9191 }, from: { id: 123 }, message: { message_id: 2, text: "第二条：这条不该在超限线程上跑" }, api: bot.api });
+    expect(session.newThread).toHaveBeenCalledTimes(2);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const sent = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(sent).toContain("硬上限");
+
+    // Turn 3: newThread recovers → the preserved mandatory pending finally rotates
+    // with a hard-cap HANDOFF carrying the earlier exchange.
+    await textHandler({ chat: { id: 9191 }, from: { id: 123 }, message: { message_id: 3, text: "第三条：现在应该翻页了" }, api: bot.api });
+    expect(session.newThread).toHaveBeenCalledTimes(3);
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    const rotatedInput = JSON.stringify(session.prompt.mock.calls[1][0]);
+    expect(rotatedInput).toContain(HANDOFF_MARKER);
+    expect(rotatedInput).toContain("硬上限");
+    expect(rotatedInput).toContain("第一条：把上下文顶过硬上限");
+  });
+
+  it("snapshots queued unanswered messages into the rotation HANDOFF (ALB-1205)", async () => {
+    let releaseTurn1!: () => void;
+    const turn1Gate = new Promise<void>((resolve) => {
+      releaseTurn1 = resolve;
+    });
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        await turn1Gate;
+        callbacks.onAgentMessage?.("第一条答完");
+        callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 5 });
+        callbacks.onAgentEnd();
+        return;
+      }
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onTurnComplete?.({ inputTokens: 40000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-unanswered-");
+    const bot = createBot(
+      createConfig({
+        workspace,
+        autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 },
+      } as any),
+      registry as any,
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Turn 1 hangs; messages 2 and 3 arrive meanwhile and are queued.
+    const turn1 = textHandler({ chat: { id: 9292 }, from: { id: 123 }, message: { message_id: 1, text: "第一条：慢活" }, api: bot.api });
+    await textHandler({ chat: { id: 9292 }, from: { id: 123 }, message: { message_id: 2, text: "第二条：排队中" }, api: bot.api });
+    await textHandler({ chat: { id: 9292 }, from: { id: 123 }, message: { message_id: 3, text: "第三条：也在排队" }, api: bot.api });
+
+    // Turn 1 completes heavy → pending rotation. Draining then runs message 2,
+    // which rotates; message 3 is still queued at that instant and must appear
+    // in the HANDOFF's unanswered section.
+    releaseTurn1();
+    await turn1;
+
+    expect(session.newThread).toHaveBeenCalledTimes(1);
+    const rotatedInput = JSON.stringify(session.prompt.mock.calls[1][0]);
+    expect(rotatedInput).toContain(HANDOFF_MARKER);
+    expect(rotatedInput).toContain("未答消息");
+    expect(rotatedInput).toContain("第三条：也在排队");
+  });
+
+  // ALB-1205 SENTINEL: the canonical "interrupted turn (最后断点) on a Telegram
+  // turn-timeout abort" test was dropped when replaying onto the live baseline.
+  // The live Telegram path is no-turn-timeout (2026-06-29 live decision) — there is
+  // no codexTurnTimeoutMs / CodexTurnTimeoutError on this path, so the abort that
+  // this test simulated cannot occur. The interrupted-turn feature lives on the
+  // mailbox path (worker bots run there and keep their own promptTimeoutMs); its
+  // coverage is in test/mailbox.test.ts.
+
   it("shows the active voice backend separately from available backends", async () => {
     process.env.VOICE_TRANSCRIPTION_BACKEND = "openai";
     process.env.OPENAI_API_KEY = "sk-test";

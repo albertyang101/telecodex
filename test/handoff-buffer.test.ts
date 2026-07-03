@@ -5,6 +5,7 @@ import {
   DEFAULT_MAX_HANDOFF_CHARS,
   DEFAULT_MAX_HANDOFF_ENTRIES,
   HANDOFF_MARKER,
+  type HandoffContext,
   type HandoffEntry,
   appendEntry,
   renderHandoff,
@@ -85,6 +86,143 @@ describe("handoff-buffer", () => {
       const out = renderHandoff([]);
       expect(out).toContain(HANDOFF_MARKER);
       expect(out.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("renderHandoff with structured context (ALB-1205)", () => {
+    const sample: HandoffEntry[] = [
+      entry("user", "部署脚本超时没兜住"),
+      entry("assistant", "我看下，先复现"),
+      entry("user", "好，抓紧"),
+    ];
+
+    it("stays byte-identical to the legacy render when no context is passed", () => {
+      expect(renderHandoff(sample, undefined)).toBe(renderHandoff(sample));
+      expect(renderHandoff(sample, undefined, { maxTotalChars: 4000 })).toBe(
+        renderHandoff(sample, { maxTotalChars: 4000 }),
+      );
+    });
+
+    it("renders a human-readable reason line for each rotation reason", () => {
+      const threshold = renderHandoff(sample, { reason: "threshold" });
+      expect(threshold).toContain("翻页原因");
+      expect(threshold).toContain("常规阈值");
+
+      const hardCap = renderHandoff(sample, { reason: "hard-cap" });
+      expect(hardCap).toContain("硬上限");
+      expect(hardCap).toContain("强制");
+
+      const timeoutAbort = renderHandoff(sample, { reason: "timeout-abort" });
+      expect(timeoutAbort).toContain("超时");
+      expect(timeoutAbort).toContain("中断");
+    });
+
+    it("includes the fill ratio in the reason line when provided", () => {
+      const out = renderHandoff(sample, { reason: "hard-cap", ratio: 0.63 });
+      expect(out).toContain("63%");
+    });
+
+    it("omits the ratio number when it is not provided", () => {
+      const out = renderHandoff(sample, { reason: "threshold" });
+      expect(out).not.toContain("%");
+    });
+
+    it("always renders the recovery-discipline pointer (AGENTS.md + Linear, no inlined content)", () => {
+      const out = renderHandoff(sample, { reason: "threshold" });
+      expect(out).toContain("恢复指引");
+      expect(out).toContain("AGENTS.md");
+      expect(out).toContain("Linear");
+    });
+
+    it("renders each unanswered message verbatim under a 未答消息 section", () => {
+      const out = renderHandoff(sample, {
+        reason: "threshold",
+        unanswered: ["帮我查下 CI 挂没挂", "另外今晚的行程改一下"],
+      });
+      expect(out).toContain("未答消息");
+      expect(out).toContain("帮我查下 CI 挂没挂");
+      expect(out).toContain("另外今晚的行程改一下");
+    });
+
+    it("truncates over-long unanswered messages with the same per-entry bound", () => {
+      const huge = "u".repeat(DEFAULT_MAX_ENTRY_CHARS + 500);
+      const out = renderHandoff(sample, { reason: "threshold", unanswered: [huge] }, {
+        maxEntryChars: DEFAULT_MAX_ENTRY_CHARS,
+      });
+      expect(out).toContain("…");
+      expect(out).not.toContain(huge);
+    });
+
+    it("renders the interrupted turn under a 最后断点 section with a continue instruction", () => {
+      const out = renderHandoff(sample, {
+        reason: "timeout-abort",
+        interruptedTurn: "把 rotation 的设计稿写完",
+      });
+      expect(out).toContain("最后断点");
+      expect(out).toContain("把 rotation 的设计稿写完");
+      expect(out).toContain("接着答");
+    });
+
+    it("omits the 未答消息 and 最后断点 sections when there is nothing to show", () => {
+      const out = renderHandoff(sample, { reason: "threshold" });
+      expect(out).not.toContain("未答消息");
+      expect(out).not.toContain("最后断点");
+    });
+
+    it("orders sections: reason → recovery → unanswered → interrupted → recent conversation", () => {
+      const out = renderHandoff(sample, {
+        reason: "hard-cap",
+        unanswered: ["queued-question"],
+        interruptedTurn: "interrupted-question",
+      });
+      const reasonAt = out.indexOf("翻页原因");
+      const recoveryAt = out.indexOf("恢复指引");
+      const unansweredAt = out.indexOf("未答消息");
+      const interruptedAt = out.indexOf("最后断点");
+      const recentAt = out.indexOf("旧 thread 最近对话");
+      expect(reasonAt).toBeGreaterThanOrEqual(0);
+      expect(recoveryAt).toBeGreaterThan(reasonAt);
+      expect(unansweredAt).toBeGreaterThan(recoveryAt);
+      expect(interruptedAt).toBeGreaterThan(unansweredAt);
+      expect(recentAt).toBeGreaterThan(interruptedAt);
+    });
+
+    it("keeps unanswered + interrupted alive under budget pressure by shedding old conversation first", () => {
+      const many: HandoffEntry[] = [];
+      for (let i = 0; i < 100; i++) {
+        many.push(entry(i % 2 === 0 ? "user" : "assistant", `entry-${i}-${"y".repeat(200)}`));
+      }
+      const out = renderHandoff(
+        many,
+        {
+          reason: "hard-cap",
+          ratio: 0.66,
+          unanswered: ["queued-alpha", "queued-beta"],
+          interruptedTurn: "interrupted-gamma",
+        },
+        { maxTotalChars: 4000 },
+      );
+      expect(out.length).toBeLessThanOrEqual(4000 + HANDOFF_MARKER.length + 600);
+      expect(out).toContain("queued-alpha");
+      expect(out).toContain("queued-beta");
+      expect(out).toContain("interrupted-gamma");
+      expect(out).toContain("entry-99"); // newest conversation still first to survive
+      expect(out).not.toContain("entry-0-"); // oldest conversation sheds first
+    });
+
+    it("still fits the default 6000-char budget with a full context attached", () => {
+      const many: HandoffEntry[] = [];
+      for (let i = 0; i < 100; i++) {
+        many.push(entry(i % 2 === 0 ? "user" : "assistant", `entry-${i}-${"y".repeat(300)}`));
+      }
+      const context: HandoffContext = {
+        reason: "hard-cap",
+        ratio: 0.61,
+        unanswered: ["q1", "q2", "q3"],
+        interruptedTurn: "被打断的问题",
+      };
+      const out = renderHandoff(many, context);
+      expect(out.length).toBeLessThanOrEqual(DEFAULT_MAX_HANDOFF_CHARS + HANDOFF_MARKER.length + 600);
     });
   });
 

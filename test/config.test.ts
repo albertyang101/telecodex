@@ -25,6 +25,7 @@ describe("loadConfig", () => {
     delete process.env.CODEX_APPROVAL_POLICY;
     delete process.env.CODEX_AUTO_ROTATE;
     delete process.env.CODEX_ROTATE_THRESHOLD;
+    delete process.env.CODEX_ROTATE_HARD_CAP;
     delete process.env.CODEX_MODEL_CONTEXT_WINDOW;
     delete process.env.CODEX_LAUNCH_PROFILES_JSON;
     delete process.env.CODEX_DEFAULT_LAUNCH_PROFILE;
@@ -186,6 +187,7 @@ describe("loadConfig", () => {
       autoRotate: {
         enabled: true,
         threshold: 0.45,
+        hardCap: 0.6,
         contextWindow: 258400,
       },
     });
@@ -202,6 +204,8 @@ describe("loadConfig", () => {
     expect((loadConfig() as any).autoRotate).toEqual({
       enabled: false,
       threshold: 0.6,
+      // default hard cap 0.6 is not strictly above the 0.6 threshold → disabled
+      hardCap: undefined,
       contextWindow: 400000,
     });
 
@@ -211,8 +215,41 @@ describe("loadConfig", () => {
     expect((loadConfig() as any).autoRotate).toEqual({
       enabled: true,
       threshold: 0.45,
+      hardCap: 0.6,
       contextWindow: 258400,
     });
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it("parses CODEX_ROTATE_HARD_CAP and fails safe to disabled on invalid values (ALB-1205)", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // unset → default 0.60
+    expect((loadConfig() as any).autoRotate.hardCap).toBe(0.6);
+
+    // explicit valid override
+    process.env.CODEX_ROTATE_HARD_CAP = "0.7";
+    expect((loadConfig() as any).autoRotate.hardCap).toBe(0.7);
+
+    // non-numeric → disabled
+    process.env.CODEX_ROTATE_HARD_CAP = "abc";
+    expect((loadConfig() as any).autoRotate.hardCap).toBeUndefined();
+
+    // out of (0, 1] → disabled
+    process.env.CODEX_ROTATE_HARD_CAP = "0";
+    expect((loadConfig() as any).autoRotate.hardCap).toBeUndefined();
+    process.env.CODEX_ROTATE_HARD_CAP = "1.5";
+    expect((loadConfig() as any).autoRotate.hardCap).toBeUndefined();
+
+    // not strictly above the rotate threshold → disabled, threshold flip unaffected
+    process.env.CODEX_ROTATE_HARD_CAP = "0.4";
+    const belowThreshold = (loadConfig() as any).autoRotate;
+    expect(belowThreshold.hardCap).toBeUndefined();
+    expect(belowThreshold.threshold).toBe(0.45);
+    expect(belowThreshold.enabled).toBe(true);
+
     expect(warn).toHaveBeenCalled();
   });
 
@@ -261,7 +298,7 @@ describe("loadConfig", () => {
     expect(config.enableTelegramReactions).toBe(false);
     expect(config.memoryTranscriptRoot).toBeUndefined();
     expect(config.mailboxBridge.promptTimeoutMs).toBeUndefined();
-    expect((config as any).autoRotate).toEqual({ enabled: true, threshold: 0.45, contextWindow: 258400 });
+    expect((config as any).autoRotate).toEqual({ enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 });
     expect(config.workspace).toBe(process.cwd());
   });
 

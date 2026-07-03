@@ -23,6 +23,13 @@ export const DEFAULT_CONTEXT_WINDOW = 258400;
  */
 export const DEFAULT_ROTATE_THRESHOLD = 0.45;
 
+/**
+ * Default hard-cap fraction (ALB-1205, mirroring CC's 0.60 contract). Crossing it
+ * upgrades the pending rotation to *mandatory*: the next turn must not run on the
+ * over-cap thread even if newThread() fails on the first attempt.
+ */
+export const DEFAULT_ROTATE_HARD_CAP = 0.6;
+
 function isPositiveFinite(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
@@ -83,4 +90,48 @@ export function shouldRotate({ lastInputTokens, contextWindow, threshold }: Shou
     return false;
   }
   return ratio >= threshold;
+}
+
+/**
+ * Resolve the effective hard cap (ALB-1205). Fails safe to `undefined` (hard cap
+ * disabled) on any non-finite / out-of-range value, or when the cap is not
+ * strictly above the regular rotate threshold — a misconfigured cap must never
+ * turn every threshold flip into a mandatory one, and it must never disturb the
+ * regular 0.45 rotation either.
+ */
+export function resolveHardCap(hardCap: unknown, threshold: number): number | undefined {
+  if (!isPositiveFinite(hardCap) || hardCap > 1) {
+    return undefined;
+  }
+  if (isPositiveFinite(threshold) && hardCap <= threshold) {
+    return undefined;
+  }
+  return hardCap;
+}
+
+export interface ShouldForceRotateInput extends ShouldRotateInput {
+  /** Hard-cap fraction; force-rotation is disabled when invalid or ≤ threshold. */
+  hardCap: number | undefined;
+}
+
+/**
+ * Decide whether the pending rotation must be upgraded to mandatory (ALB-1205).
+ * Fails safe to `false` whenever the hard cap is disabled/misconfigured or the
+ * fill ratio cannot be computed.
+ */
+export function shouldForceRotate({
+  lastInputTokens,
+  contextWindow,
+  threshold,
+  hardCap,
+}: ShouldForceRotateInput): boolean {
+  const cap = resolveHardCap(hardCap, threshold);
+  if (cap === undefined) {
+    return false;
+  }
+  const ratio = contextFillRatio(lastInputTokens, contextWindow);
+  if (ratio <= 0) {
+    return false;
+  }
+  return ratio >= cap;
 }

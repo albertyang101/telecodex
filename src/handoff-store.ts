@@ -39,9 +39,28 @@ export function loadChatState(stateDir: string, contextKey: string): ChatRotatio
       return emptyChatState();
     }
     const raw = JSON.parse(readFileSync(file, "utf8")) as unknown;
-    const obj = (raw ?? {}) as { buffer?: unknown; pendingRotation?: unknown };
+    const obj = (raw ?? {}) as {
+      buffer?: unknown;
+      pendingRotation?: unknown;
+      pendingMandatory?: unknown;
+      interruptedTurn?: unknown;
+      lastKnownRatio?: unknown;
+    };
     const buffer = Array.isArray(obj.buffer) ? obj.buffer.filter(isHandoffEntry) : [];
-    return { buffer, pendingRotation: Boolean(obj.pendingRotation) };
+    const state: ChatRotationState = { buffer, pendingRotation: Boolean(obj.pendingRotation) };
+    // ALB-1205 fields are optional for backward compatibility: a pre-ALB-1205
+    // JSON simply lacks them (= false / undefined), and malformed values are
+    // dropped rather than trusted.
+    if (obj.pendingMandatory === true) {
+      state.pendingMandatory = true;
+    }
+    if (typeof obj.interruptedTurn === "string" && obj.interruptedTurn.trim()) {
+      state.interruptedTurn = obj.interruptedTurn;
+    }
+    if (typeof obj.lastKnownRatio === "number" && Number.isFinite(obj.lastKnownRatio) && obj.lastKnownRatio > 0) {
+      state.lastKnownRatio = obj.lastKnownRatio;
+    }
+    return state;
   } catch {
     return emptyChatState();
   }
@@ -55,7 +74,15 @@ export function saveChatState(stateDir: string, contextKey: string, state: ChatR
   const file = handoffStatePath(stateDir, contextKey);
   mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
-  const payload = JSON.stringify({ buffer: state.buffer, pendingRotation: state.pendingRotation });
+  const payload = JSON.stringify({
+    buffer: state.buffer,
+    pendingRotation: state.pendingRotation,
+    // ALB-1205 fields; JSON.stringify drops the undefined ones so a state that
+    // never used them round-trips to the same shape it started with.
+    pendingMandatory: state.pendingMandatory === true,
+    interruptedTurn: state.interruptedTurn,
+    lastKnownRatio: state.lastKnownRatio,
+  });
   writeFileSync(tmp, payload, "utf8");
   renameSync(tmp, file);
 }

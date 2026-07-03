@@ -13,7 +13,12 @@ import {
   type CodexLaunchProfile,
   type CodexSandboxMode,
 } from "./codex-launch.js";
-import { DEFAULT_CONTEXT_WINDOW, DEFAULT_ROTATE_THRESHOLD } from "./rotation-policy.js";
+import {
+  DEFAULT_CONTEXT_WINDOW,
+  DEFAULT_ROTATE_HARD_CAP,
+  DEFAULT_ROTATE_THRESHOLD,
+  resolveHardCap,
+} from "./rotation-policy.js";
 
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
 export type CodexReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -56,6 +61,8 @@ export interface LinearControlConfig {
 export interface AutoRotateConfig {
   enabled: boolean;
   threshold: number;
+  /** Hard-cap fraction (ALB-1205); undefined = hard cap disabled. */
+  hardCap?: number;
   contextWindow: number;
 }
 
@@ -316,14 +323,28 @@ function parseRatioEnv(raw: string | undefined, defaultValue: number, name: stri
   return parsed;
 }
 
+function parseHardCapEnv(raw: string | undefined, threshold: number): number | undefined {
+  const candidate = raw === undefined ? DEFAULT_ROTATE_HARD_CAP : Number(raw);
+  const resolved = resolveHardCap(candidate, threshold);
+  if (resolved === undefined && raw !== undefined) {
+    console.warn(
+      `CODEX_ROTATE_HARD_CAP must be a fraction in (0, 1] strictly above the rotate threshold (${threshold}). ` +
+        `Got "${raw}"; hard-cap rotation disabled (regular rotation unaffected).`,
+    );
+  }
+  return resolved;
+}
+
 function parseAutoRotateConfig(): AutoRotateConfig {
+  const threshold = parseRatioEnv(
+    optionalString(process.env.CODEX_ROTATE_THRESHOLD),
+    DEFAULT_ROTATE_THRESHOLD,
+    "CODEX_ROTATE_THRESHOLD",
+  );
   return {
     enabled: parseBooleanEnv(optionalString(process.env.CODEX_AUTO_ROTATE), true),
-    threshold: parseRatioEnv(
-      optionalString(process.env.CODEX_ROTATE_THRESHOLD),
-      DEFAULT_ROTATE_THRESHOLD,
-      "CODEX_ROTATE_THRESHOLD",
-    ),
+    threshold,
+    hardCap: parseHardCapEnv(optionalString(process.env.CODEX_ROTATE_HARD_CAP), threshold),
     contextWindow: parsePositiveIntegerEnv(
       optionalString(process.env.CODEX_MODEL_CONTEXT_WINDOW),
       DEFAULT_CONTEXT_WINDOW,

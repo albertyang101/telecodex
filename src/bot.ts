@@ -40,7 +40,12 @@ import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { stripVisiblePromptGuardEcho, withRotationHandoff, withTelegramReplyStyleGuard } from "./prompt-guard.js";
 import { clearChatState, loadChatState, saveChatState } from "./handoff-store.js";
-import { type ChatRotationState, type RotationConfig, recordTurn, takeRotationHandoff } from "./thread-rotation.js";
+import {
+  type ChatRotationState,
+  type RotationConfig,
+  recordTurn,
+  takeRotationHandoff,
+} from "./thread-rotation.js";
 import { SessionRegistry } from "./session-registry.js";
 import { getTranscriptionBackendStatus, transcribeAudio } from "./voice.js";
 
@@ -731,7 +736,21 @@ export function createBot(
   const rotationCfg: RotationConfig = {
     enabled: config.autoRotate.enabled,
     threshold: config.autoRotate.threshold,
+    hardCap: config.autoRotate.hardCap,
     contextWindow: config.autoRotate.contextWindow,
+  };
+  /**
+   * Snapshot the still-queued (unanswered) user messages for the rotation HANDOFF
+   * (ALB-1205). The turn currently being handled has already been shifted off the
+   * queue before handleUserPrompt runs, so this captures exactly the messages that
+   * are waiting behind it — the ones a fresh thread must still get to.
+   */
+  const snapshotUnansweredPrompts = (key: string): string[] => {
+    const queue = pendingPromptQueues.get(key) ?? [];
+    return queue
+      .filter((item) => item.status !== "skipped" && item.input !== undefined)
+      .map((item) => visibleUserText(item.input!).trim())
+      .filter((text) => text.length > 0);
   };
   const getRotationState = (key: string): ChatRotationState => {
     let state = rotationStates.get(key);
@@ -1232,6 +1251,9 @@ export function createBot(
       },
     };
 
+    // Hoisted so the catch can fold a mid-turn timeout abort back into the
+    // rotation state (ALB-1205 最后断点) using the post-rotation state, if any.
+    let rotationStateAfterSuccessfulHandoff: ChatRotationState | null = null;
     try {
       const authStatus = await checkAuthStatus(config.codexApiKey);
       if (!authStatus.authenticated) {
@@ -1258,19 +1280,50 @@ export function createBot(
       }
 
       let rotationHandoff: string | null = null;
-      let rotationStateAfterSuccessfulHandoff: ChatRotationState | null = null;
       if (rotationCfg.enabled) {
         const rotationStateBeforeRotation = getRotationState(contextKey);
-        const takenRotation = takeRotationHandoff(rotationStateBeforeRotation, rotationCfg);
+        const unanswered = snapshotUnansweredPrompts(contextKey);
+        const takenRotation = takeRotationHandoff(rotationStateBeforeRotation, rotationCfg, { unanswered });
         if (takenRotation.handoff) {
-          try {
-            await session.newThread();
+          // A mandatory (hard-cap) rotation must not fall back to the over-cap
+          // thread: try to open a fresh thread once more before giving up (ALB-1205).
+          const maxNewThreadAttempts = takenRotation.mandatory ? 2 : 1;
+          let rotated = false;
+          let lastNewThreadError: unknown;
+          for (let attempt = 0; attempt < maxNewThreadAttempts; attempt += 1) {
+            try {
+              await session.newThread();
+              rotated = true;
+              break;
+            } catch (error) {
+              lastNewThreadError = error;
+            }
+          }
+          if (rotated) {
             updateSessionMetadata(contextKey, session);
             rotationStateAfterSuccessfulHandoff = takenRotation.state;
             rotationHandoff = takenRotation.handoff;
             console.error("Auto-rotated Codex thread for " + contextKey + " on context pressure (ALB-1011).");
-          } catch (error) {
-            console.error("Auto-rotation newThread failed; continuing on the existing thread:", formatError(error));
+          } else if (takenRotation.mandatory) {
+            // Hard cap crossed and no fresh thread could be opened: refuse the turn
+            // rather than run it on the over-cap thread. Keep the pending rotation
+            // so a later turn still rotates once newThread recovers.
+            console.error(
+              "Mandatory auto-rotation newThread failed; refusing the turn on the over-cap thread (ALB-1205):",
+              formatError(lastNewThreadError),
+            );
+            setRotationState(contextKey, rotationStateBeforeRotation);
+            await safeReply(
+              ctx,
+              escapeHTML("⚠️ 上下文已触及硬上限，且新线程一时开不起来，这条先没接。稍后再发一次就会自动翻页续上。"),
+              { fallbackText: "上下文已触及硬上限，新线程一时开不起来，这条先没接，稍后再发一次即可。" },
+            );
+            return;
+          } else {
+            console.error(
+              "Auto-rotation newThread failed; continuing on the existing thread:",
+              formatError(lastNewThreadError),
+            );
             setRotationState(contextKey, rotationStateBeforeRotation);
             if (!(await ensureActiveThread(ctx, contextKey, session))) {
               return;
@@ -1320,6 +1373,11 @@ export function createBot(
     } catch (error) {
       stopTyping();
       clearFlushTimer();
+      // ALB-1205 SENTINEL: live Telegram path is no-turn-timeout (2026-06-29 live
+      // decision, preserved as the integration baseline), so there is no
+      // CodexTurnTimeoutError to catch here — the canonical interrupted-turn (最后断点)
+      // recording lives on the mailbox path (mailbox.ts, which keeps its own turn
+      // timeout). Preserve the live busy-error rethrow (2026-07-02 busy-leak patch).
       if (isCodexTurnBusyError(error)) {
         throw error;
       }
