@@ -152,6 +152,12 @@ export async function runMailboxDeliveryOnce(
           rotationState = taken.state;
           rotationHandoff = taken.handoff;
           persistRotationState();
+          // Observable rotation (ALB-1205 A7): the Telegram path logs "Auto-rotated";
+          // the mailbox path — where worker bots spend most turns — rotated silently,
+          // leaving prod monitoring blind to the main rotation path. Log symmetrically.
+          console.error(
+            `Auto-rotated Codex mailbox thread for ${contextKey} on context pressure (ALB-1205).`,
+          );
         } else if (taken.mandatory) {
           console.error(
             "mailbox mandatory auto-rotation newThread failed; deferring the message rather than running it on the over-cap thread (ALB-1205):",

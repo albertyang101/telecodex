@@ -1152,6 +1152,7 @@ describe("mailbox bridge", () => {
       callbacks.onAgentEnd();
     });
     const registry = createRegistry(session);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const result = await runMailboxDeliveryOnce(
       createConfig({
@@ -1171,6 +1172,11 @@ describe("mailbox bridge", () => {
     expect(rotatedInput).toContain("未答消息");
     // Message C is still queued behind B at the instant B rotates.
     expect(rotatedInput).toContain("排队C");
+    // ALB-1205 A7: the mailbox rotation must be OBSERVABLE. The Telegram path logs
+    // "Auto-rotated ..." but the mailbox path (where worker bots spend most turns)
+    // rotated silently — leaving prod monitoring and A7-style verification blind to
+    // the main rotation path. A successful mailbox rotation must emit a greppable line.
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes("Auto-rotated"))).toBe(true);
   });
 
   it("carries a 最后断点 into the next mailbox rotation when a heavy turn times out (ALB-1205)", async () => {
