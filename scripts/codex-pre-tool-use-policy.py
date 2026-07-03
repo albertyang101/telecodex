@@ -85,7 +85,7 @@ def main() -> int:
     if blocked:
         return reject(
             "Blocked Codex shell command: "
-            f"{blocked}. Use the dispatcher abort/restart path instead of host process control from a Codex turn."
+            f"{blocked}. Use the audited dispatcher self-restart helper instead of raw host process control."
         )
 
     return 0
