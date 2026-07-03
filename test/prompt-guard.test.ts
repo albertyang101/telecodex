@@ -113,4 +113,23 @@ describe("withTelegramReplyStyleGuard", () => {
 
     expect(stripVisiblePromptGuardEcho(reply)).toContain("Fix root cause: explain why a bug happened before fixing it");
   });
+
+  it("strips whole lines that begin with the ⌦ internal-line marker (ALB-1206), keeping normal lines", () => {
+    const reply = [
+      "⌦ 现在回 Nora：我先核 X 再回。",
+      "这是真正要发给用户的话。",
+      "⌦ GO recorded, mailbox triaged.",
+    ].join("\n");
+
+    const visible = stripVisiblePromptGuardEcho(reply);
+    expect(visible).toBe("这是真正要发给用户的话。");
+    expect(visible).not.toContain("⌦");
+    expect(visible).not.toContain("Nora");
+    expect(visible).not.toContain("GO recorded");
+  });
+
+  it("returns empty when every line is ⌦-marked (whole message is internal, ALB-1206)", () => {
+    const reply = ["⌦ 都处理完了。", "⌦ 球在他那，等他回。"].join("\n");
+    expect(stripVisiblePromptGuardEcho(reply)).toBe("");
+  });
 });

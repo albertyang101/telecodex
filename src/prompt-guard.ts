@@ -57,6 +57,15 @@ export function withRotationHandoff(input: CodexPromptInput, handoff: string): C
   return prependPromptPreamble(input, handoff);
 }
 
+/**
+ * ALB-1206: internal-line marker (⌦ U+2326). Any outbound line that begins with
+ * it is model self-talk / control-plane narration that must NEVER leave the bot;
+ * it is stripped whole at the single outbound seam below, so both the Telegram
+ * and mailbox reply paths (which both funnel through stripVisiblePromptGuardEcho)
+ * are covered by one strip.
+ */
+const INTERNAL_LINE_MARKER = "⌦";
+
 export function stripVisiblePromptGuardEcho(replyText: string): string {
   const withoutHandoff = stripRotationHandoffEcho(replyText);
   const guardHeadings = new Set(["[TELEGRAM REPLY STYLE]", "[DEVELOPER DISCIPLINE]", "[CURRENT CONTEXT]"]);
@@ -65,6 +74,10 @@ export function stripVisiblePromptGuardEcho(replyText: string): string {
 
   for (const line of withoutHandoff.split("\n")) {
     const trimmed = line.trim();
+    if (trimmed.startsWith(INTERNAL_LINE_MARKER)) {
+      // ALB-1206: whole line is ⌦-marked internal self-talk — drop it, never send it.
+      continue;
+    }
     const normalized = normalizePotentialPromptGuardLine(trimmed);
     if (guardHeadings.has(normalized)) {
       inGuardBlock = true;
