@@ -1216,6 +1216,56 @@ describe("mailbox bridge", () => {
     expect(lastPrompt).toContain("最后断点");
     expect(lastPrompt).toContain("会超时的二");
   });
+
+  it("refuses a mandatory (hard-cap) mailbox rotation on the over-cap thread when newThread fails, deferring the message (ALB-1205)", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const rotateCfg = {
+      personasRoot,
+      workspace,
+      autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 } as never,
+    };
+
+    let turn = 0;
+    const session = createSession(async (_input, callbacks) => {
+      turn += 1;
+      callbacks.onAgentMessage?.(`ok-${turn}`);
+      // Turn 1 crosses the hard cap (200000/258400 ≈ 0.77 ≥ 0.60) → mandatory pending.
+      callbacks.onTurnComplete?.({ inputTokens: turn === 1 ? 200000 : 40000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    // Tick 2's mandatory rotation retries newThread twice; both fail. Tick 3 recovers.
+    session.newThread
+      .mockRejectedValueOnce(new Error("mailbox newThread failure #1"))
+      .mockRejectedValueOnce(new Error("mailbox newThread failure #2"))
+      .mockResolvedValue(session.getInfo());
+    const registry = createRegistry(session);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Tick 1: message A completes over the hard cap → mandatory pending persisted.
+    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-hc-1", subject: "顶过硬上限的一", body: "顶过硬上限的一" });
+    const tick1 = await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    expect(tick1.processed).toBe(1);
+    expect(session.newThread).not.toHaveBeenCalled();
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+
+    // Tick 2: mandatory rotation → newThread tried twice, both fail → the turn must be
+    // REFUSED (no prompt on the over-cap thread) and the message left for a later tick.
+    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-hc-2", subject: "不该在超顶线程跑的二", body: "不该在超顶线程跑的二" });
+    const tick2 = await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    expect(session.newThread).toHaveBeenCalledTimes(2);
+    expect(session.prompt).toHaveBeenCalledTimes(1); // B was NOT run on the over-cap thread
+    expect(tick2.processed).toBe(0); // B deferred, still unread for the next tick
+
+    // Tick 3: newThread recovers → the preserved mandatory pending finally rotates and B runs.
+    const tick3 = await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    expect(session.newThread).toHaveBeenCalledTimes(3);
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    expect(tick3.processed).toBe(1);
+    const rotatedInput = JSON.stringify(session.prompt.mock.calls[1]![0]);
+    expect(rotatedInput).toContain(HANDOFF_MARKER);
+    expect(rotatedInput).toContain("硬上限");
+  });
 });
 
 function createConfig(overrides: {

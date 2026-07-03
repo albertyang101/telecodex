@@ -741,14 +741,19 @@ export function createBot(
   };
   /**
    * Snapshot the still-queued (unanswered) user messages for the rotation HANDOFF
-   * (ALB-1205). The turn currently being handled has already been shifted off the
-   * queue before handleUserPrompt runs, so this captures exactly the messages that
-   * are waiting behind it — the ones a fresh thread must still get to.
+   * (ALB-1205). On the drain path the message currently being handled is still at
+   * the head of the queue — it is only shifted off in the drain loop's `finally`,
+   * after the turn — so without excluding it, this very turn's message would be
+   * listed as unanswered backlog even though the turn is answering it right now
+   * (and it is already injected as the live prompt). Exclude it by identity:
+   * `currentInput` is the exact input object handed to handleUserPrompt. On the
+   * direct (non-queued) path the current input is not in the queue, so the filter
+   * is a no-op there.
    */
-  const snapshotUnansweredPrompts = (key: string): string[] => {
+  const snapshotUnansweredPrompts = (key: string, currentInput?: CodexPromptInput): string[] => {
     const queue = pendingPromptQueues.get(key) ?? [];
     return queue
-      .filter((item) => item.status !== "skipped" && item.input !== undefined)
+      .filter((item) => item.status !== "skipped" && item.input !== undefined && item.input !== currentInput)
       .map((item) => visibleUserText(item.input!).trim())
       .filter((text) => text.length > 0);
   };
@@ -1282,7 +1287,7 @@ export function createBot(
       let rotationHandoff: string | null = null;
       if (rotationCfg.enabled) {
         const rotationStateBeforeRotation = getRotationState(contextKey);
-        const unanswered = snapshotUnansweredPrompts(contextKey);
+        const unanswered = snapshotUnansweredPrompts(contextKey, userInput);
         const takenRotation = takeRotationHandoff(rotationStateBeforeRotation, rotationCfg, { unanswered });
         if (takenRotation.handoff) {
           // A mandatory (hard-cap) rotation must not fall back to the over-cap

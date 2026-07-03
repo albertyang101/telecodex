@@ -538,6 +538,13 @@ describe("createBot response delivery", () => {
     expect(rotatedInput).toContain(HANDOFF_MARKER);
     expect(rotatedInput).toContain("未答消息");
     expect(rotatedInput).toContain("第三条：也在排队");
+    // ALB-1205: the message currently being handled (第二条) is delivered as this
+    // very turn's live prompt — it must NOT also be listed as unanswered backlog in
+    // the HANDOFF. On the drain path it is still queue[0] when rotation snapshots, so
+    // without excluding it the new thread is told to "答完" a message it is answering
+    // right now. It must appear exactly once (the live prompt), never twice.
+    const currentMsgOccurrences = (rotatedInput.match(/第二条：排队中/g) ?? []).length;
+    expect(currentMsgOccurrences).toBe(1);
   });
 
   // ALB-1205 SENTINEL: the canonical "interrupted turn (最后断点) on a Telegram

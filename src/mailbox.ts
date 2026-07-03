@@ -132,18 +132,49 @@ export async function runMailboxDeliveryOnce(
       const unanswered = messages.slice(index + 1).map(mailboxTurnDescriptor);
       const taken = takeRotationHandoff(rotationState, rotationCfg, { unanswered });
       if (taken.handoff) {
-        try {
-          await session.newThread();
+        // A mandatory (hard-cap) rotation must not fall back to the over-cap thread:
+        // try once more before giving up, and if it still fails, refuse this turn and
+        // leave the message for a later tick. The pending rotation is preserved because
+        // taken.state is only adopted on success. Mirrors the Telegram path (ALB-1205).
+        const maxNewThreadAttempts = taken.mandatory ? 2 : 1;
+        let rotated = false;
+        let lastNewThreadError: unknown;
+        for (let attempt = 0; attempt < maxNewThreadAttempts; attempt += 1) {
+          try {
+            await session.newThread();
+            rotated = true;
+            break;
+          } catch (error) {
+            lastNewThreadError = error;
+          }
+        }
+        if (rotated) {
           rotationState = taken.state;
           rotationHandoff = taken.handoff;
           persistRotationState();
-        } catch (error) {
+        } else if (taken.mandatory) {
+          console.error(
+            "mailbox mandatory auto-rotation newThread failed; deferring the message rather than running it on the over-cap thread (ALB-1205):",
+            lastNewThreadError instanceof Error ? lastNewThreadError.message : String(lastNewThreadError),
+          );
+          skipped += 1;
+          break;
+        } else {
           console.error(
             "mailbox auto-rotation newThread failed; continuing on the existing thread:",
-            error instanceof Error ? error.message : String(error),
+            lastNewThreadError instanceof Error ? lastNewThreadError.message : String(lastNewThreadError),
           );
           if (!session.hasActiveThread()) {
-            await session.newThread();
+            try {
+              await session.newThread();
+            } catch (error) {
+              console.error(
+                "mailbox fallback newThread failed; deferring the message (ALB-1205):",
+                error instanceof Error ? error.message : String(error),
+              );
+              skipped += 1;
+              break;
+            }
           }
         }
       } else if (!session.hasActiveThread()) {
