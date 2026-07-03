@@ -22,6 +22,8 @@ export interface MailboxBridgeConfig {
   persona?: string;
   personasRoot: string;
   contextKey?: string;
+  launchProfileId?: string;
+  allowUnsafeLaunchProfile: boolean;
   pollMs: number;
   fullScanMs: number;
   autoReply: boolean;
@@ -60,7 +62,6 @@ export interface TeleCodexConfig {
   codexPathOverride?: string;
   codexModel?: string;
   codexReasoningEffort?: CodexReasoningEffort;
-  codexTurnTimeoutMs?: number;
   codexTurnAbortGraceMs?: number;
   codexSandboxMode: CodexSandboxMode;
   codexApprovalPolicy: CodexApprovalPolicy;
@@ -89,10 +90,6 @@ export function loadConfig(): TeleCodexConfig {
   const codexPathOverride = parseCodexPathOverride(optionalString(process.env.CODEX_PATH));
   const codexModel = optionalString(process.env.CODEX_MODEL);
   const codexReasoningEffort = parseReasoningEffort(optionalString(process.env.CODEX_REASONING_EFFORT));
-  const codexTurnTimeoutMs = parseOptionalPositiveIntegerEnv(
-    optionalString(process.env.CODEX_TURN_TIMEOUT_MS),
-    "CODEX_TURN_TIMEOUT_MS",
-  );
   const codexTurnAbortGraceMs = parseOptionalPositiveIntegerEnv(
     optionalString(process.env.CODEX_TURN_ABORT_GRACE_MS),
     "CODEX_TURN_ABORT_GRACE_MS",
@@ -141,7 +138,6 @@ export function loadConfig(): TeleCodexConfig {
     codexPathOverride,
     codexModel,
     codexReasoningEffort,
-    codexTurnTimeoutMs,
     codexTurnAbortGraceMs,
     codexSandboxMode,
     codexApprovalPolicy,
@@ -324,6 +320,18 @@ function parsePositiveIntegerEnv(raw: string | undefined, defaultValue: number, 
   return parsed;
 }
 
+function parseOptionalNonNegativeIntegerEnv(raw: string | undefined, defaultValue: number, name: string): number {
+  if (!raw) {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
 function parseMailboxBridgeConfig(): MailboxBridgeConfig {
   const persona = optionalString(process.env.MAILBOX_PERSONA);
   const enabled = Boolean(persona) && parseBooleanEnv(optionalString(process.env.MAILBOX_ENABLED), true);
@@ -337,6 +345,8 @@ function parseMailboxBridgeConfig(): MailboxBridgeConfig {
     persona,
     personasRoot,
     contextKey: optionalString(process.env.MAILBOX_CONTEXT_KEY),
+    launchProfileId: optionalString(process.env.MAILBOX_LAUNCH_PROFILE_ID),
+    allowUnsafeLaunchProfile: parseBooleanEnv(optionalString(process.env.MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE), false),
     pollMs: parsePositiveIntegerEnv(optionalString(process.env.MAILBOX_POLL_MS), 500, "MAILBOX_POLL_MS"),
     fullScanMs: parsePositiveIntegerEnv(
       optionalString(process.env.MAILBOX_FULL_SCAN_MS),
@@ -463,12 +473,22 @@ function validateMailboxBridgeLaunch(
     throw new Error("MAILBOX_PERSONA must be a safe single path segment");
   }
 
-  const profile = findLaunchProfile(launchProfiles, defaultLaunchProfileId);
+  const launchProfileId = mailboxBridge.launchProfileId ?? defaultLaunchProfileId;
+  const profile = findLaunchProfile(launchProfiles, launchProfileId);
+  if (!profile && mailboxBridge.launchProfileId) {
+    throw new Error(`Unknown MAILBOX_LAUNCH_PROFILE_ID: ${mailboxBridge.launchProfileId}`);
+  }
   if (profile?.sandboxMode === "read-only" && profile.approvalPolicy === "never") {
     return;
   }
+  if (profile && mailboxBridge.allowUnsafeLaunchProfile) {
+    if (profile.approvalPolicy !== "never") {
+      throw new Error("MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE requires a never approval launch profile");
+    }
+    return;
+  }
 
-  throw new Error("MAILBOX_PERSONA requires the default Codex launch profile to be read-only / never");
+  throw new Error("MAILBOX_PERSONA requires a read-only / never launch profile");
 }
 
 function parseMailboxMinSentAt(raw: string | undefined): string | undefined {

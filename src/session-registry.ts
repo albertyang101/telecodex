@@ -20,6 +20,8 @@ export interface ContextMetadata {
 
 export class SessionRegistry {
   private readonly sessions = new Map<TelegramContextKey, CodexSessionService>();
+  private readonly creatingSessions = new Map<TelegramContextKey, Promise<CodexSessionService>>();
+  private readonly creationVersions = new Map<TelegramContextKey, number>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
   private readonly persistPath: string;
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
@@ -31,15 +33,19 @@ export class SessionRegistry {
 
   async getOrCreate(
     contextKey: TelegramContextKey,
-    options?: { deferThreadStart?: boolean },
+    options?: { deferThreadStart?: boolean; launchProfileId?: string },
   ): Promise<CodexSessionService> {
     let session = this.sessions.get(contextKey);
     if (session) {
       return session;
     }
+    const creating = this.creatingSessions.get(contextKey);
+    if (creating) {
+      return creating;
+    }
 
     const meta = this.metadata.get(contextKey);
-    const launchProfileId = resolveLaunchProfileId(this.config, meta);
+    const launchProfileId = resolveLaunchProfileId(this.config, meta, options?.launchProfileId);
     const createOptions: CreateOptions = {
       workspace: meta?.workspace,
       model: meta?.model,
@@ -54,10 +60,24 @@ export class SessionRegistry {
     if (meta?.nextReasoningEffort) {
       createOptions.nextReasoningEffort = meta.nextReasoningEffort;
     }
-    session = await CodexSessionService.create(this.config, createOptions);
+    const createVersion = this.creationVersions.get(contextKey) ?? 0;
+    const createPromise = CodexSessionService.create(this.config, createOptions)
+      .then((createdSession) => {
+        if ((this.creationVersions.get(contextKey) ?? 0) !== createVersion) {
+          createdSession.dispose();
+          throw new Error(`Session creation for ${contextKey} was invalidated`);
+        }
+        this.sessions.set(contextKey, createdSession);
+        return createdSession;
+      })
+      .finally(() => {
+        if (this.creatingSessions.get(contextKey) === createPromise) {
+          this.creatingSessions.delete(contextKey);
+        }
+      });
 
-    this.sessions.set(contextKey, session);
-    return session;
+    this.creatingSessions.set(contextKey, createPromise);
+    return createPromise;
   }
 
   get(contextKey: TelegramContextKey): CodexSessionService | undefined {
@@ -100,6 +120,8 @@ export class SessionRegistry {
     const session = this.sessions.get(contextKey);
     session?.dispose();
     this.sessions.delete(contextKey);
+    this.creatingSessions.delete(contextKey);
+    this.creationVersions.set(contextKey, (this.creationVersions.get(contextKey) ?? 0) + 1);
     this.metadata.delete(contextKey);
     this.onRemoveCallback?.(contextKey);
     this.persistMetadata();
@@ -109,7 +131,11 @@ export class SessionRegistry {
     for (const session of this.sessions.values()) {
       session.dispose();
     }
+    for (const contextKey of this.creatingSessions.keys()) {
+      this.creationVersions.set(contextKey, (this.creationVersions.get(contextKey) ?? 0) + 1);
+    }
     this.sessions.clear();
+    this.creatingSessions.clear();
   }
 
   private persistMetadata(): void {
@@ -149,7 +175,19 @@ export class SessionRegistry {
 function resolveLaunchProfileId(
   config: TeleCodexConfig,
   meta: ContextMetadata | undefined,
+  requestedLaunchProfileId: string | undefined,
 ): string | undefined {
+  if (requestedLaunchProfileId) {
+    if (findLaunchProfile(config.launchProfiles, requestedLaunchProfileId)) {
+      return requestedLaunchProfileId;
+    }
+
+    console.warn(
+      `Unknown requested launch profile "${requestedLaunchProfileId}". Falling back to ${config.defaultLaunchProfileId}.`,
+    );
+    return undefined;
+  }
+
   if (!meta?.launchProfileId) {
     return undefined;
   }

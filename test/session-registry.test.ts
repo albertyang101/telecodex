@@ -119,6 +119,7 @@ describe("SessionRegistry", () => {
       persona: undefined,
       personasRoot: "/Users/albert/personas",
       contextKey: undefined,
+      launchProfileId: undefined,
       pollMs: 500,
       fullScanMs: 10_000,
       autoReply: false,
@@ -189,6 +190,102 @@ describe("SessionRegistry", () => {
 
     expect(first).toBe(second);
     expect(mockSessionState.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces concurrent creation for the same new context key", async () => {
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    mockSessionState.create.mockImplementationOnce(async (config: TeleCodexConfig) => {
+      await createGate;
+      return createMockSession({
+        threadId: null,
+        workspace: config.workspace,
+        model: config.codexModel,
+        launchProfileId: config.defaultLaunchProfileId,
+        launchProfileLabel: "Default",
+        launchProfileBehavior: "workspace-write / never",
+        sandboxMode: "workspace-write",
+        approvalPolicy: "never",
+        unsafeLaunch: false,
+      });
+    });
+    const registry = new SessionRegistry(createConfig());
+
+    const firstPromise = registry.getOrCreate("123");
+    const secondPromise = registry.getOrCreate("123");
+    releaseCreate();
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+    expect(first).toBe(second);
+    expect(mockSessionState.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resurrect a context when pending session creation resolves after remove", async () => {
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    mockSessionState.create.mockImplementationOnce(async (config: TeleCodexConfig) => {
+      await createGate;
+      return createMockSession({
+        threadId: null,
+        workspace: config.workspace,
+        model: config.codexModel,
+        launchProfileId: config.defaultLaunchProfileId,
+        launchProfileLabel: "Default",
+        launchProfileBehavior: "workspace-write / never",
+        sandboxMode: "workspace-write",
+        approvalPolicy: "never",
+        unsafeLaunch: false,
+      });
+    });
+    const registry = new SessionRegistry(createConfig());
+
+    const stalePromise = registry.getOrCreate("123");
+    registry.remove("123");
+    releaseCreate();
+
+    await expect(stalePromise).rejects.toThrow("Session creation for 123 was invalidated");
+    const stale = mockSessionState.sessions[0]!;
+    expect(stale.dispose).toHaveBeenCalledTimes(1);
+    expect(registry.has("123")).toBe(false);
+
+    const fresh = await registry.getOrCreate("123");
+    expect(fresh).not.toBe(stale);
+    expect(mockSessionState.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not resurrect sessions when pending creation resolves after disposeAll", async () => {
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    mockSessionState.create.mockImplementationOnce(async (config: TeleCodexConfig) => {
+      await createGate;
+      return createMockSession({
+        threadId: null,
+        workspace: config.workspace,
+        model: config.codexModel,
+        launchProfileId: config.defaultLaunchProfileId,
+        launchProfileLabel: "Default",
+        launchProfileBehavior: "workspace-write / never",
+        sandboxMode: "workspace-write",
+        approvalPolicy: "never",
+        unsafeLaunch: false,
+      });
+    });
+    const registry = new SessionRegistry(createConfig());
+
+    const stalePromise = registry.getOrCreate("123");
+    registry.disposeAll();
+    releaseCreate();
+
+    await expect(stalePromise).rejects.toThrow("Session creation for 123 was invalidated");
+    const stale = mockSessionState.sessions[0]!;
+    expect(stale.dispose).toHaveBeenCalledTimes(1);
+    expect(registry.has("123")).toBe(false);
   });
 
   it("returns different session instances for different context keys", async () => {
@@ -323,6 +420,47 @@ describe("SessionRegistry", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       'Unknown persisted launch profile "missing" for 123. Falling back to default.',
     );
+  });
+
+  it("uses an explicit launch profile option for new sessions", async () => {
+    const registry = new SessionRegistry(createConfig());
+
+    await registry.getOrCreate("mailbox:albert-v3", { launchProfileId: "readonly" });
+
+    expect(mockSessionState.create).toHaveBeenCalledWith(createConfig(), {
+      workspace: undefined,
+      model: undefined,
+      reasoningEffort: undefined,
+      launchProfileId: "readonly",
+      resumeThreadId: undefined,
+    });
+  });
+
+  it("lets an explicit launch profile option override persisted metadata", async () => {
+    const persistPath = path.join("/workspace/base", ".telecodex", "contexts.json");
+    mockFsState.files.set(
+      persistPath,
+      JSON.stringify([
+        {
+          contextKey: "mailbox:albert-v3",
+          threadId: "thread-mailbox",
+          workspace: "/workspace/base",
+          launchProfileId: "default",
+          updatedAt: 10,
+        },
+      ]),
+    );
+    const registry = new SessionRegistry(createConfig());
+
+    await registry.getOrCreate("mailbox:albert-v3", { launchProfileId: "readonly" });
+
+    expect(mockSessionState.create).toHaveBeenCalledWith(createConfig(), {
+      workspace: "/workspace/base",
+      model: undefined,
+      reasoningEffort: undefined,
+      launchProfileId: "readonly",
+      resumeThreadId: "thread-mailbox",
+    });
   });
 
   it("updates metadata and lists contexts sorted by newest first", async () => {

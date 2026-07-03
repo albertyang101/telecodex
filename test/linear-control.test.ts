@@ -50,7 +50,7 @@ describe("Linear control helper", () => {
     });
   });
 
-  it("resolves the issue id before creating a comment", async () => {
+  it("returns the created comment id and url after creating a comment", async () => {
     const calls: Array<{ url: string; init: RequestInit; body: any }> = [];
     const fetcher = vi.fn(async (url: string, init: RequestInit) => {
       const body = JSON.parse(String(init.body));
@@ -70,6 +70,10 @@ describe("Linear control helper", () => {
         data: {
           commentCreate: {
             success: true,
+            comment: {
+              id: "comment-uuid",
+              url: "https://linear.app/albert-yang/issue/ALB-714/test#comment-uuid",
+            },
           },
         },
       });
@@ -85,6 +89,8 @@ describe("Linear control helper", () => {
       ok: true,
       issueIdentifier: "ALB-714",
       issueUrl: "https://linear.app/albert-yang/issue/ALB-714/test",
+      commentId: "comment-uuid",
+      commentUrl: "https://linear.app/albert-yang/issue/ALB-714/test#comment-uuid",
     });
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(calls.map((call) => call.url)).toEqual([
@@ -93,6 +99,9 @@ describe("Linear control helper", () => {
     ]);
     expect(calls[0].body.variables).toEqual({ id: "ALB-714" });
     expect(calls[1].body.variables).toEqual({ issueId: "issue-uuid", body: "probe body" });
+    expect(calls[1].body.query).toContain("comment {");
+    expect(calls[1].body.query).toContain("id");
+    expect(calls[1].body.query).toContain("url");
     expect(calls[0].init.headers).toEqual(
       expect.objectContaining({
         Authorization: "linear-key",

@@ -20,6 +20,7 @@ const DEFAULT_FATAL_CLEANUP_TIMEOUT_MS = 2_000;
 
 export type FatalProcessHandlerOptions = {
   process?: ProcessLike;
+  getStopTelegramPolling?: () => (() => void | Promise<void>) | undefined;
   getBot?: () => StoppableBot | undefined;
   getStopMailboxBridge?: () => (() => void) | undefined;
   getRegistry?: () => DisposableRegistry | undefined;
@@ -42,6 +43,20 @@ export function installFatalProcessHandlers(options: FatalProcessHandlerOptions 
     handlingFatal = true;
 
     logger.error(`Fatal ${kind}: ${formatFatalError(error)}`);
+
+    try {
+      const stopTelegramPolling = options.getStopTelegramPolling?.();
+      if (stopTelegramPolling) {
+        await runWithTimeout(
+          stopTelegramPolling,
+          cleanupTimeoutMs,
+          "Timed out stopping Telegram polling after fatal error",
+          logger,
+        );
+      }
+    } catch (stopError) {
+      logger.error(`Failed to stop Telegram polling after fatal error: ${formatFatalError(stopError)}`);
+    }
 
     try {
       const fatalBot = options.getBot?.();

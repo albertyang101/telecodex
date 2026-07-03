@@ -329,6 +329,47 @@ describe("CodexSessionService", () => {
     expect(mcpConfig).not.toHaveProperty("default_tools_approval_mode");
   });
 
+  it("injects the persona mail MCP server when mailbox bridge is enabled", async () => {
+    await CodexSessionService.create(
+      createConfig({
+        mailboxBridge: {
+          enabled: true,
+          persona: "albert-codex-e2e",
+          personasRoot: "/Users/albert/personas",
+          contextKey: undefined,
+          pollMs: 500,
+          fullScanMs: 10_000,
+          autoReply: true,
+          maxMessagesPerTick: 1,
+        },
+      }),
+    );
+
+    expect(mockState.Codex).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({
+          approval_policy: "never",
+          mcp_servers: {
+            persona_mail: {
+              command: process.execPath,
+              args: expect.arrayContaining([
+                expect.stringMatching(/persona-mail-mcp-server\.(js|ts)$/),
+              ]),
+              env_vars: ["PERSONAS_ROOT", "MAILBOX_PERSONA"],
+              default_tools_approval_mode: "approve",
+              enabled_tools: ["send_persona_mail"],
+              startup_timeout_sec: 10,
+              tool_timeout_sec: 30,
+            },
+          },
+        }),
+        env: expect.objectContaining({
+          PERSONAS_ROOT: "/Users/albert/personas",
+          MAILBOX_PERSONA: "albert-codex-e2e",
+        }),
+      }),
+    );
+  });
   it("injects the Linear control MCP server when enabled", async () => {
     await CodexSessionService.create(
       createConfig({

@@ -89,33 +89,29 @@ type BusyState = {
   transcribing: number;
 };
 
-type QueuedPrompt = {
-  ctx: Context;
-  chatId: TelegramChatId;
-  session: CodexSessionService;
-  status: "pending" | "ready" | "skipped";
-  input?: CodexPromptInput;
-  receiptReaction?: Promise<void>;
-  afterPrompt?: () => Promise<void>;
+export type TeleCodexBot = Bot<Context> & {
+  waitForIdle: () => Promise<void>;
+  getInFlightCount: () => number;
 };
 
-class CodexTurnTimeoutError extends Error {
-  constructor(timeoutMs: number) {
-    super(`Codex turn timed out after ${timeoutMs}ms`);
-    this.name = "CodexTurnTimeoutError";
-  }
+export function formatTelegramIngressAuditLine(ctx: Context, authorized: boolean): string {
+  const updateId = (ctx.update as { update_id?: number } | undefined)?.update_id ?? "unknown";
+  const updateType = ctx.message ? "message" : ctx.callbackQuery ? "callback_query" : "unknown";
+  const fromId = ctx.from?.id ?? "unknown";
+  const chatId = ctx.chat?.id ?? "unknown";
+  const chatType = ctx.chat?.type ?? "unknown";
+  const messageId = ctx.message?.message_id ?? ctx.callbackQuery?.message?.message_id ?? "unknown";
+  return [
+    `Telegram ingress update_id=${updateId}`,
+    `type=${updateType}`,
+    `from_id=${fromId}`,
+    `chat_id=${chatId}`,
+    `chat_type=${chatType}`,
+    `message_id=${messageId}`,
+    `authorized=${authorized ? "yes" : "no"}`,
+  ].join(" ");
 }
 
-class CodexTurnAbortGraceError extends Error {
-  constructor(timeoutMs: number, abortGraceMs: number) {
-    super(`Codex turn remained active after timeout abort grace (${timeoutMs}ms + ${abortGraceMs}ms)`);
-    this.name = "CodexTurnAbortGraceError";
-  }
-}
-
-export type BotRecoveryOptions = {
-  onFatalRecovery?: (error: Error) => void;
-};
 
 const SOURCE_REQUEST_RE =
   /((?:show|include|with|provide|send|list|cite|add|attach|give)\s+(?:me\s+)?(?:the\s+)?(?:visible\s+)?(?:sources?|references?|citations?|sauces?|links?|urls?)|official\s+(?:site|url|link)|source\s*block|(?:给|列|带|附|发|贴|提供|保留|加上|展示|显示).{0,12}(?:引用|来源|出处|参考资料|链接|网址|官网)|(?:引用|来源|出处|参考资料|链接|网址|官网).{0,12}(?:发我|给我|列出|带上|附上|也要|保留|贴出来))/i;
@@ -244,83 +240,6 @@ async function appendMemoryTranscriptTurn(
   await appendFile(file, block, "utf8");
 }
 
-async function waitForCodexPrompt(
-  session: CodexSessionService,
-  promptPromise: Promise<void>,
-  timeoutMs: number | undefined,
-  options?: {
-    abortGraceMs?: number;
-    onSettledAfterTimeout?: () => Promise<void>;
-    onFatalRecovery?: (error: Error) => void;
-  },
-): Promise<void> {
-  if (!timeoutMs) {
-    await promptPromise;
-    return;
-  }
-
-  let timedOut = false;
-  let notifiedPostTimeoutSettle = false;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  let abortGraceTimeout: ReturnType<typeof setTimeout> | undefined;
-  const notifyPromptSettledAfterTimeout = (error?: unknown): void => {
-    if (!timedOut || notifiedPostTimeoutSettle) {
-      return;
-    }
-    notifiedPostTimeoutSettle = true;
-    if (abortGraceTimeout) {
-      clearTimeout(abortGraceTimeout);
-      abortGraceTimeout = undefined;
-    }
-
-    if (error && !isAbortLikeError(error)) {
-      console.error("Codex prompt error after timeout abort:", formatError(error));
-    }
-
-    if (!options?.onSettledAfterTimeout) {
-      return;
-    }
-
-    void options.onSettledAfterTimeout().catch((callbackError) => {
-      console.error("Failed to drain queued prompts after timeout abort:", formatError(callbackError));
-    });
-  };
-  const observedPromptPromise = promptPromise.catch((error) => {
-    if (timedOut) {
-      notifyPromptSettledAfterTimeout(error);
-      return;
-    }
-    throw error;
-  }).then(() => {
-    notifyPromptSettledAfterTimeout();
-  });
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeout = setTimeout(() => {
-      timedOut = true;
-      void session.abort().catch((error) => {
-        console.error("Failed to abort timed-out Codex turn:", formatError(error));
-      });
-      if (options?.abortGraceMs && options.onFatalRecovery) {
-        abortGraceTimeout = setTimeout(() => {
-          if (notifiedPostTimeoutSettle || !session.isProcessing()) {
-            return;
-          }
-          options.onFatalRecovery?.(new CodexTurnAbortGraceError(timeoutMs, options.abortGraceMs!));
-        }, options.abortGraceMs);
-      }
-      reject(new CodexTurnTimeoutError(timeoutMs));
-    }, timeoutMs);
-  });
-
-  try {
-    await Promise.race([observedPromptPromise, timeoutPromise]);
-  } finally {
-    if (timeout) {
-      clearTimeout(timeout);
-    }
-  }
-}
-
 function stripVisibleSourceFooter(userText: string, replyText: string): string {
   if (!replyText || userRequestedSources(userText)) {
     return replyText;
@@ -400,9 +319,8 @@ function findSourceHeadingInRange(lines: string[], start: number, end: number): 
 export function createBot(
   config: TeleCodexConfig,
   registry: SessionRegistry,
-  recoveryOptions: BotRecoveryOptions = {},
-): Bot<Context> {
-  const bot = new Bot<Context>(config.telegramBotToken);
+): TeleCodexBot {
+  const bot = new Bot<Context>(config.telegramBotToken) as TeleCodexBot;
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
 
   const contextBusy = new Map<TelegramContextKey, BusyState>();
@@ -416,8 +334,41 @@ export function createBot(
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
-  const pendingPromptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
-  const drainingPromptQueues = new Set<TelegramContextKey>();
+  let inFlightCount = 0;
+  const idleWaiters = new Set<() => void>();
+  const textInFlightEnds = new WeakMap<Context, () => void>();
+
+  const notifyIdleWaiters = (): void => {
+    if (inFlightCount !== 0) {
+      return;
+    }
+    const waiters = [...idleWaiters];
+    idleWaiters.clear();
+    waiters.forEach((resolve) => resolve());
+  };
+
+  const beginInFlight = (): (() => void) => {
+    inFlightCount += 1;
+    let ended = false;
+    return () => {
+      if (ended) {
+        return;
+      }
+      ended = true;
+      inFlightCount = Math.max(0, inFlightCount - 1);
+      notifyIdleWaiters();
+    };
+  };
+
+  bot.getInFlightCount = () => inFlightCount;
+  bot.waitForIdle = async (): Promise<void> => {
+    if (inFlightCount === 0) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      idleWaiters.add(resolve);
+    });
+  };
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
@@ -425,8 +376,6 @@ export function createBot(
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
     lastPromptInput.delete(key);
-    pendingPromptQueues.delete(key);
-    drainingPromptQueues.delete(key);
   });
 
   const getBusyState = (contextKey: TelegramContextKey): BusyState => {
@@ -603,97 +552,6 @@ export function createBot(
     }
   };
 
-  const enqueuePrompt = (
-    contextKey: TelegramContextKey,
-    item: QueuedPrompt,
-  ): QueuedPrompt => {
-    const queue = pendingPromptQueues.get(contextKey) ?? [];
-    queue.push(item);
-    pendingPromptQueues.set(contextKey, queue);
-    return item;
-  };
-
-  const drainQueuedPrompts = async (contextKey: TelegramContextKey): Promise<void> => {
-    if (drainingPromptQueues.has(contextKey) || isBusy(contextKey)) {
-      return;
-    }
-
-    drainingPromptQueues.add(contextKey);
-    try {
-      while (!isBusy(contextKey)) {
-        const queue = pendingPromptQueues.get(contextKey);
-        const next = queue?.[0];
-        if (!next) {
-          pendingPromptQueues.delete(contextKey);
-          return;
-        }
-
-        if (next.status === "pending") {
-          return;
-        }
-
-        queue.shift();
-        if (queue && queue.length === 0) {
-          pendingPromptQueues.delete(contextKey);
-        }
-
-        if (next.status === "skipped") {
-          await failReaction(next.ctx, next.receiptReaction);
-          if (next.afterPrompt) {
-            await next.afterPrompt();
-          }
-          continue;
-        }
-
-        if (!next.input) {
-          if (next.afterPrompt) {
-            await next.afterPrompt();
-          }
-          continue;
-        }
-
-        try {
-          await handleUserPrompt(next.ctx, contextKey, next.chatId, next.session, next.input);
-          await completeReaction(next.ctx, next.receiptReaction);
-        } catch {
-          await failReaction(next.ctx, next.receiptReaction);
-        } finally {
-          if (next.afterPrompt) {
-            await next.afterPrompt();
-          }
-        }
-      }
-    } finally {
-      drainingPromptQueues.delete(contextKey);
-    }
-  };
-
-  const runOrQueuePrompt = async (
-    ctx: Context,
-    contextKey: TelegramContextKey,
-    chatId: TelegramChatId,
-    session: CodexSessionService,
-    input: CodexPromptInput,
-    options?: { reactionAlreadySet?: boolean },
-  ): Promise<void> => {
-    rememberPromptInput(contextKey, input);
-    const receiptReaction = options?.reactionAlreadySet ? undefined : setReaction(ctx, "👀");
-
-    const hasQueuedPrompts = (pendingPromptQueues.get(contextKey)?.length ?? 0) > 0;
-    if (isBusy(contextKey) || hasQueuedPrompts) {
-      enqueuePrompt(contextKey, { ctx, chatId, session, status: "ready", input, receiptReaction });
-      await drainQueuedPrompts(contextKey);
-      return;
-    }
-
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, input);
-      await completeReaction(ctx, receiptReaction);
-    } catch {
-      await failReaction(ctx, receiptReaction);
-    }
-  };
-
   const ensureActiveThread = async (
     ctx: Context,
     contextKey: TelegramContextKey,
@@ -725,13 +583,11 @@ export function createBot(
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
 
-    if (isBusy(contextKey)) {
-      await sendBusyReply(ctx);
-      return;
-    }
-
     const busyState = getBusyState(contextKey);
-    busyState.processing = true;
+    const ownsProcessingFlag = !busyState.processing;
+    if (ownsProcessingFlag) {
+      busyState.processing = true;
+    }
 
     const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
     const toolVerbosity: ToolVerbosity = config.toolVerbosity;
@@ -913,6 +769,32 @@ export function createBot(
       } catch (error) {
         if (!isMessageNotModifiedError(error)) {
           console.error("Failed to clear Abort button", error);
+        }
+      }
+    };
+
+    const removeInterruptedResponseMessage = async (): Promise<void> => {
+      if (!responseMessageId) {
+        return;
+      }
+
+      const interruptedMessageId = responseMessageId;
+      try {
+        await bot.api.deleteMessage(chatId, interruptedMessageId);
+        responseMessageId = undefined;
+        lastRenderedText = "";
+      } catch (deleteError) {
+        const replacement = renderMarkdownChunkWithinLimit("已收到后续消息，正在按最新内容处理。");
+        try {
+          await safeEditMessage(bot, chatId, interruptedMessageId, replacement.text, {
+            parseMode: replacement.parseMode,
+            fallbackText: replacement.fallbackText,
+            replyMarkup: new InlineKeyboard(),
+          });
+          lastRenderedText = replacement.text;
+        } catch (editError) {
+          console.error("Failed to clear interrupted Telegram response message:", formatError(deleteError));
+          console.error("Failed to replace interrupted Telegram response message:", formatError(editError));
         }
       }
     };
@@ -1173,16 +1055,7 @@ export function createBot(
         console.error("Failed to append memory user turn:", error instanceof Error ? error.message : String(error));
       });
 
-      await waitForCodexPrompt(
-        session,
-        session.prompt(withTelegramReplyStyleGuard(userInput, session.getInfo()), callbacks),
-        config.codexTurnTimeoutMs,
-        {
-          abortGraceMs: config.codexTurnAbortGraceMs,
-          onSettledAfterTimeout: () => drainQueuedPrompts(contextKey),
-          onFatalRecovery: recoveryOptions.onFatalRecovery,
-        },
-      );
+      await session.prompt(withTelegramReplyStyleGuard(userInput, session.getInfo()), callbacks);
       updateSessionMetadata(contextKey, session);
       const finalVisibleText = await ensureFinalized();
       await appendMemoryTranscriptTurn(
@@ -1231,8 +1104,9 @@ export function createBot(
     } finally {
       stopTyping();
       clearFlushTimer();
-      busyState.processing = false;
-      await drainQueuedPrompts(contextKey);
+      if (ownsProcessingFlag) {
+        busyState.processing = false;
+      }
     }
   };
 
@@ -1274,7 +1148,9 @@ export function createBot(
 
   bot.use(async (ctx, next) => {
     const fromId = ctx.from?.id;
-    if (!fromId || !config.telegramAllowedUserIdSet.has(fromId)) {
+    const authorized = Boolean(fromId && config.telegramAllowedUserIdSet.has(fromId));
+    console.log(formatTelegramIngressAuditLine(ctx, authorized));
+    if (!authorized) {
       if (ctx.callbackQuery) {
         await ctx.answerCallbackQuery({ text: "Unauthorized" }).catch(() => {});
       } else if (ctx.chat) {
@@ -1283,7 +1159,21 @@ export function createBot(
       return;
     }
 
-    await next();
+    const userText = ctx.message?.text?.trim();
+    const shouldTrackTextTurn = Boolean(userText && !userText.startsWith("/") && contextKeyFromCtx(ctx));
+    const endInFlight = shouldTrackTextTurn ? beginInFlight() : undefined;
+    if (endInFlight) {
+      textInFlightEnds.set(ctx, endInFlight);
+    }
+
+    try {
+      await next();
+    } finally {
+      if (endInFlight && textInFlightEnds.get(ctx) === endInFlight) {
+        textInFlightEnds.delete(ctx);
+        endInFlight();
+      }
+    }
   });
 
   bot.command("start", async (ctx) => {
@@ -1342,6 +1232,7 @@ export function createBot(
   });
 
   bot.command("login", async (ctx) => {
+
     if (!ctx.chat) {
       return;
     }
@@ -1387,6 +1278,7 @@ export function createBot(
   });
 
   bot.command("logout", async (ctx) => {
+
     if (!ctx.chat) {
       return;
     }
@@ -1570,7 +1462,7 @@ export function createBot(
       return;
     }
 
-    const { session } = contextSession;
+    const { contextKey, session } = contextSession;
     try {
       await session.abort();
       await safeReply(ctx, escapeHTML("Aborted current operation"), {
@@ -2019,6 +1911,7 @@ export function createBot(
   handlePageCallback(/^effort_page_(\d+)$/, "effort", pendingEffortButtons, "Expired, run /effort again");
 
   bot.callbackQuery(/^codex_abort:(.+)$/, async (ctx) => {
+
     const contextKey = ctx.match?.[1];
     if (!contextKey) {
       await ctx.answerCallbackQuery();
@@ -2405,6 +2298,11 @@ export function createBot(
       return;
     }
 
+    if (isBusy(contextKey)) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
     await ctx.answerCallbackQuery({ text: `Effort set to ${effort}` });
     pendingEffortButtons.delete(contextKey);
     session.setReasoningEffort(effort);
@@ -2416,8 +2314,8 @@ export function createBot(
   });
 
   bot.on("message:text", async (ctx) => {
-    const contextSession = await getContextSession(ctx);
-    if (!contextSession) {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
       return;
     }
 
@@ -2426,8 +2324,21 @@ export function createBot(
       return;
     }
 
-    const { contextKey, session } = contextSession;
-    await runOrQueuePrompt(ctx, contextKey, ctx.chat.id, session, userText);
+    const trackedByMiddleware = textInFlightEnds.has(ctx);
+    const endInFlight = trackedByMiddleware ? undefined : beginInFlight();
+    try {
+      const session = await registry.getOrCreate(contextKey);
+      rememberPromptInput(contextKey, userText);
+      const receiptReaction = setReaction(ctx, "👀");
+      try {
+        await handleUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
+        await completeReaction(ctx, receiptReaction);
+      } catch {
+        await failReaction(ctx, receiptReaction);
+      }
+    } finally {
+      endInFlight?.();
+    }
   });
 
   bot.on(["message:voice", "message:audio"], async (ctx) => {
@@ -2438,16 +2349,15 @@ export function createBot(
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
-
     const fileId = ctx.message.voice?.file_id ?? ctx.message.audio?.file_id;
     if (!fileId) {
       return;
     }
 
     const receiptReaction = setReaction(ctx, "👀");
-    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
+    let transcript = "";
     const messageThreadId = parseContextKey(contextKey).messageThreadId;
 
     try {
@@ -2456,23 +2366,19 @@ export function createBot(
         return await transcribeAudio(tempFilePath);
       }, messageThreadId);
 
-      const transcript = result.text.trim();
+      transcript = result.text.trim();
       if (!transcript) {
-        queuedPrompt.status = "skipped";
+        await failReaction(ctx, receiptReaction);
         void safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
           fallbackText: "Transcription was empty. Please try again or send text instead.",
         }).catch(() => {});
         return;
       }
-
-      queuedPrompt.status = "ready";
-      queuedPrompt.input = transcript;
-      rememberPromptInput(contextKey, transcript);
     } catch (error) {
-      queuedPrompt.status = "skipped";
+      await failReaction(ctx, receiptReaction);
       const note = "Note: voice transcription is separate from CODEX_API_KEY.";
-      void safeReply(ctx, `<b>Transcription failed:</b>\n${escapeHTML(friendlyErrorText(error))}\n\n<i>${escapeHTML(note)}</i>`, {
-        fallbackText: `Transcription failed:\n${friendlyErrorText(error)}\n\n${note}`,
+      void safeReply(ctx, "<b>Transcription failed:</b>\n" + escapeHTML(friendlyErrorText(error)) + "\n\n<i>" + escapeHTML(note) + "</i>", {
+        fallbackText: "Transcription failed:\n" + friendlyErrorText(error) + "\n\n" + note,
       }).catch(() => {});
       return;
     } finally {
@@ -2480,7 +2386,14 @@ export function createBot(
       if (tempFilePath) {
         await unlink(tempFilePath).catch(() => {});
       }
-      await drainQueuedPrompts(contextKey);
+    }
+
+    rememberPromptInput(contextKey, transcript);
+    try {
+      await handleUserPrompt(ctx, contextKey, chatId, session, transcript);
+      await completeReaction(ctx, receiptReaction);
+    } catch {
+      await failReaction(ctx, receiptReaction);
     }
   });
 
@@ -2492,7 +2405,6 @@ export function createBot(
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
-
     const photos = ctx.message.photo;
     const photo = photos[photos.length - 1];
     if (!photo) {
@@ -2500,7 +2412,6 @@ export function createBot(
     }
 
     const receiptReaction = setReaction(ctx, "👀");
-    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 
@@ -2508,14 +2419,13 @@ export function createBot(
       await ctx.api.sendChatAction(chatId, "upload_photo");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, photo.file_id, 20 * 1024 * 1024);
     } catch (error) {
-      queuedPrompt.status = "skipped";
-      void safeReply(ctx, `<b>Failed to download photo:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed to download photo: ${friendlyErrorText(error)}`,
+      await failReaction(ctx, receiptReaction);
+      void safeReply(ctx, "<b>Failed to download photo:</b> " + escapeHTML(friendlyErrorText(error)), {
+        fallbackText: "Failed to download photo: " + friendlyErrorText(error),
       }).catch(() => {});
       return;
     } finally {
       stopTranscribing();
-      await drainQueuedPrompts(contextKey);
     }
 
     const caption = ctx.message.caption?.trim();
@@ -2524,12 +2434,14 @@ export function createBot(
       promptInput.text = caption;
     }
     rememberPromptInput(contextKey, promptInput);
-    queuedPrompt.status = "ready";
-    queuedPrompt.input = promptInput;
-    queuedPrompt.afterPrompt = async () => {
+    try {
+      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
+      await completeReaction(ctx, receiptReaction);
+    } catch {
+      await failReaction(ctx, receiptReaction);
+    } finally {
       await unlink(tempFilePath).catch(() => {});
-    };
-    await drainQueuedPrompts(contextKey);
+    }
   });
 
   bot.on("message:document", async (ctx) => {
@@ -2540,7 +2452,6 @@ export function createBot(
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
-
     const doc = ctx.message.document;
     if (!doc) {
       return;
@@ -2549,14 +2460,13 @@ export function createBot(
     if (doc.file_size && doc.file_size > config.maxFileSize) {
       const sizeMB = Math.round(doc.file_size / 1024 / 1024);
       const maxMB = Math.round(config.maxFileSize / 1024 / 1024);
-      await safeReply(ctx, `<b>File too large</b> (${sizeMB} MB, max ${maxMB} MB)`, {
-        fallbackText: `File too large (${sizeMB} MB, max ${maxMB} MB)`,
+      await safeReply(ctx, "<b>File too large</b> (" + sizeMB + " MB, max " + maxMB + " MB)", {
+        fallbackText: "File too large (" + sizeMB + " MB, max " + maxMB + " MB)",
       });
       return;
     }
 
     const receiptReaction = setReaction(ctx, "👀");
-    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 
@@ -2564,14 +2474,13 @@ export function createBot(
       await ctx.api.sendChatAction(chatId, "typing");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, doc.file_id, config.maxFileSize);
     } catch (error) {
-      queuedPrompt.status = "skipped";
-      void safeReply(ctx, `<b>Failed to download file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed to download file: ${friendlyErrorText(error)}`,
+      await failReaction(ctx, receiptReaction);
+      void safeReply(ctx, "<b>Failed to download file:</b> " + escapeHTML(friendlyErrorText(error)), {
+        fallbackText: "Failed to download file: " + friendlyErrorText(error),
       }).catch(() => {});
       return;
     } finally {
       stopTranscribing();
-      await drainQueuedPrompts(contextKey);
     }
 
     const turnId = randomUUID().slice(0, 12);
@@ -2588,11 +2497,10 @@ export function createBot(
         maxFileSize: config.maxFileSize,
       });
     } catch (error) {
-      queuedPrompt.status = "skipped";
-      void safeReply(ctx, `<b>Failed to stage file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed to stage file: ${friendlyErrorText(error)}`,
+      await failReaction(ctx, receiptReaction);
+      void safeReply(ctx, "<b>Failed to stage file:</b> " + escapeHTML(friendlyErrorText(error)), {
+        fallbackText: "Failed to stage file: " + friendlyErrorText(error),
       }).catch(() => {});
-      await drainQueuedPrompts(contextKey);
       return;
     } finally {
       if (tempFilePath) {
@@ -2600,23 +2508,21 @@ export function createBot(
       }
     }
 
-    void safeReply(ctx, `📎 <b>Received:</b> <code>${escapeHTML(stagedFile.safeName)}</code>`, {
-      fallbackText: `📎 Received: ${stagedFile.safeName}`,
+    void safeReply(ctx, "📎 <b>Received:</b> <code>" + escapeHTML(stagedFile.safeName) + "</code>", {
+      fallbackText: "📎 Received: " + stagedFile.safeName,
     }).catch(() => {});
 
-    // Keep typing visible during the gap between staging and prompt execution
     await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
 
     const outDir = outboxPath(workspace, turnId);
     try {
       await ensureOutDir(outDir);
     } catch (error) {
-      queuedPrompt.status = "skipped";
-      void safeReply(ctx, `<b>Failed to prepare output folder:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed to prepare output folder: ${friendlyErrorText(error)}`,
+      await failReaction(ctx, receiptReaction);
+      void safeReply(ctx, "<b>Failed to prepare output folder:</b> " + escapeHTML(friendlyErrorText(error)), {
+        fallbackText: "Failed to prepare output folder: " + friendlyErrorText(error),
       }).catch(() => {});
       await cleanupInbox(workspace, turnId).catch(() => {});
-      await drainQueuedPrompts(contextKey);
       return;
     }
 
@@ -2629,19 +2535,16 @@ export function createBot(
     }
     rememberPromptInput(contextKey, promptInput);
 
-    queuedPrompt.status = "ready";
-    queuedPrompt.input = promptInput;
-    queuedPrompt.afterPrompt = async () => {
-      try {
-        await deliverArtifacts(ctx, chatId, outDir, parseContextKey(contextKey).messageThreadId);
-      } catch (artifactError) {
-        console.error("Failed to deliver artifacts:", artifactError);
-      } finally {
-        await cleanupInbox(workspace, turnId);
-        // TODO: prune old outbox turn folders by age or count to avoid unbounded growth
-      }
-    };
-    await drainQueuedPrompts(contextKey);
+    try {
+      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
+      await completeReaction(ctx, receiptReaction);
+      await deliverArtifacts(ctx, chatId, outDir, parseContextKey(contextKey).messageThreadId);
+    } catch (error) {
+      await failReaction(ctx, receiptReaction);
+      console.error("Failed to process document prompt:", error);
+    } finally {
+      await cleanupInbox(workspace, turnId);
+    }
   });
 
   bot.catch((error) => {
@@ -3164,9 +3067,9 @@ function isTelegramParseError(error: unknown): boolean {
   );
 }
 
-function renderPromptFailure(accumulatedText: string, error: unknown): string {
+function renderPromptFailure(_accumulatedText: string, error: unknown): string {
   const message = friendlyErrorText(error);
-  return accumulatedText.trim() ? `${accumulatedText.trim()}\n\n⚠️ ${message}` : `⚠️ ${message}`;
+  return `⚠️ ${message}`;
 }
 
 function isAbortLikeError(error: unknown): boolean {

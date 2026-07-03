@@ -138,6 +138,50 @@ describe("installFatalProcessHandlers", () => {
     expect(exit).toHaveBeenCalledWith(1);
   });
 
+  it("stops runner polling before other fatal cleanup so token polling is released", async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const processLike = {
+      once: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        handlers.set(event, handler);
+      }),
+    };
+    const cleanupOrder: string[] = [];
+    const stopTelegramPolling = vi.fn(async () => {
+      cleanupOrder.push("polling");
+    });
+    const bot = {
+      stop: vi.fn(() => {
+        cleanupOrder.push("bot");
+      }),
+    };
+    const stopMailboxBridge = vi.fn(() => {
+      cleanupOrder.push("mailbox");
+    });
+    const registry = {
+      disposeAll: vi.fn(() => {
+        cleanupOrder.push("registry");
+      }),
+    };
+    const exit = vi.fn(() => {
+      cleanupOrder.push("exit");
+    });
+
+    installFatalProcessHandlers({
+      process: processLike,
+      getStopTelegramPolling: () => stopTelegramPolling,
+      getBot: () => bot,
+      getStopMailboxBridge: () => stopMailboxBridge,
+      getRegistry: () => registry,
+      logger: { error: vi.fn() },
+      exit,
+    });
+
+    await handlers.get("uncaughtException")?.(new Error("polling conflict"));
+
+    expect(stopTelegramPolling).toHaveBeenCalledTimes(1);
+    expect(cleanupOrder).toEqual(["polling", "bot", "mailbox", "registry", "exit"]);
+  });
+
   it("bounds async bot stop so fatal recovery still exits", async () => {
     const handlers = new Map<string, (...args: unknown[]) => unknown>();
     const processLike = {

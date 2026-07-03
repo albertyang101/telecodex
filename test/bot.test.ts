@@ -43,6 +43,7 @@ const mockGrammy = vi.hoisted(() => {
       sendMessage: vi.fn().mockImplementation(async () => ({ message_id: api.sendMessage.mock.calls.length })),
       editMessageText: vi.fn().mockResolvedValue(true),
       editMessageReplyMarkup: vi.fn().mockResolvedValue(true),
+      deleteMessage: vi.fn().mockResolvedValue(true),
       setMyCommands: vi.fn().mockResolvedValue(true),
       setMessageReaction: vi.fn().mockResolvedValue(true),
     };
@@ -110,12 +111,13 @@ describe("createBot response delivery", () => {
   const originalTelegramFileDownloadTimeoutMs = process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS;
   const originalVoiceTranscriptionTimeoutMs = process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS;
   const tempDirs: string[] = [];
+  let defaultWorkspace = path.join(tmpdir(), "telecodex-bot-test-workspace-initial");
 
   const createConfig = (overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig => ({
     telegramBotToken: "bot-token",
     telegramAllowedUserIds: [123],
     telegramAllowedUserIdSet: new Set([123]),
-    workspace: "/workspace/base",
+    workspace: defaultWorkspace,
     maxFileSize: 20 * 1024 * 1024,
     codexApiKey: "codex-key",
     codexModel: "gpt-5.5",
@@ -149,14 +151,14 @@ describe("createBot response delivery", () => {
     isProcessing: vi.fn(() => false),
     hasActiveThread: vi.fn(() => true),
     newThread: vi.fn(),
-    getCurrentWorkspace: vi.fn(() => "/workspace/base"),
+    getCurrentWorkspace: vi.fn(() => defaultWorkspace),
     prompt: vi.fn(async (input, callbacks: CodexSessionCallbacks) => {
       await onPrompt(callbacks, input);
     }),
     abort: vi.fn(async () => undefined),
     getInfo: vi.fn(() => ({
       threadId: "thread-1",
-      workspace: "/workspace/base",
+      workspace: defaultWorkspace,
       model: "gpt-5.5",
       reasoningEffort: "xhigh",
       launchProfileId: "default",
@@ -168,17 +170,35 @@ describe("createBot response delivery", () => {
     })),
   });
 
-  const createRegistry = (session: any) => ({
-    onRemove: vi.fn(),
-    get: vi.fn(() => session),
-    getOrCreate: vi.fn(async () => session),
-    updateMetadata: vi.fn(),
-  });
+  const createRegistry = (session: any) => {
+    const removeCallbacks: Array<(key: string) => void> = [];
+    return {
+      __removeCallbacks: removeCallbacks,
+      onRemove: vi.fn((callback: (key: string) => void) => {
+        removeCallbacks.push(callback);
+      }),
+      get: vi.fn(() => session),
+      getOrCreate: vi.fn(async () => session),
+      updateMetadata: vi.fn(),
+    };
+  };
 
   beforeEach(() => {
+    defaultWorkspace = path.join(
+      tmpdir(),
+      `telecodex-bot-test-workspace-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    );
+    tempDirs.push(defaultWorkspace);
     mockGrammy.bots.length = 0;
     mockGrammy.Bot.mockClear();
-    mockAuth.checkAuthStatus.mockClear();
+    mockAuth.checkAuthStatus.mockReset();
+    mockAuth.checkAuthStatus.mockResolvedValue({
+      authenticated: true,
+      method: "cli",
+      detail: "authenticated",
+    });
+    mockAuth.startLogin.mockReset();
+    mockAuth.startLogout.mockReset();
     process.env.VOICE_TRANSCRIPTION_BACKEND = "parakeet";
     process.env.QWEN_ASR_SOCKET = "/tmp/telecodex-test-missing-qwen-asr.sock";
   });
@@ -269,6 +289,89 @@ describe("createBot response delivery", () => {
     const html = bot.api.sendMessage.mock.calls[0][1] as string;
     expect(html).toContain("Voice transcription configuration error");
     expect(html).toContain("VOICE_TRANSCRIPTION_BACKEND");
+  });
+
+  it("waits for an active text turn before reporting idle during shutdown", async () => {
+    const releasePrompt = deferred<void>();
+    const session = createSession(async (callbacks) => {
+      await releasePrompt.promise;
+      callbacks.onAgentMessage?.("drained reply");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const turn = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 7, text: "hold this turn" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    let idleResolved = false;
+    const idle = bot.waitForIdle().then(() => {
+      idleResolved = true;
+    });
+    await Promise.resolve();
+
+    expect(bot.getInFlightCount()).toBe(1);
+    expect(idleResolved).toBe(false);
+
+    releasePrompt.resolve();
+    await turn;
+    await idle;
+
+    expect(bot.getInFlightCount()).toBe(0);
+    expect(idleResolved).toBe(true);
+    expect(bot.api.sendMessage.mock.calls[0][1]).toContain("drained reply");
+  });
+
+  it("tracks authorized text updates while middleware is still dispatching during shutdown", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const middleware = bot.__handlers.use[0];
+    const releaseNext = deferred<void>();
+    let nextStarted = false;
+
+    const turn = middleware(
+      {
+        update: { update_id: 77 },
+        chat: { id: 42, type: "private" },
+        from: { id: 123 },
+        message: { message_id: 8, text: "hold before text handler" },
+        api: bot.api,
+      },
+      async () => {
+        nextStarted = true;
+        await releaseNext.promise;
+      },
+    );
+
+    await vi.waitFor(() => expect(nextStarted).toBe(true));
+
+    let idleResolved = false;
+    const idle = bot.waitForIdle().then(() => {
+      idleResolved = true;
+    });
+    await Promise.resolve();
+
+    expect(bot.getInFlightCount()).toBe(1);
+    expect(idleResolved).toBe(false);
+
+    releaseNext.resolve();
+    await turn;
+    await idle;
+
+    expect(bot.getInFlightCount()).toBe(0);
+    expect(idleResolved).toBe(true);
   });
 
   it("can buffer agent deltas and only send the final response to Telegram", async () => {
@@ -511,7 +614,8 @@ describe("createBot response delivery", () => {
     const codexInput = session.prompt.mock.calls[0][0] as string;
     expect(codexInput).toContain("[DEVELOPER DISCIPLINE]");
     expect(codexInput).toContain("discipline_version=ALB-714-hard-discipline-v1");
-    expect(codexInput).toContain("explain why a bug happened before fixing it");
+    expect(codexInput).toContain("find the first cause");
+    expect(codexInput).toContain("check existing architecture/tooling before adding new code");
     expect(codexInput).toContain("fix at the earliest reliable boundary");
     expect(codexInput).toContain("workarounds are temporary and require Linear follow-up");
     expect(codexInput).toContain("修一下这个 bug");
@@ -995,7 +1099,9 @@ describe("createBot response delivery", () => {
     expect(input.stagedFileInstructions).toContain("Current reasoning effort: xhigh");
     expect(input.stagedFileInstructions).not.toMatch(/runtime facts/i);
     expect(input.stagedFileInstructions).toContain("staged on disk");
-    expect(input.text).toBe("帮我总结");
+    expect(input.text).toContain("帮我总结");
+    expect(input.text).toContain("[CODEX EXEC ADAPTER OVERRIDE]");
+    expect(input.text?.startsWith("帮我总结\n\n[CODEX EXEC ADAPTER OVERRIDE]")).toBe(true);
   });
 
   it("adds runtime facts to image prompts while preserving image paths", async () => {
@@ -1108,477 +1214,34 @@ describe("createBot response delivery", () => {
     expect(visible).not.toContain("Fix root cause");
   });
 
-  it("queues text follow-ups that arrive while a Codex turn is still running", async () => {
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("第二轮回复。");
-        callbacks.onAgentMessage?.("第二轮回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    const textHandler = bot.__handlers.on.get("message:text");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 10, text: "第一条，先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 11, text: "第二条，必须排队进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条，必须排队进 Codex");
-    expect(String(session.prompt.mock.calls[1][0])).toContain("[DEVELOPER DISCIPLINE]");
-    expect(String(session.prompt.mock.calls[1][0])).toContain("discipline_version=ALB-714-hard-discipline-v1");
-    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).not.toContain(
-      "Still working on previous message",
-    );
-  });
-
-  it("aborts a stuck foreground Codex turn after the configured timeout and drains queued prompts", async () => {
-    const abortCalled = deferred<void>();
-    const releaseAbortedTurn = deferred<void>();
-    const abortedTurnSettled = deferred<void>();
-    let promptCount = 0;
-    let processing = false;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      processing = true;
-      if (promptCount === 1) {
-        await abortCalled.promise;
-        await releaseAbortedTurn.promise;
-        processing = false;
-        abortedTurnSettled.resolve();
-        throw new Error("The operation was aborted");
-      }
-
-      try {
-        callbacks.onTextDelta("第二轮回复。");
-        callbacks.onAgentMessage?.("第二轮回复。");
+  it("thin bridge sends each text message immediately without dispatcher coalescing", async () => {
+    vi.useFakeTimers();
+    try {
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("即时回复。");
+        callbacks.onAgentMessage?.("即时回复。");
         callbacks.onAgentEnd();
-      } finally {
-        processing = false;
-      }
-    });
-    session.isProcessing.mockImplementation(() => processing);
-    session.abort.mockImplementation(async () => {
-      abortCalled.resolve();
-    });
-    const registry = createRegistry(session);
+      });
+      const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ codexTurnTimeoutMs: 5 } as any), registry as any) as any;
-    const textHandler = bot.__handlers.on.get("message:text");
+      const bot = createBot(createConfig({ telegramTextCoalesceMs: 60_000 } as any), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
 
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 12, text: "第一条会卡住" },
-      api: bot.api,
-    });
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 900, text: "不要合并，马上进 Codex" },
+        api: bot.api,
+      });
 
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 13, text: "第二条必须在超时后继续进 Codex" },
-      api: bot.api,
-    });
-
-    await expect(Promise.race([firstPromise.then(() => "resolved"), delay(100).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-
-    expect(session.abort).toHaveBeenCalledTimes(1);
-    expect(session.prompt).toHaveBeenCalledTimes(1);
-    releaseAbortedTurn.resolve();
-    await abortedTurnSettled.promise;
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条必须在超时后继续进 Codex");
-    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).toContain(
-      "Request timed out. Try a shorter prompt or use /retry.",
-    );
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      expect(String(session.prompt.mock.calls[0][0])).toContain("不要合并，马上进 Codex");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("escalates to fatal recovery when a timed-out Codex turn never settles after abort", async () => {
-    let processing = false;
-    const session = createSession(async () => {
-      processing = true;
-      await new Promise(() => undefined);
-    });
-    session.isProcessing.mockImplementation(() => processing);
-    session.abort.mockResolvedValue(undefined);
-    const registry = createRegistry(session);
-    const onFatalRecovery = vi.fn();
-
-    const bot = createBot(
-      createConfig({ codexTurnTimeoutMs: 5, codexTurnAbortGraceMs: 5 } as any),
-      registry as any,
-      { onFatalRecovery },
-    ) as any;
-    const textHandler = bot.__handlers.on.get("message:text");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 14, text: "第一条会超时且 abort 后永不 settle" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-    await firstPromise;
-    await vi.waitFor(() => expect(onFatalRecovery).toHaveBeenCalledTimes(1));
-
-    expect(session.abort).toHaveBeenCalledTimes(1);
-    expect(String(onFatalRecovery.mock.calls[0]?.[0]?.message)).toContain(
-      "Codex turn remained active after timeout abort grace",
-    );
-  });
-
-  it("preserves text arrival order when the first receipt reaction is slow", async () => {
-    const firstReceiptReaction = deferred<void>();
-    const firstTurn = deferred<void>();
-    let reactionCalls = 0;
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("第二轮回复。");
-        callbacks.onAgentMessage?.("第二轮回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ enableTelegramReactions: true }), registry as any) as any;
-    bot.api.setMessageReaction.mockImplementation(async () => {
-      reactionCalls += 1;
-      if (reactionCalls === 1) {
-        await firstReceiptReaction.promise;
-      }
-      return true;
-    });
-    const textHandler = bot.__handlers.on.get("message:text");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 60, text: "第一条，reaction 会慢" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(bot.api.setMessageReaction).toHaveBeenCalledTimes(1));
-
-    const secondPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 61, text: "第二条，不能插队" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-    expect(String(session.prompt.mock.calls[0][0])).toContain("第一条，reaction 会慢");
-
-    firstReceiptReaction.resolve();
-    firstTurn.resolve();
-    await Promise.all([firstPromise, secondPromise]);
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条，不能插队");
-  });
-
-  it("does not let a stuck queued receipt reaction block later queued prompts", async () => {
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
-      callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
-      if (promptCount === 1) {
-        await firstTurn.promise;
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ enableTelegramReactions: true }), registry as any) as any;
-    bot.api.setMessageReaction.mockImplementation(async (_chatId: number, messageId: number, reactions: unknown[]) => {
-      if (messageId === 63 && JSON.stringify(reactions).includes("👀")) {
-        await new Promise(() => {});
-      }
-      return true;
-    });
-    const textHandler = bot.__handlers.on.get("message:text");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 62, text: "第一条，先忙住" },
-      api: bot.api,
-    });
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 63, text: "第二条，receipt 永久卡住" },
-      api: bot.api,
-    });
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 64, text: "第三条，不能被第二条 reaction 卡住" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await expect(Promise.race([firstPromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条，receipt 永久卡住");
-    expect(String(session.prompt.mock.calls[2][0])).toContain("第三条，不能被第二条 reaction 卡住");
-  });
-
-  it("does not let a stuck final reaction block later queued prompts", async () => {
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
-      callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
-      if (promptCount === 1) {
-        await firstTurn.promise;
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ enableTelegramReactions: true }), registry as any) as any;
-    bot.api.setMessageReaction.mockImplementation(async (_chatId: number, messageId: number, reactions: unknown[]) => {
-      if (messageId === 67 && JSON.stringify(reactions).includes("👍")) {
-        await new Promise(() => {});
-      }
-      return true;
-    });
-    const textHandler = bot.__handlers.on.get("message:text");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 66, text: "第一条，先忙住" },
-      api: bot.api,
-    });
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 67, text: "第二条，final reaction 永久卡住" },
-      api: bot.api,
-    });
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 68, text: "第三条，不能被第二条 final reaction 卡住" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await expect(Promise.race([firstPromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条，final reaction 永久卡住");
-    expect(String(session.prompt.mock.calls[2][0])).toContain("第三条，不能被第二条 final reaction 卡住");
-  });
-
-  it("does not let a stuck clear reaction for a skipped queued prompt block later queued prompts", async () => {
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
-      callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
-      if (promptCount === 1) {
-        await firstTurn.promise;
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ enableTelegramReactions: true }), registry as any) as any;
-    bot.api.setMessageReaction.mockImplementation(async (_chatId: number, messageId: number, reactions: unknown[]) => {
-      if (messageId === 71 && reactions.length === 0) {
-        await new Promise(() => {});
-      }
-      return true;
-    });
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "voice/empty-clear-reaction.ogg",
-      file_size: 3,
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-      })),
-    );
-    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
-    _setImportHook(async () => ({
-      ParakeetAsrEngine: class {
-        async initialize(): Promise<void> {}
-
-        async transcribe(): Promise<{ text: string; durationMs: number }> {
-          return { text: "   ", durationMs: 1 };
-        }
-      },
-    }));
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 70, text: "第一条，先忙住" },
-      api: bot.api,
-    });
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    await voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 71, voice: { file_id: "voice-file-empty-clear-reaction" } },
-      api: bot.api,
-    });
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 72, text: "空语音 clear reaction 卡住后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await expect(Promise.race([firstPromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("空语音 clear reaction 卡住后这条也必须进 Codex");
-  });
-
-  it("does not let a stuck retry reaction block retry prompt execution", async () => {
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
-      callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ enableTelegramReactions: true }), registry as any) as any;
-    const textHandler = bot.__handlers.on.get("message:text");
-    const retryCommand = bot.__handlers.commands.get("retry");
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 84, text: "这条会被 retry" },
-      api: bot.api,
-    });
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    bot.api.setMessageReaction.mockImplementation(async (_chatId: number, messageId: number) => {
-      if (messageId === 85) {
-        await new Promise(() => {});
-      }
-      return true;
-    });
-
-    const retryPromise = retryCommand({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 85, text: "/retry" },
-      api: bot.api,
-    });
-
-    await expect(Promise.race([retryPromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("这条会被 retry");
-  });
-
-  it("keeps the final reaction after a slow receipt reaction settles late", async () => {
-    const slowReceiptReaction = deferred<void>();
-    const finishTurn = deferred<void>();
-    let callCount = 0;
-    const session = createSession(async (callbacks) => {
-      callbacks.onTextDelta("最终回复。");
-      callbacks.onAgentMessage?.("最终回复。");
-      await finishTurn.promise;
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ enableTelegramReactions: true }), registry as any) as any;
-    bot.api.setMessageReaction.mockImplementation(async () => {
-      callCount += 1;
-      if (callCount === 1) {
-        await slowReceiptReaction.promise;
-      }
-      return true;
-    });
-    const textHandler = bot.__handlers.on.get("message:text");
-
-    const promptPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 65, text: "只跑一轮" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(bot.api.setMessageReaction).toHaveBeenCalledTimes(1));
-    finishTurn.resolve();
-    await promptPromise;
-
-    expect(reactionEmojiFromCall(bot.api.setMessageReaction.mock.calls.at(-1))).toBe("👍");
-
-    slowReceiptReaction.resolve();
-    await vi.waitFor(() => expect(bot.api.setMessageReaction).toHaveBeenCalledTimes(3));
-    expect(reactionEmojiFromCall(bot.api.setMessageReaction.mock.calls.at(-1))).toBe("👍");
-  });
-
-  it("transcribes and queues voice follow-ups that arrive while a Codex turn is still running", async () => {
+  it("thin bridge passes a text follow-up to Codex instead of sending a dispatcher busy reply", async () => {
     const firstTurn = deferred<void>();
     let promptCount = 0;
     const session = createSession(async (callbacks) => {
@@ -1588,1421 +1251,20 @@ describe("createBot response delivery", () => {
         callbacks.onAgentMessage?.("第一轮回复。");
         await firstTurn.promise;
       } else {
-        callbacks.onTextDelta("语音后续回复。");
-        callbacks.onAgentMessage?.("语音后续回复。");
+        callbacks.onTextDelta("第二轮进入 Codex。");
+        callbacks.onAgentMessage?.("第二轮进入 Codex。");
       }
       callbacks.onAgentEnd();
     });
     const registry = createRegistry(session);
 
     const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "voice/follow-up.ogg",
-      file_size: 3,
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-      })),
-    );
-    let transcribeCalls = 0;
-    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
-    _setImportHook(async () => ({
-      ParakeetAsrEngine: class {
-        async initialize(): Promise<void> {}
-
-        async transcribe(): Promise<{ text: string; durationMs: number }> {
-          transcribeCalls += 1;
-          return {
-            text: "这是忙时发来的语音转写",
-            durationMs: 1,
-          };
-        }
-      },
-    }));
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 20, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    await voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 21, voice: { file_id: "voice-file-1" } },
-      api: bot.api,
-    });
-
-    expect(bot.api.getFile).toHaveBeenCalledWith("voice-file-1");
-    expect(transcribeCalls).toBe(1);
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("这是忙时发来的语音转写");
-  });
-
-  it("preserves Telegram arrival order when a voice transcription finishes after a later text arrives", async () => {
-    const firstTurn = deferred<void>();
-    const transcribeStarted = deferred<void>();
-    const finishTranscription = deferred<{ text: string; durationMs: number }>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
-        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "voice/follow-up.ogg",
-      file_size: 3,
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-      })),
-    );
-    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
-    _setImportHook(async () => ({
-      ParakeetAsrEngine: class {
-        async initialize(): Promise<void> {}
-
-        async transcribe(): Promise<{ text: string; durationMs: number }> {
-          transcribeStarted.resolve();
-          return await finishTranscription.promise;
-        }
-      },
-    }));
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 30, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const voicePromise = voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 31, voice: { file_id: "voice-file-2" } },
-      api: bot.api,
-    });
-
-    await transcribeStarted.promise;
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 32, text: "语音后面发来的文字" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    finishTranscription.resolve({ text: "稍后完成的语音转写", durationMs: 1 });
-    await voicePromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("稍后完成的语音转写");
-    expect(String(session.prompt.mock.calls[2][0])).toContain("语音后面发来的文字");
-  });
-
-  it("queues photo follow-ups by Telegram arrival order while a Codex turn is running", async () => {
-    const firstTurn = deferred<void>();
-    const photoDownloadStarted = deferred<void>();
-    const finishPhotoDownload = deferred<ArrayBuffer>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
-        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "photos/follow-up.jpg",
-      file_size: 3,
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        photoDownloadStarted.resolve();
-        return {
-          ok: true,
-          arrayBuffer: async () => finishPhotoDownload.promise,
-        };
-      }),
-    );
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const photoHandler = bot.__handlers.on.get("message:photo");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 49, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const photoPromise = photoHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: {
-        message_id: 50,
-        photo: [{ file_id: "photo-file-queued" }],
-        caption: "先看这张图",
-      },
-      api: bot.api,
-    });
-    await expect(
-      Promise.race([photoDownloadStarted.promise.then(() => "started"), delay(50).then(() => "not-started")]),
-    ).resolves.toBe("started");
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 51, text: "图片后面发来的文字" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    finishPhotoDownload.resolve(new Uint8Array([1, 2, 3]).buffer);
-    await photoPromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
-    const photoInput = session.prompt.mock.calls[1][0] as { imagePaths?: string[]; text?: string };
-    expect(photoInput.imagePaths).toHaveLength(1);
-    expect(photoInput.text).toContain("先看这张图");
-    expect(String(session.prompt.mock.calls[2][0])).toContain("图片后面发来的文字");
-  });
-
-  it("does not let a stuck photo download failure notice block later queued prompts", async () => {
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    let messageId = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "photos/fail.jpg",
-      file_size: 3,
-    });
-    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
-      if (String(text).includes("Failed to download photo")) {
-        return await new Promise(() => {});
-      }
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new Error("photo download failed");
-      }),
-    );
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const photoHandler = bot.__handlers.on.get("message:photo");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 76, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const photoPromise = photoHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: {
-        message_id: 77,
-        photo: [{ file_id: "photo-file-fail-stuck-notice" }],
-      },
-      api: bot.api,
-    });
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 78, text: "图片下载失败通知卡住后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await expect(Promise.race([photoPromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("图片下载失败通知卡住后这条也必须进 Codex");
-  });
-
-  it("queues document follow-ups by Telegram arrival order while a Codex turn is running", async () => {
-    const firstTurn = deferred<void>();
-    const documentDownloadStarted = deferred<void>();
-    const finishDocumentDownload = deferred<ArrayBuffer>();
-    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-queue-"));
-    tempDirs.push(workspace);
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
-        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
-      }
-      callbacks.onAgentEnd();
-    });
-    session.getCurrentWorkspace.mockReturnValue(workspace);
-    session.getInfo.mockReturnValue({
-      ...session.getInfo(),
-      workspace,
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ workspace }), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "documents/follow-up.txt",
-      file_size: 5,
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        documentDownloadStarted.resolve();
-        return {
-          ok: true,
-          arrayBuffer: async () => finishDocumentDownload.promise,
-        };
-      }),
-    );
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const documentHandler = bot.__handlers.on.get("message:document");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 52, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const documentPromise = documentHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: {
-        message_id: 53,
-        document: { file_id: "doc-file-queued", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
-        caption: "先总结这个文档",
-      },
-      api: bot.api,
-    });
-    await expect(
-      Promise.race([documentDownloadStarted.promise.then(() => "started"), delay(50).then(() => "not-started")]),
-    ).resolves.toBe("started");
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 54, text: "文档后面发来的文字" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    finishDocumentDownload.resolve(new TextEncoder().encode("hello").buffer);
-    await documentPromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
-    const documentInput = session.prompt.mock.calls[1][0] as { stagedFileInstructions?: string; text?: string };
-    expect(documentInput.stagedFileInstructions).toContain("report.txt");
-    expect(documentInput.text).toBe("先总结这个文档");
-    expect(String(session.prompt.mock.calls[2][0])).toContain("文档后面发来的文字");
-  });
-
-  it("does not let a stuck document download failure notice block later queued prompts", async () => {
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    let messageId = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "documents/fail.txt",
-      file_size: 5,
-    });
-    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
-      if (String(text).includes("Failed to download file")) {
-        return await new Promise(() => {});
-      }
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new Error("document download failed");
-      }),
-    );
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const documentHandler = bot.__handlers.on.get("message:document");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 79, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const documentPromise = documentHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: {
-        message_id: 80,
-        document: { file_id: "doc-file-download-fail-stuck-notice", file_name: "report.txt", file_size: 5 },
-      },
-      api: bot.api,
-    });
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 81, text: "文档下载失败通知卡住后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await expect(
-      Promise.race([documentPromise.then(() => "resolved"), delay(50).then(() => "timed-out")]),
-    ).resolves.toBe("resolved");
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("文档下载失败通知卡住后这条也必须进 Codex");
-  });
-
-  it("queues a document prompt even when the received acknowledgement fails to send", async () => {
-    const firstTurn = deferred<void>();
-    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-ack-fail-"));
-    tempDirs.push(workspace);
-    let promptCount = 0;
-    let messageId = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
-        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
-      }
-      callbacks.onAgentEnd();
-    });
-    session.getCurrentWorkspace.mockReturnValue(workspace);
-    session.getInfo.mockReturnValue({
-      ...session.getInfo(),
-      workspace,
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ workspace }), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "documents/ack-fail.txt",
-      file_size: 5,
-    });
-    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
-      if (String(text).includes("Received:")) {
-        throw new Error("document acknowledgement failed");
-      }
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
-      })),
-    );
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const documentHandler = bot.__handlers.on.get("message:document");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 58, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const documentPromise = documentHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: {
-        message_id: 59,
-        document: { file_id: "doc-file-ack-fail", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
-        caption: "先总结这个文档",
-      },
-      api: bot.api,
-    });
-
-    await expect(
-      Promise.race([
-        documentPromise.then(
-          () => "resolved",
-          () => "rejected",
-        ),
-        delay(50).then(() => "timed-out"),
-      ]),
-    ).resolves.toBe("resolved");
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 60, text: "文档确认失败后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
-    const documentInput = session.prompt.mock.calls[1][0] as { stagedFileInstructions?: string; text?: string };
-    expect(documentInput.stagedFileInstructions).toContain("report.txt");
-    expect(documentInput.text).toBe("先总结这个文档");
-    expect(String(session.prompt.mock.calls[2][0])).toContain("文档确认失败后这条也必须进 Codex");
-  });
-
-  it("does not let a stuck document acknowledgement block the queue", async () => {
-    const firstTurn = deferred<void>();
-    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-ack-stuck-"));
-    tempDirs.push(workspace);
-    let promptCount = 0;
-    let messageId = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta(`第 ${promptCount} 轮回复。`);
-        callbacks.onAgentMessage?.(`第 ${promptCount} 轮回复。`);
-      }
-      callbacks.onAgentEnd();
-    });
-    session.getCurrentWorkspace.mockReturnValue(workspace);
-    session.getInfo.mockReturnValue({
-      ...session.getInfo(),
-      workspace,
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ workspace }), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "documents/ack-stuck.txt",
-      file_size: 5,
-    });
-    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
-      if (String(text).includes("Received:")) {
-        return await new Promise(() => {});
-      }
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
-      })),
-    );
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const documentHandler = bot.__handlers.on.get("message:document");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 67, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const documentPromise = documentHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: {
-        message_id: 68,
-        document: { file_id: "doc-file-ack-stuck", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
-        caption: "先总结这个文档",
-      },
-      api: bot.api,
-    });
-
-    await expect(
-      Promise.race([documentPromise.then(() => "resolved"), delay(50).then(() => "timed-out")]),
-    ).resolves.toBe("resolved");
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 69, text: "文档确认卡住后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
-    const documentInput = session.prompt.mock.calls[1][0] as { stagedFileInstructions?: string; text?: string };
-    expect(documentInput.stagedFileInstructions).toContain("report.txt");
-    expect(documentInput.text).toBe("先总结这个文档");
-    expect(String(session.prompt.mock.calls[2][0])).toContain("文档确认卡住后这条也必须进 Codex");
-  });
-
-  it("does not let a stuck document stage failure notice pin the document handler", async () => {
-    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-stage-notice-stuck-"));
-    tempDirs.push(workspace);
-    let messageId = 0;
-    const session = createSession(async () => {
-      throw new Error("document stage failure should not reach Codex");
-    });
-    session.getCurrentWorkspace.mockReturnValue(workspace);
-    session.getInfo.mockReturnValue({
-      ...session.getInfo(),
-      workspace,
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ workspace }), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "documents/stage-fail.txt",
-      file_size: 5,
-    });
-    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
-      if (String(text).includes("Failed to stage file")) {
-        return await new Promise(() => {});
-      }
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    await mkdir(path.join(workspace, ".telecodex"), { recursive: true });
-    await writeFile(path.join(workspace, ".telecodex", "inbox"), "not a directory");
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
-      })),
-    );
-
-    const documentHandler = bot.__handlers.on.get("message:document");
-    const documentPromise = documentHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: {
-        message_id: 82,
-        document: { file_id: "doc-file-stage-fail-stuck-notice", file_name: "report.txt", file_size: 5 },
-      },
-      api: bot.api,
-    });
-
-    await expect(
-      Promise.race([documentPromise.then(() => "resolved"), delay(50).then(() => "timed-out")]),
-    ).resolves.toBe("resolved");
-    expect(session.prompt).not.toHaveBeenCalled();
-  });
-
-  it("does not let a stuck document outbox failure notice pin the document handler", async () => {
-    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-outbox-notice-stuck-"));
-    tempDirs.push(workspace);
-    let messageId = 0;
-    const session = createSession(async () => {
-      throw new Error("document outbox failure should not reach Codex");
-    });
-    session.getCurrentWorkspace.mockReturnValue(workspace);
-    session.getInfo.mockReturnValue({
-      ...session.getInfo(),
-      workspace,
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ workspace }), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "documents/outbox-notice-stuck.txt",
-      file_size: 5,
-    });
-    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
-      if (String(text).includes("Failed to prepare output folder")) {
-        return await new Promise(() => {});
-      }
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    await mkdir(path.join(workspace, ".telecodex"), { recursive: true });
-    await writeFile(path.join(workspace, ".telecodex", "turns"), "not a directory");
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
-      })),
-    );
-
-    const documentHandler = bot.__handlers.on.get("message:document");
-    const documentPromise = documentHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: {
-        message_id: 83,
-        document: { file_id: "doc-file-outbox-fail-stuck-notice", file_name: "report.txt", file_size: 5 },
-      },
-      api: bot.api,
-    });
-
-    await expect(
-      Promise.race([documentPromise.then(() => "resolved"), delay(50).then(() => "timed-out")]),
-    ).resolves.toBe("resolved");
-    expect(session.prompt).not.toHaveBeenCalled();
-  });
-
-  it("drains later queued text after document outbox preparation fails", async () => {
-    const firstTurn = deferred<void>();
-    const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-doc-outbox-fail-"));
-    tempDirs.push(workspace);
-    let promptCount = 0;
-    let messageId = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    session.getCurrentWorkspace.mockReturnValue(workspace);
-    session.getInfo.mockReturnValue({
-      ...session.getInfo(),
-      workspace,
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig({ workspace }), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "documents/outbox-fail.txt",
-      file_size: 5,
-    });
-    await mkdir(path.join(workspace, ".telecodex"), { recursive: true });
-    await writeFile(path.join(workspace, ".telecodex", "turns"), "not a directory");
-    bot.api.sendMessage.mockImplementation(async () => {
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
-      })),
-    );
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const documentHandler = bot.__handlers.on.get("message:document");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 61, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const documentPromise = documentHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: {
-        message_id: 62,
-        document: { file_id: "doc-file-outbox-fail", file_name: "report.txt", mime_type: "text/plain", file_size: 5 },
-      },
-      api: bot.api,
-    });
-
-    await expect(
-      Promise.race([
-        documentPromise.then(
-          () => "resolved",
-          () => "rejected",
-        ),
-        delay(50).then(() => "timed-out"),
-      ]),
-    ).resolves.toBe("resolved");
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 63, text: "文档 outbox 失败后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("文档 outbox 失败后这条也必须进 Codex");
-  });
-
-  it("drains later queued text after an earlier voice transcription fails", async () => {
-    const firstTurn = deferred<void>();
-    const transcribeStarted = deferred<void>();
-    const failTranscription = deferred<{ text: string; durationMs: number }>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "voice/fail.ogg",
-      file_size: 3,
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-      })),
-    );
-    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
-    _setImportHook(async () => ({
-      ParakeetAsrEngine: class {
-        async initialize(): Promise<void> {}
-
-        async transcribe(): Promise<{ text: string; durationMs: number }> {
-          transcribeStarted.resolve();
-          return await failTranscription.promise;
-        }
-      },
-    }));
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 40, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const voicePromise = voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 41, voice: { file_id: "voice-file-fail" } },
-      api: bot.api,
-    });
-    await transcribeStarted.promise;
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 42, text: "语音失败后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    failTranscription.reject(new Error("transcription failed"));
-    await voicePromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("语音失败后这条也必须进 Codex");
-  });
-
-  it("does not let a stuck voice transcription failure notice block later queued prompts", async () => {
-    const firstTurn = deferred<void>();
-    const transcribeStarted = deferred<void>();
-    const failTranscription = deferred<{ text: string; durationMs: number }>();
-    let promptCount = 0;
-    let messageId = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "voice/fail-stuck-notice.ogg",
-      file_size: 3,
-    });
-    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
-      if (String(text).includes("Transcription failed")) {
-        return await new Promise(() => {});
-      }
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-      })),
-    );
-    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
-    _setImportHook(async () => ({
-      ParakeetAsrEngine: class {
-        async initialize(): Promise<void> {}
-
-        async transcribe(): Promise<{ text: string; durationMs: number }> {
-          transcribeStarted.resolve();
-          return await failTranscription.promise;
-        }
-      },
-    }));
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 73, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const voicePromise = voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 74, voice: { file_id: "voice-file-fail-stuck-notice" } },
-      api: bot.api,
-    });
-    await transcribeStarted.promise;
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 75, text: "语音失败通知卡住后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    failTranscription.reject(new Error("transcription failed"));
-    await expect(Promise.race([voicePromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("语音失败通知卡住后这条也必须进 Codex");
-  });
-
-  it("drains later queued text after an empty voice transcript notice fails to send", async () => {
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    let messageId = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "voice/empty.ogg",
-      file_size: 3,
-    });
-    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
-      if (String(text).includes("Transcription was empty")) {
-        throw new Error("empty notice send failed");
-      }
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-      })),
-    );
-    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
-    _setImportHook(async () => ({
-      ParakeetAsrEngine: class {
-        async initialize(): Promise<void> {}
-
-        async transcribe(): Promise<{ text: string; durationMs: number }> {
-          return { text: "   ", durationMs: 1 };
-        }
-      },
-    }));
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 64, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const voicePromise = voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 65, voice: { file_id: "voice-file-empty" } },
-      api: bot.api,
-    });
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 66, text: "空语音后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-    await voicePromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("空语音后这条也必须进 Codex");
-    const replies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
-    expect(replies).not.toContain("Transcription failed");
-  });
-
-  it("drains later queued text after an empty voice transcript notice never settles", async () => {
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    let messageId = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "voice/empty-stuck-notice.ogg",
-      file_size: 3,
-    });
-    bot.api.sendMessage.mockImplementation(async (_chatId: number, text: string) => {
-      if (String(text).includes("Transcription was empty")) {
-        return await new Promise(() => {});
-      }
-      messageId += 1;
-      return { message_id: messageId };
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-      })),
-    );
-    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
-    _setImportHook(async () => ({
-      ParakeetAsrEngine: class {
-        async initialize(): Promise<void> {}
-
-        async transcribe(): Promise<{ text: string; durationMs: number }> {
-          return { text: "   ", durationMs: 1 };
-        }
-      },
-    }));
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 70, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const voicePromise = voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 71, voice: { file_id: "voice-file-empty-stuck-notice" } },
-      api: bot.api,
-    });
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 72, text: "空语音通知卡住后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await expect(Promise.race([voicePromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("空语音通知卡住后这条也必须进 Codex");
-  });
-
-  it("drains later queued text after a stuck voice download times out", async () => {
-    process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = "5";
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "voice/stuck.ogg",
-      file_size: 3,
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((_url, init?: RequestInit) => {
-        return new Promise((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => reject(new Error("download aborted")));
-        });
-      }),
-    );
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 43, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const voicePromise = voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 44, voice: { file_id: "voice-file-stuck" } },
-      api: bot.api,
-    });
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 45, text: "语音下载超时后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await expect(Promise.race([voicePromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("语音下载超时后这条也必须进 Codex");
-  });
-
-  it("drains later queued text after a stuck voice transcription times out", async () => {
-    process.env.VOICE_TRANSCRIPTION_TIMEOUT_MS = "5";
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn().mockResolvedValue({
-      file_path: "voice/stuck-transcription.ogg",
-      file_size: 3,
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => ({
-        ok: true,
-        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-      })),
-    );
-    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
-    _setImportHook(async () => ({
-      ParakeetAsrEngine: class {
-        async initialize(): Promise<void> {}
-
-        async transcribe(): Promise<{ text: string; durationMs: number }> {
-          return await new Promise(() => {});
-        }
-      },
-    }));
-
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 146, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const voicePromise = voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 147, voice: { file_id: "voice-file-stuck-transcription" } },
-      api: bot.api,
-    });
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 148, text: "语音转写超时后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await expect(Promise.race([voicePromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("语音转写超时后这条也必须进 Codex");
-  });
-
-  it("drains later queued text after a stuck Telegram getFile times out", async () => {
-    process.env.TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = "5";
-    const firstTurn = deferred<void>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("后续文本回复。");
-        callbacks.onAgentMessage?.("后续文本回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    bot.api.getFile = vi.fn(() => new Promise(() => {}));
-    const textHandler = bot.__handlers.on.get("message:text");
-    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
-
-    const firstPromise = textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 46, text: "先跑一个长任务" },
-      api: bot.api,
-    });
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
-
-    const voicePromise = voiceHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 47, voice: { file_id: "voice-file-getfile-stuck" } },
-      api: bot.api,
-    });
-
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 48, text: "getFile 超时后这条也必须进 Codex" },
-      api: bot.api,
-    });
-
-    firstTurn.resolve();
-    await firstPromise;
-
-    await expect(Promise.race([voicePromise.then(() => "resolved"), delay(50).then(() => "timed-out")])).resolves.toBe(
-      "resolved",
-    );
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("getFile 超时后这条也必须进 Codex");
-  });
-
-  it("waits for the final Telegram reply before draining the next queued prompt", async () => {
-    const firstTurn = deferred<void>();
-    const firstSend = deferred<{ message_id: number }>();
-    let promptCount = 0;
-    const session = createSession(async (callbacks) => {
-      promptCount += 1;
-      if (promptCount === 1) {
-        callbacks.onTextDelta("第一轮回复。");
-        callbacks.onAgentMessage?.("第一轮回复。");
-        await firstTurn.promise;
-      } else {
-        callbacks.onTextDelta("第二轮回复。");
-        callbacks.onAgentMessage?.("第二轮回复。");
-      }
-      callbacks.onAgentEnd();
-    });
-    const registry = createRegistry(session);
-
-    const bot = createBot(createConfig(), registry as any) as any;
-    let sendCount = 0;
-    bot.api.sendMessage.mockImplementation(async () => {
-      sendCount += 1;
-      if (sendCount === 1) {
-        return await firstSend.promise;
-      }
-      return { message_id: sendCount };
-    });
     const textHandler = bot.__handlers.on.get("message:text");
 
     const firstPromise = textHandler({
       chat: { id: 42 },
       from: { id: 123 },
-      message: { message_id: 50, text: "第一条，回复发送要慢一点" },
+      message: { message_id: 901, text: "第一条，先跑一个长任务" },
       api: bot.api,
     });
 
@@ -3011,20 +1273,22 @@ describe("createBot response delivery", () => {
     await textHandler({
       chat: { id: 42 },
       from: { id: 123 },
-      message: { message_id: 51, text: "第二条必须等第一条真正发完" },
+      message: { message_id: 902, text: "第二条，照常送进 Codex" },
       api: bot.api,
     });
 
+    expect(session.abort).not.toHaveBeenCalled();
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条，照常送进 Codex");
+
+    const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\\n");
+    expect(visibleReplies).not.toContain("Still working on previous message");
+
     firstTurn.resolve();
+    await firstPromise;
     await delay(20);
-    expect(session.prompt).toHaveBeenCalledTimes(1);
-
-    firstSend.resolve({ message_id: 101 });
-    await firstPromise;
-
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条必须等第一条真正发完");
   });
+
 });
 
 type Deferred<T> = {

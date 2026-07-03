@@ -532,6 +532,10 @@ export class CodexSessionService {
     if (linearControlMcp) {
       mcpServers[this.config.linearControl.mcpServerName] = linearControlMcp;
     }
+    const personaMailMcp = buildPersonaMailMcpConfig(this.config);
+    if (personaMailMcp) {
+      mcpServers.persona_mail = personaMailMcp;
+    }
     if (Object.keys(mcpServers).length > 0) {
       configOverrides.mcp_servers = mcpServers;
     }
@@ -637,6 +641,40 @@ function buildLinearControlMcpCommand(): { command: string; args: string[] } {
   };
 }
 
+function buildPersonaMailMcpConfig(config: TeleCodexConfig): CodexConfigObject | undefined {
+  if (!config.mailboxBridge.enabled || !config.mailboxBridge.persona) {
+    return undefined;
+  }
+
+  const command = buildPersonaMailMcpCommand();
+  return {
+    command: command.command,
+    args: command.args,
+    env_vars: ["PERSONAS_ROOT", "MAILBOX_PERSONA"],
+    enabled_tools: ["send_persona_mail"],
+    default_tools_approval_mode: "approve",
+    startup_timeout_sec: 10,
+    tool_timeout_sec: 30,
+  };
+}
+
+function buildPersonaMailMcpCommand(): { command: string; args: string[] } {
+  const modulePath = fileURLToPath(import.meta.url);
+  if (modulePath.endsWith(".ts")) {
+    return {
+      command: process.execPath,
+      args: [
+        fileURLToPath(new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url)),
+        fileURLToPath(new URL("./persona-mail-mcp-server.ts", import.meta.url)),
+      ],
+    };
+  }
+
+  return {
+    command: process.execPath,
+    args: [fileURLToPath(new URL("./persona-mail-mcp-server.js", import.meta.url))],
+  };
+}
 function buildCodexEnv(config: TeleCodexConfig): Record<string, string> {
   const env: Record<string, string> = {};
 
@@ -660,6 +698,11 @@ function buildCodexEnv(config: TeleCodexConfig): Record<string, string> {
   if (config.linearControl.enabled) {
     env.LINEAR_API_KEY_PATH = config.linearControl.apiKeyPath;
     env.LINEAR_CONTROL_ALLOWED_ISSUES = config.linearControl.allowedIssues.join(",");
+  }
+
+  if (config.mailboxBridge.enabled && config.mailboxBridge.persona) {
+    env.PERSONAS_ROOT = config.mailboxBridge.personasRoot;
+    env.MAILBOX_PERSONA = config.mailboxBridge.persona;
   }
 
   return env;

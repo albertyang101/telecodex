@@ -129,6 +129,17 @@ describe("codex PreToolUse policy hook", () => {
     expect(result.stderr).toBe("");
   });
 
+  it("allows the audited THEO self-restart helper but still blocks raw launchctl", () => {
+    const helper = "/Users/albertyang0888/code/codex-telegram-research/discipline-workspace/bin/theo-self-restart";
+
+    expect(runHook(`${helper} --dry-run`).status).toBe(0);
+    expect(runHook(helper).status).toBe(0);
+
+    const rawLaunchctl = runHook("launchctl kickstart -k gui/501/com.albert.albert-v3-codex-dispatcher");
+    expect(rawLaunchctl.status).not.toBe(0);
+    expect(rawLaunchctl.stderr).toContain("Blocked Codex shell command");
+  });
+
   it("fails closed when the hook input is malformed", () => {
     const result = spawnSync("/usr/bin/python3", [hookScript], {
       input: "not-json",

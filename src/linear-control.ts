@@ -45,6 +45,8 @@ export interface CreateLinearCommentResult {
   ok: true;
   issueIdentifier: string;
   issueUrl?: string;
+  commentId?: string;
+  commentUrl?: string;
 }
 
 type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
@@ -63,6 +65,10 @@ const CREATE_COMMENT_MUTATION = `
 mutation CreateLinearComment($issueId: String!, $body: String!) {
   commentCreate(input: { issueId: $issueId, body: $body }) {
     success
+    comment {
+      id
+      url
+    }
   }
 }
 `;
@@ -112,7 +118,9 @@ export async function createLinearComment(
     throw new Error(`Linear issue not found: ${issueId}`);
   }
 
-  const commentData = await linearGraphQl<{ commentCreate: { success: boolean } }>(
+  const commentData = await linearGraphQl<{
+    commentCreate: { success: boolean; comment?: { id?: string; url?: string } | null };
+  }>(
     apiKey,
     CREATE_COMMENT_MUTATION,
     { issueId: issue.id, body },
@@ -126,6 +134,8 @@ export async function createLinearComment(
     ok: true,
     issueIdentifier: issue.identifier,
     issueUrl: issue.url,
+    ...(commentData.commentCreate.comment?.id ? { commentId: commentData.commentCreate.comment.id } : {}),
+    ...(commentData.commentCreate.comment?.url ? { commentUrl: commentData.commentCreate.comment.url } : {}),
   };
 }
 

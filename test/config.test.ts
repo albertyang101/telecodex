@@ -32,6 +32,7 @@ describe("loadConfig", () => {
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
+    delete process.env.TELEGRAM_TEXT_COALESCE_MS;
     delete process.env.TRANSCRIPT_ROOT;
     delete process.env.MEMORY_TRANSCRIPT_ROOT;
     delete process.env.MAILBOX_ENABLED;
@@ -39,6 +40,8 @@ describe("loadConfig", () => {
     delete process.env.PERSONAS_ROOT;
     delete process.env.CLAUDE_PERSONAS_ROOT;
     delete process.env.MAILBOX_CONTEXT_KEY;
+    delete process.env.MAILBOX_LAUNCH_PROFILE_ID;
+    delete process.env.MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE;
     delete process.env.MAILBOX_POLL_MS;
     delete process.env.MAILBOX_FULL_SCAN_MS;
     delete process.env.MAILBOX_AUTO_REPLY;
@@ -111,7 +114,7 @@ describe("loadConfig", () => {
       codexPathOverride: codexPath,
       codexModel: "o3",
       codexReasoningEffort: "xhigh",
-      codexTurnTimeoutMs: undefined,
+      codexTurnAbortGraceMs: undefined,
       codexSandboxMode: "danger-full-access",
       codexApprovalPolicy: "on-request",
       launchProfiles: [
@@ -150,6 +153,8 @@ describe("loadConfig", () => {
         persona: undefined,
         personasRoot: path.join(homedir(), "personas"),
         contextKey: undefined,
+        launchProfileId: undefined,
+        allowUnsafeLaunchProfile: false,
         pollMs: 500,
         fullScanMs: 10_000,
         autoReply: false,
@@ -188,7 +193,6 @@ describe("loadConfig", () => {
     expect(config.codexPathOverride).toBeUndefined();
     expect(config.codexModel).toBeUndefined();
     expect(config.codexReasoningEffort).toBeUndefined();
-    expect((config as any).codexTurnTimeoutMs).toBeUndefined();
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
     expect(config.codexSandboxMode).toBe("workspace-write");
     expect(config.codexApprovalPolicy).toBe("never");
@@ -416,6 +420,14 @@ describe("loadConfig", () => {
     expect(config.enableTelegramReactions).toBe(false);
   });
 
+  it("ignores retired TELEGRAM_TEXT_COALESCE_MS values", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.TELEGRAM_TEXT_COALESCE_MS = "1200";
+
+    expect((loadConfig() as any).telegramTextCoalesceMs).toBeUndefined();
+  });
+
   it("parses SHOW_TURN_TOKEN_USAGE boolean values", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
@@ -447,6 +459,7 @@ describe("loadConfig", () => {
     process.env.MAILBOX_PERSONA = "albert-v3";
     process.env.PERSONAS_ROOT = "/Users/albert/personas";
     process.env.MAILBOX_CONTEXT_KEY = "mailbox:theo";
+    process.env.MAILBOX_LAUNCH_PROFILE_ID = "readonly";
     process.env.MAILBOX_POLL_MS = "750";
     process.env.MAILBOX_FULL_SCAN_MS = "30000";
     process.env.MAILBOX_AUTO_REPLY = "true";
@@ -461,6 +474,8 @@ describe("loadConfig", () => {
       persona: "albert-v3",
       personasRoot: "/Users/albert/personas",
       contextKey: "mailbox:theo",
+      launchProfileId: "readonly",
+      allowUnsafeLaunchProfile: false,
       pollMs: 750,
       fullScanMs: 30_000,
       autoReply: true,
@@ -577,7 +592,26 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow("Enabled MCP server names must be unique");
   });
 
-  it("rejects mailbox bridge startup unless the default Codex launch is read-only and never approval", () => {
+  it("allows mailbox bridge startup with a read-only mailbox launch profile when the default launch is writable", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.MAILBOX_PERSONA = "albert-v3";
+    process.env.MAILBOX_LAUNCH_PROFILE_ID = "readonly";
+    process.env.CODEX_SANDBOX_MODE = "danger-full-access";
+    process.env.CODEX_APPROVAL_POLICY = "never";
+    process.env.ENABLE_UNSAFE_LAUNCH_PROFILES = "true";
+
+    const config = loadConfig();
+
+    expect(config.defaultLaunchProfileId).toBe("default");
+    expect(config.mailboxBridge.launchProfileId).toBe("readonly");
+    expect(config.launchProfiles.find((profile) => profile.id === "readonly")).toMatchObject({
+      sandboxMode: "read-only",
+      approvalPolicy: "never",
+    });
+  });
+
+  it("rejects mailbox bridge startup unless it has a read-only and never approval launch profile", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
     process.env.MAILBOX_PERSONA = "albert-v3";
@@ -585,7 +619,55 @@ describe("loadConfig", () => {
     process.env.CODEX_APPROVAL_POLICY = "never";
 
     expect(() => loadConfig()).toThrow(
-      "MAILBOX_PERSONA requires the default Codex launch profile to be read-only / never",
+      "MAILBOX_PERSONA requires a read-only / never launch profile",
+    );
+  });
+
+  it("rejects mailbox launch profiles that are not read-only and never approval", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.MAILBOX_PERSONA = "albert-v3";
+    process.env.MAILBOX_LAUNCH_PROFILE_ID = "review";
+    process.env.CODEX_SANDBOX_MODE = "danger-full-access";
+    process.env.CODEX_APPROVAL_POLICY = "never";
+    process.env.ENABLE_UNSAFE_LAUNCH_PROFILES = "true";
+
+    expect(() => loadConfig()).toThrow(
+      "MAILBOX_PERSONA requires a read-only / never launch profile",
+    );
+  });
+
+  it("allows an unsafe mailbox launch profile only with an explicit mailbox override", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.MAILBOX_PERSONA = "albert-v3";
+    process.env.MAILBOX_LAUNCH_PROFILE_ID = "full-access";
+    process.env.MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE = "true";
+    process.env.CODEX_SANDBOX_MODE = "danger-full-access";
+    process.env.CODEX_APPROVAL_POLICY = "never";
+    process.env.ENABLE_UNSAFE_LAUNCH_PROFILES = "true";
+
+    const config = loadConfig();
+
+    expect(config.mailboxBridge.launchProfileId).toBe("full-access");
+    expect(config.launchProfiles.find((profile) => profile.id === "full-access")).toMatchObject({
+      sandboxMode: "danger-full-access",
+      approvalPolicy: "never",
+    });
+  });
+
+  it("rejects mailbox unsafe override when the launch profile still requires approvals", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.MAILBOX_PERSONA = "albert-v3";
+    process.env.MAILBOX_LAUNCH_PROFILE_ID = "review";
+    process.env.MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE = "true";
+    process.env.CODEX_SANDBOX_MODE = "danger-full-access";
+    process.env.CODEX_APPROVAL_POLICY = "never";
+    process.env.ENABLE_UNSAFE_LAUNCH_PROFILES = "true";
+
+    expect(() => loadConfig()).toThrow(
+      "MAILBOX_ALLOW_UNSAFE_LAUNCH_PROFILE requires a never approval launch profile",
     );
   });
 
@@ -731,20 +813,12 @@ describe("loadConfig", () => {
     );
   });
 
-  it("parses CODEX_TURN_TIMEOUT_MS when configured", () => {
+  it("ignores retired CODEX_TURN_TIMEOUT_MS values", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
     process.env.CODEX_TURN_TIMEOUT_MS = "600000";
 
-    expect((loadConfig() as any).codexTurnTimeoutMs).toBe(600000);
-  });
-
-  it("throws when CODEX_TURN_TIMEOUT_MS is invalid", () => {
-    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
-    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
-    process.env.CODEX_TURN_TIMEOUT_MS = "0";
-
-    expect(() => loadConfig()).toThrow("CODEX_TURN_TIMEOUT_MS must be a positive integer");
+    expect((loadConfig() as any).codexTurnTimeoutMs).toBeUndefined();
   });
 
   it("parses CODEX_TURN_ABORT_GRACE_MS when configured", () => {
