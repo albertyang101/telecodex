@@ -45,6 +45,7 @@ import { getTranscriptionBackendStatus, transcribeAudio } from "./voice.js";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
+const QUEUED_PROMPT_BUSY_RETRY_MS = 250;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
@@ -87,6 +88,17 @@ type BusyState = {
   processing: boolean;
   switching: boolean;
   transcribing: number;
+};
+
+type QueuedPrompt = {
+  ctx: Context;
+  chatId: TelegramChatId;
+  session: CodexSessionService;
+  status: "pending" | "ready" | "skipped";
+  input?: CodexPromptInput;
+  receiptReaction?: Promise<void>;
+  afterSuccess?: () => Promise<void>;
+  afterPrompt?: () => Promise<void>;
 };
 
 export type TeleCodexBot = Bot<Context> & {
@@ -334,6 +346,12 @@ export function createBot(
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
+  const pendingPromptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
+  const drainingPromptQueues = new Set<TelegramContextKey>();
+  const queuedPromptRetryTimers = new Map<
+    TelegramContextKey,
+    { timer: ReturnType<typeof setTimeout>; endInFlight: () => void }
+  >();
   let inFlightCount = 0;
   const idleWaiters = new Set<() => void>();
   const textInFlightEnds = new WeakMap<Context, () => void>();
@@ -376,6 +394,14 @@ export function createBot(
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
     lastPromptInput.delete(key);
+    pendingPromptQueues.delete(key);
+    drainingPromptQueues.delete(key);
+    const retryTimer = queuedPromptRetryTimers.get(key);
+    if (retryTimer) {
+      clearTimeout(retryTimer.timer);
+      retryTimer.endInFlight();
+      queuedPromptRetryTimers.delete(key);
+    }
   });
 
   const getBusyState = (contextKey: TelegramContextKey): BusyState => {
@@ -532,6 +558,152 @@ export function createBot(
     void clearReaction(ctx).catch(() => {});
   };
 
+  const enqueuePrompt = (
+    contextKey: TelegramContextKey,
+    item: QueuedPrompt,
+  ): QueuedPrompt => {
+    const queue = pendingPromptQueues.get(contextKey) ?? [];
+    queue.push(item);
+    pendingPromptQueues.set(contextKey, queue);
+    return item;
+  };
+
+  const scheduleDrainQueuedPrompts = (contextKey: TelegramContextKey): void => {
+    const queue = pendingPromptQueues.get(contextKey);
+    if (!queue || queue.length === 0 || queuedPromptRetryTimers.has(contextKey)) {
+      return;
+    }
+
+    const endInFlight = beginInFlight();
+    const timer = setTimeout(() => {
+      queuedPromptRetryTimers.delete(contextKey);
+      void drainQueuedPrompts(contextKey)
+        .catch((error) => {
+          console.error("Failed to drain queued Telegram prompt:", formatError(error));
+        })
+        .finally(endInFlight);
+    }, QUEUED_PROMPT_BUSY_RETRY_MS);
+    queuedPromptRetryTimers.set(contextKey, { timer, endInFlight });
+  };
+
+  const drainQueuedPrompts = async (contextKey: TelegramContextKey): Promise<void> => {
+    if (drainingPromptQueues.has(contextKey) || isBusy(contextKey)) {
+      scheduleDrainQueuedPrompts(contextKey);
+      return;
+    }
+
+    drainingPromptQueues.add(contextKey);
+    try {
+      while (!isBusy(contextKey)) {
+        const queue = pendingPromptQueues.get(contextKey);
+        const next = queue?.[0];
+        if (!next) {
+          pendingPromptQueues.delete(contextKey);
+          return;
+        }
+
+        if (next.status === "pending") {
+          scheduleDrainQueuedPrompts(contextKey);
+          return;
+        }
+
+        let consumed = false;
+        try {
+          if (next.status === "ready" && next.input !== undefined) {
+            rememberPromptInput(contextKey, next.input);
+            await handleUserPrompt(next.ctx, contextKey, next.chatId, next.session, next.input);
+            consumed = true;
+            await completeReaction(next.ctx, next.receiptReaction);
+            if (next.afterSuccess) {
+              await next.afterSuccess();
+            }
+          } else {
+            consumed = true;
+            await failReaction(next.ctx, next.receiptReaction);
+          }
+        } catch (error) {
+          if (isCodexTurnBusyError(error)) {
+            scheduleDrainQueuedPrompts(contextKey);
+            return;
+          }
+          consumed = true;
+          await failReaction(next.ctx, next.receiptReaction);
+        } finally {
+          if (consumed) {
+            queue.shift();
+            if (queue.length === 0) {
+              pendingPromptQueues.delete(contextKey);
+            }
+            if (next.afterPrompt) {
+              await next.afterPrompt();
+            }
+          }
+        }
+      }
+    } finally {
+      drainingPromptQueues.delete(contextKey);
+    }
+  };
+
+  const runOrQueuePrompt = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    session: CodexSessionService,
+    input: CodexPromptInput,
+    options: { receiptReaction?: Promise<void>; afterSuccess?: () => Promise<void>; afterPrompt?: () => Promise<void> } = {},
+  ): Promise<void> => {
+    rememberPromptInput(contextKey, input);
+    const receiptReaction = options.receiptReaction ?? setReaction(ctx, "👀");
+    const hasQueuedPrompts = (pendingPromptQueues.get(contextKey)?.length ?? 0) > 0;
+    if (isBusy(contextKey) || hasQueuedPrompts) {
+      enqueuePrompt(contextKey, {
+        ctx,
+        chatId,
+        session,
+        status: "ready",
+        input,
+        receiptReaction,
+        afterSuccess: options.afterSuccess,
+        afterPrompt: options.afterPrompt,
+      });
+      await drainQueuedPrompts(contextKey);
+      return;
+    }
+
+    let consumed = false;
+    try {
+      await handleUserPrompt(ctx, contextKey, chatId, session, input);
+      consumed = true;
+      await completeReaction(ctx, receiptReaction);
+      if (options.afterSuccess) {
+        await options.afterSuccess();
+      }
+    } catch (error) {
+      if (isCodexTurnBusyError(error)) {
+        enqueuePrompt(contextKey, {
+          ctx,
+          chatId,
+          session,
+          status: "ready",
+          input,
+          receiptReaction,
+          afterSuccess: options.afterSuccess,
+          afterPrompt: options.afterPrompt,
+        });
+        scheduleDrainQueuedPrompts(contextKey);
+        return;
+      }
+      consumed = true;
+      await failReaction(ctx, receiptReaction);
+    } finally {
+      if (consumed && options.afterPrompt) {
+        await options.afterPrompt();
+      }
+      await drainQueuedPrompts(contextKey);
+    }
+  };
+
   const sendRepeatingChatAction = async <T>(
     chatId: TelegramChatId,
     action: TelegramChatAction,
@@ -566,6 +738,10 @@ export function createBot(
       updateSessionMetadata(contextKey, session);
       return true;
     } catch (error) {
+      if (isCodexTurnBusyError(error)) {
+        throw error;
+      }
+
       await safeReply(ctx, escapeHTML(`Failed to create thread: ${friendlyErrorText(error)}`), {
         fallbackText: `Failed to create thread: ${friendlyErrorText(error)}`,
       });
@@ -1071,6 +1247,9 @@ export function createBot(
     } catch (error) {
       stopTyping();
       clearFlushTimer();
+      if (isCodexTurnBusyError(error)) {
+        throw error;
+      }
       if (responseMessagePromise) {
         try {
           await responseMessagePromise;
@@ -2328,14 +2507,7 @@ export function createBot(
     const endInFlight = trackedByMiddleware ? undefined : beginInFlight();
     try {
       const session = await registry.getOrCreate(contextKey);
-      rememberPromptInput(contextKey, userText);
-      const receiptReaction = setReaction(ctx, "👀");
-      try {
-        await handleUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
-        await completeReaction(ctx, receiptReaction);
-      } catch {
-        await failReaction(ctx, receiptReaction);
-      }
+      await runOrQueuePrompt(ctx, contextKey, ctx.chat.id, session, userText);
     } finally {
       endInFlight?.();
     }
@@ -2355,6 +2527,7 @@ export function createBot(
     }
 
     const receiptReaction = setReaction(ctx, "👀");
+    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
     let transcript = "";
@@ -2368,14 +2541,16 @@ export function createBot(
 
       transcript = result.text.trim();
       if (!transcript) {
-        await failReaction(ctx, receiptReaction);
+        queuedPrompt.status = "skipped";
         void safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
           fallbackText: "Transcription was empty. Please try again or send text instead.",
         }).catch(() => {});
         return;
       }
+      queuedPrompt.status = "ready";
+      queuedPrompt.input = transcript;
     } catch (error) {
-      await failReaction(ctx, receiptReaction);
+      queuedPrompt.status = "skipped";
       const note = "Note: voice transcription is separate from CODEX_API_KEY.";
       void safeReply(ctx, "<b>Transcription failed:</b>\n" + escapeHTML(friendlyErrorText(error)) + "\n\n<i>" + escapeHTML(note) + "</i>", {
         fallbackText: "Transcription failed:\n" + friendlyErrorText(error) + "\n\n" + note,
@@ -2386,14 +2561,7 @@ export function createBot(
       if (tempFilePath) {
         await unlink(tempFilePath).catch(() => {});
       }
-    }
-
-    rememberPromptInput(contextKey, transcript);
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, transcript);
-      await completeReaction(ctx, receiptReaction);
-    } catch {
-      await failReaction(ctx, receiptReaction);
+      await drainQueuedPrompts(contextKey);
     }
   });
 
@@ -2412,6 +2580,7 @@ export function createBot(
     }
 
     const receiptReaction = setReaction(ctx, "👀");
+    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 
@@ -2419,13 +2588,14 @@ export function createBot(
       await ctx.api.sendChatAction(chatId, "upload_photo");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, photo.file_id, 20 * 1024 * 1024);
     } catch (error) {
-      await failReaction(ctx, receiptReaction);
+      queuedPrompt.status = "skipped";
       void safeReply(ctx, "<b>Failed to download photo:</b> " + escapeHTML(friendlyErrorText(error)), {
         fallbackText: "Failed to download photo: " + friendlyErrorText(error),
       }).catch(() => {});
       return;
     } finally {
       stopTranscribing();
+      await drainQueuedPrompts(contextKey);
     }
 
     const caption = ctx.message.caption?.trim();
@@ -2433,15 +2603,14 @@ export function createBot(
     if (caption) {
       promptInput.text = caption;
     }
-    rememberPromptInput(contextKey, promptInput);
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
-      await completeReaction(ctx, receiptReaction);
-    } catch {
-      await failReaction(ctx, receiptReaction);
-    } finally {
-      await unlink(tempFilePath).catch(() => {});
-    }
+    queuedPrompt.status = "ready";
+    queuedPrompt.input = promptInput;
+    queuedPrompt.afterPrompt = async () => {
+      if (tempFilePath) {
+        await unlink(tempFilePath).catch(() => {});
+      }
+    };
+    await drainQueuedPrompts(contextKey);
   });
 
   bot.on("message:document", async (ctx) => {
@@ -2467,6 +2636,7 @@ export function createBot(
     }
 
     const receiptReaction = setReaction(ctx, "👀");
+    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 
@@ -2474,13 +2644,14 @@ export function createBot(
       await ctx.api.sendChatAction(chatId, "typing");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, doc.file_id, config.maxFileSize);
     } catch (error) {
-      await failReaction(ctx, receiptReaction);
+      queuedPrompt.status = "skipped";
       void safeReply(ctx, "<b>Failed to download file:</b> " + escapeHTML(friendlyErrorText(error)), {
         fallbackText: "Failed to download file: " + friendlyErrorText(error),
       }).catch(() => {});
       return;
     } finally {
       stopTranscribing();
+      await drainQueuedPrompts(contextKey);
     }
 
     const turnId = randomUUID().slice(0, 12);
@@ -2497,10 +2668,11 @@ export function createBot(
         maxFileSize: config.maxFileSize,
       });
     } catch (error) {
-      await failReaction(ctx, receiptReaction);
+      queuedPrompt.status = "skipped";
       void safeReply(ctx, "<b>Failed to stage file:</b> " + escapeHTML(friendlyErrorText(error)), {
         fallbackText: "Failed to stage file: " + friendlyErrorText(error),
       }).catch(() => {});
+      await drainQueuedPrompts(contextKey);
       return;
     } finally {
       if (tempFilePath) {
@@ -2518,11 +2690,12 @@ export function createBot(
     try {
       await ensureOutDir(outDir);
     } catch (error) {
-      await failReaction(ctx, receiptReaction);
+      queuedPrompt.status = "skipped";
       void safeReply(ctx, "<b>Failed to prepare output folder:</b> " + escapeHTML(friendlyErrorText(error)), {
         fallbackText: "Failed to prepare output folder: " + friendlyErrorText(error),
       }).catch(() => {});
       await cleanupInbox(workspace, turnId).catch(() => {});
+      await drainQueuedPrompts(contextKey);
       return;
     }
 
@@ -2533,18 +2706,15 @@ export function createBot(
     if (caption) {
       promptInput.text = caption;
     }
-    rememberPromptInput(contextKey, promptInput);
-
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
-      await completeReaction(ctx, receiptReaction);
+    queuedPrompt.status = "ready";
+    queuedPrompt.input = promptInput;
+    queuedPrompt.afterSuccess = async () => {
       await deliverArtifacts(ctx, chatId, outDir, parseContextKey(contextKey).messageThreadId);
-    } catch (error) {
-      await failReaction(ctx, receiptReaction);
-      console.error("Failed to process document prompt:", error);
-    } finally {
+    };
+    queuedPrompt.afterPrompt = async () => {
       await cleanupInbox(workspace, turnId);
-    }
+    };
+    await drainQueuedPrompts(contextKey);
   });
 
   bot.catch((error) => {
@@ -2556,25 +2726,32 @@ export function createBot(
 }
 
 export async function registerCommands(bot: Bot<Context>): Promise<void> {
-  await bot.api.setMyCommands([
-    { command: "start", description: "Welcome & status" },
-    { command: "help", description: "Command reference" },
-    { command: "new", description: "Start a new thread" },
-    { command: "session", description: "Current thread details" },
-    { command: "sessions", description: "Browse & switch threads" },
-    { command: "retry", description: "Resend the last prompt" },
-    { command: "abort", description: "Cancel current operation" },
-    { command: "launch_profiles", description: "Select launch profile" },
-    { command: "model", description: "View & change model" },
-    { command: "effort", description: "Set reasoning effort" },
-    { command: "auth", description: "Check auth status" },
-    { command: "login", description: "Start authentication" },
-    { command: "logout", description: "Sign out" },
-    { command: "voice", description: "Voice transcription status" },
-    { command: "handback", description: "Hand thread to Codex CLI" },
-    { command: "attach", description: "Bind a Codex thread to this topic" },
-    { command: "switch", description: "Switch to a thread by ID" },
-  ]);
+  try {
+    await bot.api.setMyCommands([
+      { command: "start", description: "Welcome & status" },
+      { command: "help", description: "Command reference" },
+      { command: "new", description: "Start a new thread" },
+      { command: "session", description: "Current thread details" },
+      { command: "sessions", description: "Browse & switch threads" },
+      { command: "retry", description: "Resend the last prompt" },
+      { command: "abort", description: "Cancel current operation" },
+      { command: "launch_profiles", description: "Select launch profile" },
+      { command: "model", description: "View & change model" },
+      { command: "effort", description: "Set reasoning effort" },
+      { command: "auth", description: "Check auth status" },
+      { command: "login", description: "Start authentication" },
+      { command: "logout", description: "Sign out" },
+      { command: "voice", description: "Voice transcription status" },
+      { command: "handback", description: "Hand thread to Codex CLI" },
+      { command: "attach", description: "Bind a Codex thread to this topic" },
+      { command: "switch", description: "Switch to a thread by ID" },
+    ]);
+  } catch (error) {
+    console.warn(
+      "Warning: Failed to register Telegram bot commands; continuing without command menu.",
+      friendlyErrorText(error),
+    );
+  }
 }
 
 function renderSessionInfoPlain(info: CodexSessionInfo): string {
@@ -3070,6 +3247,12 @@ function isTelegramParseError(error: unknown): boolean {
 function renderPromptFailure(_accumulatedText: string, error: unknown): string {
   const message = friendlyErrorText(error);
   return `⚠️ ${message}`;
+}
+
+function isCodexTurnBusyError(error: unknown): boolean {
+  return /(A Codex turn is already in progress|turn is already in progress|while a turn is in progress)/i.test(
+    formatError(error),
+  );
 }
 
 function isAbortLikeError(error: unknown): boolean {

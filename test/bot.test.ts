@@ -101,7 +101,7 @@ vi.mock("@grammyjs/auto-retry", () => ({
 
 vi.mock("../src/codex-auth.js", () => mockAuth);
 
-import { createBot } from "../src/bot.js";
+import { createBot, registerCommands } from "../src/bot.js";
 import { _resetImportHook, _setDecodeHook, _setImportHook } from "../src/voice.js";
 
 describe("createBot response delivery", () => {
@@ -1053,6 +1053,86 @@ describe("createBot response delivery", () => {
     expect(visibleReplies).not.toContain("这段转写只应该进 Codex");
   });
 
+  it("queues voice transcripts behind an active text turn before calling Codex", async () => {
+    const firstTurn = deferred<void>();
+    let activePrompt = false;
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      if (activePrompt) {
+        throw new Error("A Codex turn is already in progress");
+      }
+
+      activePrompt = true;
+      promptCount += 1;
+      try {
+        if (promptCount === 1) {
+          callbacks.onTextDelta("第一轮回复。");
+          callbacks.onAgentMessage?.("第一轮回复。");
+          await firstTurn.promise;
+        } else {
+          callbacks.onTextDelta("语音进入 Codex。");
+          callbacks.onAgentMessage?.("语音进入 Codex。");
+        }
+        callbacks.onAgentEnd();
+      } finally {
+        activePrompt = false;
+      }
+    });
+    session.isProcessing.mockImplementation(() => activePrompt);
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "voice/queued.ogg",
+      file_size: 3,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      })),
+    );
+    _setDecodeHook(async () => new Float32Array([0.1, 0.2]));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          return { text: "语音第二条必须排队", durationMs: 1 };
+        }
+      },
+    }));
+
+    const textHandler = bot.__handlers.on.get("message:text");
+    const voiceHandler = bot.__handlers.on.get("message:voice|message:audio");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 77, text: "第一条，先跑一个长任务" },
+      api: bot.api,
+    });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    await voiceHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 78, voice: { file_id: "voice-queued" } },
+      api: bot.api,
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).not.toContain(
+      "A Codex turn is already in progress",
+    );
+
+    firstTurn.resolve();
+    await firstPromise;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("语音第二条必须排队");
+  });
+
   it("places the style guard before staged file instructions for document prompts", async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), "telecodex-bot-doc-"));
     tempDirs.push(workspace);
@@ -1241,7 +1321,7 @@ describe("createBot response delivery", () => {
     }
   });
 
-  it("thin bridge passes a text follow-up to Codex instead of sending a dispatcher busy reply", async () => {
+  it("thin bridge queues a text follow-up instead of sending a dispatcher busy reply", async () => {
     const firstTurn = deferred<void>();
     let promptCount = 0;
     const session = createSession(async (callbacks) => {
@@ -1270,7 +1350,7 @@ describe("createBot response delivery", () => {
 
     await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
 
-    await textHandler({
+    const secondPromise = textHandler({
       chat: { id: 42 },
       from: { id: 123 },
       message: { message_id: 902, text: "第二条，照常送进 Codex" },
@@ -1278,15 +1358,140 @@ describe("createBot response delivery", () => {
     });
 
     expect(session.abort).not.toHaveBeenCalled();
-    expect(session.prompt).toHaveBeenCalledTimes(2);
-    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条，照常送进 Codex");
+    await delay(20);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
 
     const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\\n");
     expect(visibleReplies).not.toContain("Still working on previous message");
 
     firstTurn.resolve();
     await firstPromise;
+    await secondPromise;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条，照常送进 Codex");
+  });
+
+  it("does not fail startup when Telegram command registration is rate limited", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("ok");
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.setMyCommands.mockRejectedValueOnce(
+      new Error("Call to setMyCommands failed! (429: Too Many Requests: retry after 1151)"),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await expect(registerCommands(bot)).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("Warning: Failed to register Telegram bot commands"),
+        expect.stringContaining("Rate limited by the API"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("requeues a text prompt when the Codex session boundary reports an active turn race", async () => {
+    let firstRejected = false;
+    let externalBusy = false;
+    const session = createSession(async (callbacks, input) => {
+      if (!firstRejected) {
+        firstRejected = true;
+        externalBusy = true;
+        throw new Error("A Codex turn is already in progress");
+      }
+
+      callbacks.onTextDelta("排队后进入 Codex。");
+      callbacks.onAgentMessage?.("排队后进入 Codex。");
+      callbacks.onAgentEnd();
+    });
+    session.isProcessing.mockImplementation(() => externalBusy);
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 905, text: "这条不能露 busy，要等边界空出来" },
+      api: bot.api,
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\\n")).not.toContain(
+      "A Codex turn is already in progress",
+    );
+
+    externalBusy = false;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("这条不能露 busy");
+    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\\n")).toContain(
+      "排队后进入 Codex",
+    );
+  });
+
+  it("serializes same-context text follow-ups before calling Codex", async () => {
+    const firstTurn = deferred<void>();
+    let activePrompt = false;
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      if (activePrompt) {
+        throw new Error("A Codex turn is already in progress");
+      }
+
+      activePrompt = true;
+      promptCount += 1;
+      try {
+        if (promptCount === 1) {
+          callbacks.onTextDelta("第一轮回复。");
+          callbacks.onAgentMessage?.("第一轮回复。");
+          await firstTurn.promise;
+        } else {
+          callbacks.onTextDelta("第二轮进入 Codex。");
+          callbacks.onAgentMessage?.("第二轮进入 Codex。");
+        }
+        callbacks.onAgentEnd();
+      } finally {
+        activePrompt = false;
+      }
+    });
+    session.isProcessing.mockImplementation(() => activePrompt);
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 903, text: "第一条，先跑一个长任务" },
+      api: bot.api,
+    });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const secondPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 904, text: "第二条必须等第一条结束再进 Codex" },
+      api: bot.api,
+    });
+
     await delay(20);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n")).not.toContain(
+      "A Codex turn is already in progress",
+    );
+
+    firstTurn.resolve();
+    await firstPromise;
+    await secondPromise;
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("第二条必须等第一条结束再进 Codex");
   });
 
 });
@@ -1315,3 +1520,22 @@ function reactionEmojiFromCall(call: unknown[] | undefined): string | undefined 
   const reactions = call?.[2] as Array<{ emoji?: string }> | undefined;
   return reactions?.[0]?.emoji;
 }
+
+describe("registerCommands startup resilience", () => {
+  it("does not reject when Telegram command registration is rate limited", async () => {
+    const bot = {
+      api: {
+        setMyCommands: vi.fn().mockRejectedValue(new Error("429: Too Many Requests: retry after 120")),
+      },
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(registerCommands(bot as any)).resolves.toBeUndefined();
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("Warning: Failed to register Telegram bot commands"),
+      expect.stringContaining("Rate limited by the API"),
+    );
+    warn.mockRestore();
+  });
+});
