@@ -1815,6 +1815,204 @@ describe("createBot response delivery", () => {
     expect(String(session.prompt.mock.calls[1][0])).toContain("第二条必须等第一条结束再进 Codex");
   });
 
+  it("pending-answer guard: a normally answered message triggers no re-prompt (ALB-1339 场景①)", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("这就是答复。");
+      callbacks.onAgentMessage?.("这就是答复。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1101, text: "普通一问" },
+      api: bot.api,
+    });
+    await delay(30);
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const allPrompts = session.prompt.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(allPrompts).not.toContain("欠答自查");
+  });
+
+  it("pending-answer guard: queued messages answered by their own turns are all struck (ALB-1339 场景②)", async () => {
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta(`第${promptCount}轮回复。`);
+        callbacks.onAgentMessage?.(`第${promptCount}轮回复。`);
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1111, text: "第一条，长任务" },
+      api: bot.api,
+    });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    const secondPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1112, text: "第二条，排队" },
+      api: bot.api,
+    });
+    const thirdPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1113, text: "第三条，也排队" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await Promise.all([firstPromise, secondPromise, thirdPromise]);
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+    await delay(300);
+
+    // All three were answered by their own turns — nothing is owed, no re-prompt.
+    expect(session.prompt).toHaveBeenCalledTimes(3);
+    const allPrompts = session.prompt.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(allPrompts).not.toContain("欠答自查");
+  });
+
+  it("pending-answer guard: a swallowed message is re-prompted once on the next finalize (ALB-1339 场景③)", async () => {
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        // The turn for the first message dies without ever answering it.
+        throw new Error("codex exploded mid-turn");
+      }
+      callbacks.onTextDelta(`第${promptCount}轮回复。`);
+      callbacks.onAgentMessage?.(`第${promptCount}轮回复。`);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1121, text: "这条会被吞掉，一直没人答" },
+      api: bot.api,
+    });
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1122, text: "第二条正常问" },
+      api: bot.api,
+    });
+
+    // Second turn answers normally, then its finalize notices the swallowed
+    // first message and feeds a re-prompt turn back into the same thread.
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+    const repromptText = String(session.prompt.mock.calls[2][0]);
+    expect(repromptText).toContain("欠答自查");
+    expect(repromptText).toContain("这条会被吞掉，一直没人答");
+  });
+
+  it("pending-answer guard: the re-prompt turn itself never spawns another re-prompt (ALB-1339 场景④)", async () => {
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        throw new Error("codex exploded mid-turn");
+      }
+      callbacks.onTextDelta(`第${promptCount}轮回复。`);
+      callbacks.onAgentMessage?.(`第${promptCount}轮回复。`);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1131, text: "被吞的一条" },
+      api: bot.api,
+    });
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1132, text: "触发补答的一条" },
+      api: bot.api,
+    });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+    await delay(400);
+
+    // Exactly one re-prompt across the whole exchange, and it does not loop.
+    expect(session.prompt).toHaveBeenCalledTimes(3);
+    const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("欠答自查"),
+    );
+    expect(repromptCalls).toHaveLength(1);
+  });
+
+  it("pending-answer guard: a message arriving mid-turn is not treated as owed (ALB-1339 场景⑤)", async () => {
+    const firstTurn = deferred<void>();
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("第一轮回复。");
+        callbacks.onAgentMessage?.("第一轮回复。");
+        await firstTurn.promise;
+      } else {
+        callbacks.onTextDelta("第二轮回复。");
+        callbacks.onAgentMessage?.("第二轮回复。");
+      }
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const firstPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1141, text: "第一条，长任务" },
+      api: bot.api,
+    });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+
+    // Arrives while turn 1 is still running: queued, not owed by turn 1.
+    const secondPromise = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1142, text: "turn 进行中来的一条" },
+      api: bot.api,
+    });
+
+    firstTurn.resolve();
+    await Promise.all([firstPromise, secondPromise]);
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    await delay(300);
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    const allPrompts = session.prompt.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(allPrompts).not.toContain("欠答自查");
+  });
+
 });
 
 type Deferred<T> = {

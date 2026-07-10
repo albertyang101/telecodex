@@ -38,6 +38,7 @@ import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
+import { PendingAnswerLedger, formatPendingAnswerReprompt } from "./pending-answer-guard.js";
 import { stripVisiblePromptGuardEcho, withRotationHandoff, withTelegramReplyStyleGuard } from "./prompt-guard.js";
 import { clearChatState, loadChatState, saveChatState } from "./handoff-store.js";
 import {
@@ -103,6 +104,8 @@ type QueuedPrompt = {
   session: CodexSessionService;
   status: "pending" | "ready" | "skipped";
   input?: CodexPromptInput;
+  /** Telegram message id backing this queued prompt (ALB-1339 欠答账本 exclusion). */
+  pendingMsgId?: number;
   receiptReaction?: Promise<void>;
   afterSuccess?: () => Promise<void>;
   afterPrompt?: () => Promise<void>;
@@ -354,6 +357,8 @@ export function createBot(
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const pendingPromptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
+  // ALB-1339 欠答账本: owner messages received but not yet answered.
+  const pendingAnswerLedger = new PendingAnswerLedger();
   const drainingPromptQueues = new Set<TelegramContextKey>();
   const queuedPromptRetryTimers = new Map<
     TelegramContextKey,
@@ -402,6 +407,7 @@ export function createBot(
     pendingUnsafeLaunchConfirmations.delete(key);
     lastPromptInput.delete(key);
     pendingPromptQueues.delete(key);
+    pendingAnswerLedger.clear(key);
     drainingPromptQueues.delete(key);
     const retryTimer = queuedPromptRetryTimers.get(key);
     if (retryTimer) {
@@ -661,6 +667,10 @@ export function createBot(
     options: { receiptReaction?: Promise<void>; afterSuccess?: () => Promise<void>; afterPrompt?: () => Promise<void> } = {},
   ): Promise<void> => {
     rememberPromptInput(contextKey, input);
+    // ALB-1339 欠答账本入口腿: every owner message is owed an answer from the
+    // moment it arrives; the turn that answers it strikes it off on finalize.
+    const pendingAnswerMsgId = ctx.message?.message_id;
+    pendingAnswerLedger.record(contextKey, pendingAnswerMsgId, visibleUserText(input));
     const receiptReaction = options.receiptReaction ?? setReaction(ctx, "👀");
     const hasQueuedPrompts = (pendingPromptQueues.get(contextKey)?.length ?? 0) > 0;
     if (isBusy(contextKey) || hasQueuedPrompts) {
@@ -670,6 +680,7 @@ export function createBot(
         session,
         status: "ready",
         input,
+        pendingMsgId: pendingAnswerMsgId,
         receiptReaction,
         afterSuccess: options.afterSuccess,
         afterPrompt: options.afterPrompt,
@@ -694,6 +705,7 @@ export function createBot(
           session,
           status: "ready",
           input,
+          pendingMsgId: pendingAnswerMsgId,
           receiptReaction,
           afterSuccess: options.afterSuccess,
           afterPrompt: options.afterPrompt,
@@ -816,6 +828,17 @@ export function createBot(
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
+
+    // ALB-1339 欠答检查: ledger entries recorded from this point on belong to
+    // messages that arrived during this turn — never this turn's debt.
+    const pendingAnswerTurnSeq = pendingAnswerLedger.snapshotSeq();
+    // A message counts as answered once the user got a direct reply about it —
+    // the normal finalize, but also the give-up paths that reply and return
+    // (auth failure, hard-cap refusal, thread-creation failure). Only turns
+    // that die without any reply about their message leave the entry pending.
+    const strikeOwnPendingAnswer = (): void => {
+      pendingAnswerLedger.markAnswered(contextKey, ctx.message?.message_id);
+    };
 
     const busyState = getBusyState(contextKey);
     const ownsProcessingFlag = !busyState.processing;
@@ -1281,6 +1304,7 @@ export function createBot(
             ].join("\n"),
           },
         );
+        strikeOwnPendingAnswer();
         return;
       }
 
@@ -1323,6 +1347,9 @@ export function createBot(
               escapeHTML("⚠️ 上下文已触及硬上限，且新线程一时开不起来，这条先没接。稍后再发一次就会自动翻页续上。"),
               { fallbackText: "上下文已触及硬上限，新线程一时开不起来，这条先没接，稍后再发一次即可。" },
             );
+            // The user was told to resend this message (ALB-1205 contract), so
+            // it is answered for the pending-answer ledger — do not re-feed it.
+            strikeOwnPendingAnswer();
             return;
           } else {
             console.error(
@@ -1331,13 +1358,16 @@ export function createBot(
             );
             setRotationState(contextKey, rotationStateBeforeRotation);
             if (!(await ensureActiveThread(ctx, contextKey, session))) {
+              strikeOwnPendingAnswer();
               return;
             }
           }
         } else if (!(await ensureActiveThread(ctx, contextKey, session))) {
+          strikeOwnPendingAnswer();
           return;
         }
       } else if (!(await ensureActiveThread(ctx, contextKey, session))) {
+        strikeOwnPendingAnswer();
         return;
       }
 
@@ -1374,6 +1404,28 @@ export function createBot(
             rotationCfg,
           ),
         );
+      }
+
+      // ALB-1339 欠答检查出口腿: this turn's reply went out — strike its own
+      // message, then re-prompt anything received before this turn that was
+      // never answered and is no longer queued for a turn of its own
+      // (swallowed by a queue drop / abort / usage-cap). takeOverdue removes
+      // what it returns, so each swallowed message is re-fed at most once.
+      strikeOwnPendingAnswer();
+      const overdueAnswers = pendingAnswerLedger.takeOverdue(
+        contextKey,
+        pendingAnswerTurnSeq,
+        (msgId) => (pendingPromptQueues.get(contextKey) ?? []).some((item) => item.pendingMsgId === msgId),
+      );
+      if (overdueAnswers.length > 0) {
+        enqueuePrompt(contextKey, {
+          ctx,
+          chatId,
+          session,
+          status: "ready",
+          input: formatPendingAnswerReprompt(overdueAnswers),
+        });
+        scheduleDrainQueuedPrompts(contextKey);
       }
     } catch (error) {
       stopTyping();
