@@ -133,3 +133,73 @@ describe("withTelegramReplyStyleGuard", () => {
     expect(stripVisiblePromptGuardEcho(reply)).toBe("");
   });
 });
+
+// ALB-1207 W2: the guard must TEACH the model to tag internal lines with ⌦
+// (the outbound strip already exists but was idle without this teaching line),
+// plus hard style rules (full-width punctuation / no headings-tables-rules /
+// no engineering jargon in Albert-facing prose).
+const ALB1207_TAGGING_LINE =
+  "内部行必打标：凡说给自己的行（盘算、进度自述、干活旁白、收尾复述如「已发给他/等他回」），行首打「⌦ 」，出口会机械剥掉；给 Albert 的话绝不打标；后台轮没有要对用户说的话，就整条全部打标或直接留空。";
+const ALB1207_PUNCT_LINE =
+  "中文一律用全角标点（，。？！：）；小标题用加粗独占一行；不写井号标题，不画表格分隔线、水平线。";
+const ALB1207_JARGON_LINE =
+  "不把模块名、函数名、commit、文件路径、行号这类工程黑话写进给 Albert 的正文；技术细节只在 Albert 明确要时才给，给之前先用一句人话总结。";
+
+describe("ALB-1207 guard tagging teaching + hard style lines", () => {
+  it("teaches ⌦ tagging of internal lines in every Telegram turn", () => {
+    const prompt = withTelegramReplyStyleGuard("hello", sessionInfo);
+    expect(prompt).toContain(ALB1207_TAGGING_LINE);
+  });
+
+  it("injects the full-width punctuation / no-markdown-noise style line", () => {
+    const prompt = withTelegramReplyStyleGuard("hello", sessionInfo);
+    expect(prompt).toContain(ALB1207_PUNCT_LINE);
+  });
+
+  it("injects the no-engineering-jargon style line", () => {
+    const prompt = withTelegramReplyStyleGuard("hello", sessionInfo);
+    expect(prompt).toContain(ALB1207_JARGON_LINE);
+  });
+
+  it("strips each new guard line when the model echoes it verbatim outside a guard block", () => {
+    for (const echoed of [ALB1207_TAGGING_LINE, ALB1207_PUNCT_LINE, ALB1207_JARGON_LINE]) {
+      const reply = ["好的，我记住了。", echoed].join("\n");
+      const visible = stripVisiblePromptGuardEcho(reply);
+      expect(visible).toBe("好的，我记住了。");
+    }
+  });
+
+  it("strips the new guard lines when echoed inside a [TELEGRAM REPLY STYLE] block", () => {
+    const reply = [
+      "[TELEGRAM REPLY STYLE]",
+      ALB1207_TAGGING_LINE,
+      ALB1207_PUNCT_LINE,
+      ALB1207_JARGON_LINE,
+      "",
+      "正文在这里。",
+    ].join("\n");
+    expect(stripVisiblePromptGuardEcho(reply)).toBe("正文在这里。");
+  });
+
+  it("strips the new guard lines even when echoed wrapped in markdown (bold/bullet)", () => {
+    const reply = [
+      `- **${ALB1207_TAGGING_LINE}**`,
+      `> ${ALB1207_PUNCT_LINE}`,
+      "只有这句要发出去。",
+    ].join("\n");
+    expect(stripVisiblePromptGuardEcho(reply)).toBe("只有这句要发出去。");
+  });
+
+  it("keeps only the normal line when ⌦ internal lines, normal text and echoed guard lines coexist", () => {
+    const reply = [
+      "⌦ 先盘一下：这轮只需要回结论。",
+      "这是真正要发给 Albert 的话。",
+      ALB1207_TAGGING_LINE,
+      "⌦ 已发给他，等他回。",
+    ].join("\n");
+    const visible = stripVisiblePromptGuardEcho(reply);
+    expect(visible).toBe("这是真正要发给 Albert 的话。");
+    expect(visible).not.toContain("⌦");
+    expect(visible).not.toContain("内部行必打标");
+  });
+});

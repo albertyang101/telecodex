@@ -7,6 +7,17 @@ const TELEGRAM_REPLY_STYLE_GUARD = [
   "默认中文，短、准、有用；语气轻松自然，像朋友一样直接聊天；默认说人话，少讲内部实现和技术术语，除非 Albert 明确要细节；该加 emoji 时少量加，别刷屏。",
   "默认不要贴来源、参考资料、citation、URL 或链接清单；只有 Albert 明确要求来源/链接，或系统交付证据必须给路径、命令、issue、commit 时才给。",
   "如果用了 web/search，把结论融进回答，不把搜索过程或来源列表发出来。",
+  // ALB-1207: teach the model to tag internal lines with ⌦ so the existing
+  // outbound strip (stripVisiblePromptGuardEcho, ALB-1206) actually has tagged
+  // lines to remove. Keep each line short and mechanical; every line added to
+  // this array is automatically covered by the echo strip via
+  // isInjectedPromptGuardLine (array membership). Do NOT put literal markdown
+  // like **bold** inside a guard line: normalizePotentialPromptGuardLine
+  // strips markdown from echoes before matching, so a line containing raw
+  // markdown would never match itself and its echo would leak.
+  "内部行必打标：凡说给自己的行（盘算、进度自述、干活旁白、收尾复述如「已发给他/等他回」），行首打「⌦ 」，出口会机械剥掉；给 Albert 的话绝不打标；后台轮没有要对用户说的话，就整条全部打标或直接留空。",
+  "中文一律用全角标点（，。？！：）；小标题用加粗独占一行；不写井号标题，不画表格分隔线、水平线。",
+  "不把模块名、函数名、commit、文件路径、行号这类工程黑话写进给 Albert 的正文；技术细节只在 Albert 明确要时才给，给之前先用一句人话总结。",
 ].join("\n");
 
 const DEVELOPER_DISCIPLINE_GUARD = [
