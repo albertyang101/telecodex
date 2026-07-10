@@ -355,9 +355,13 @@ export function createBot(
   const pendingUnsafeLaunchConfirmations = new Map<TelegramContextKey, string>();
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
-  const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
+  const lastPromptInput = new Map<TelegramContextKey, { input: CodexPromptInput; msgId?: number }>();
   const pendingPromptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
-  // ALB-1339 欠答账本: owner messages received but not yet answered.
+  // ALB-1339 欠答账本: owner messages received but not yet answered. Scope is
+  // deliberately the text-prompt path (runOrQueuePrompt) only — voice/photo/
+  // document messages enqueue directly in their own handlers and already reply
+  // to the user themselves on every failure path, so they stay off the ledger
+  // (reviewer Minor-2: a scope trade-off, not an oversight).
   const pendingAnswerLedger = new PendingAnswerLedger();
   const drainingPromptQueues = new Set<TelegramContextKey>();
   const queuedPromptRetryTimers = new Map<
@@ -499,14 +503,18 @@ export function createBot(
     });
   };
 
-  const rememberPromptInput = (contextKey: TelegramContextKey, input: CodexPromptInput): void => {
+  // `msgId` rides along so a later /retry can strike the ORIGINAL message off
+  // the pending-answer ledger (ALB-1339): striking the /retry command's own id
+  // instead would leave the original entry pending and re-prompt an already
+  // answered message.
+  const rememberPromptInput = (contextKey: TelegramContextKey, input: CodexPromptInput, msgId?: number): void => {
     if (typeof input === "string") {
-      lastPromptInput.set(contextKey, input);
+      lastPromptInput.set(contextKey, { input, msgId });
       return;
     }
 
     if (input.text) {
-      lastPromptInput.set(contextKey, input.text);
+      lastPromptInput.set(contextKey, { input: input.text, msgId });
     }
   };
 
@@ -623,7 +631,7 @@ export function createBot(
         let consumed = false;
         try {
           if (next.status === "ready" && next.input !== undefined) {
-            rememberPromptInput(contextKey, next.input);
+            rememberPromptInput(contextKey, next.input, next.pendingMsgId);
             await handleUserPrompt(next.ctx, contextKey, next.chatId, next.session, next.input);
             consumed = true;
             await completeReaction(next.ctx, next.receiptReaction);
@@ -666,10 +674,10 @@ export function createBot(
     input: CodexPromptInput,
     options: { receiptReaction?: Promise<void>; afterSuccess?: () => Promise<void>; afterPrompt?: () => Promise<void> } = {},
   ): Promise<void> => {
-    rememberPromptInput(contextKey, input);
     // ALB-1339 欠答账本入口腿: every owner message is owed an answer from the
     // moment it arrives; the turn that answers it strikes it off on finalize.
     const pendingAnswerMsgId = ctx.message?.message_id;
+    rememberPromptInput(contextKey, input, pendingAnswerMsgId);
     pendingAnswerLedger.record(contextKey, pendingAnswerMsgId, visibleUserText(input));
     const receiptReaction = options.receiptReaction ?? setReaction(ctx, "👀");
     const hasQueuedPrompts = (pendingPromptQueues.get(contextKey)?.length ?? 0) > 0;
@@ -825,6 +833,7 @@ export function createBot(
     chatId: TelegramChatId,
     session: CodexSessionService,
     userInput: CodexPromptInput,
+    turnOptions: { pendingAnswerMsgId?: number } = {},
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
@@ -836,8 +845,11 @@ export function createBot(
     // the normal finalize, but also the give-up paths that reply and return
     // (auth failure, hard-cap refusal, thread-creation failure). Only turns
     // that die without any reply about their message leave the entry pending.
+    // /retry turns answer a message OTHER than ctx's own (the cached original),
+    // so callers may override which message this turn settles.
+    const ownPendingAnswerMsgId = turnOptions.pendingAnswerMsgId ?? ctx.message?.message_id;
     const strikeOwnPendingAnswer = (): void => {
-      pendingAnswerLedger.markAnswered(contextKey, ctx.message?.message_id);
+      pendingAnswerLedger.markAnswered(contextKey, ownPendingAnswerMsgId);
     };
 
     const busyState = getBusyState(contextKey);
@@ -1870,7 +1882,11 @@ export function createBot(
 
     const receiptReaction = setReaction(ctx, "👀");
     try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, cached);
+      // ALB-1339: the retry turn answers the cached ORIGINAL message, so its
+      // pending-answer strike must target that msgId, not /retry's own.
+      await handleUserPrompt(ctx, contextKey, chatId, session, cached.input, {
+        pendingAnswerMsgId: cached.msgId,
+      });
       await completeReaction(ctx, receiptReaction);
     } catch {
       await failReaction(ctx, receiptReaction);

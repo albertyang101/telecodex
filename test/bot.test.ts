@@ -2013,6 +2013,48 @@ describe("createBot response delivery", () => {
     expect(allPrompts).not.toContain("欠答自查");
   });
 
+  it("pending-answer guard: a successful /retry strikes the original message instead of re-prompting it (ALB-1339 review fix)", async () => {
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        // Message A's own turn dies without answering it.
+        throw new Error("codex exploded mid-turn");
+      }
+      callbacks.onTextDelta(`第${promptCount}轮回复。`);
+      callbacks.onAgentMessage?.(`第${promptCount}轮回复。`);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    const retryCommand = bot.__handlers.commands.get("retry");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1151, text: "消息A，第一轮会挂" },
+      api: bot.api,
+    });
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+
+    // /retry re-runs A's cached content and succeeds: A is answered — its
+    // ledger debt must be struck via the cached msgId, not re-prompted.
+    await retryCommand({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 1152, text: "/retry" },
+      api: bot.api,
+    });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    await delay(400);
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    const allPrompts = session.prompt.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(allPrompts).not.toContain("欠答自查");
+  });
+
 });
 
 type Deferred<T> = {
