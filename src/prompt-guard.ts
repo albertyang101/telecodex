@@ -85,11 +85,14 @@ export function stripVisiblePromptGuardEcho(replyText: string): string {
 
   for (const line of withoutHandoff.split("\n")) {
     const trimmed = line.trim();
-    if (trimmed.startsWith(INTERNAL_LINE_MARKER)) {
+    const normalized = normalizePotentialPromptGuardLine(trimmed);
+    if (trimmed.startsWith(INTERNAL_LINE_MARKER) || normalized.startsWith(INTERNAL_LINE_MARKER)) {
       // ALB-1206: whole line is ⌦-marked internal self-talk — drop it, never send it.
+      // ALB-1207: also drop markdown-wrapped forms ("- ⌦ …", "> ⌦ …", "**⌦ …**"),
+      // which normalize back to a ⌦-prefixed line; without this the tagging we now
+      // teach in the guard could leak whenever the model bullets its asides.
       continue;
     }
-    const normalized = normalizePotentialPromptGuardLine(trimmed);
     if (guardHeadings.has(normalized)) {
       inGuardBlock = true;
       continue;

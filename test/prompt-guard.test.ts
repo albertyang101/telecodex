@@ -202,4 +202,16 @@ describe("ALB-1207 guard tagging teaching + hard style lines", () => {
     expect(visible).not.toContain("⌦");
     expect(visible).not.toContain("内部行必打标");
   });
+
+  it.each([
+    ["bullet", "- ⌦ 顺手记一下：明天再核。"],
+    ["blockquote", "> ⌦ 这轮先不回他。"],
+    ["bold", "**⌦ 已发给他，等他回。**"],
+    ["numbered", "1. ⌦ 收尾：等唤醒。"],
+  ])("strips markdown-wrapped ⌦ internal lines (%s)", (_kind, wrapped) => {
+    const reply = ["这是真正要发给 Albert 的话。", wrapped].join("\n");
+    const visible = stripVisiblePromptGuardEcho(reply);
+    expect(visible).toBe("这是真正要发给 Albert 的话。");
+    expect(visible).not.toContain("⌦");
+  });
 });
