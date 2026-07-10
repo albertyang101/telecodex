@@ -951,7 +951,6 @@ export function createBot(
       }
 
       responseMessagePromise = (async () => {
-        stopTyping();
         const preview = renderPreview();
         const message = await sendTextMessage(bot.api, chatId, preview.text, {
           parseMode: preview.parseMode,

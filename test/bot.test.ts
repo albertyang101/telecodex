@@ -1551,6 +1551,51 @@ describe("createBot response delivery", () => {
     expect(input.text).toContain("看一下这张图");
   });
 
+  it("keeps refreshing typing after a streaming preview until the whole turn finishes (ALB-1361)", async () => {
+    vi.useFakeTimers();
+    try {
+      let typingCallsDuringToolWait = -1;
+      let botInstance: any;
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("收到，我查一下。");
+        await Promise.resolve();
+        await Promise.resolve();
+
+        await vi.advanceTimersByTimeAsync(9_000);
+        typingCallsDuringToolWait = botInstance.api.sendChatAction.mock.calls.filter(
+          (call: unknown[]) => call[1] === "typing",
+        ).length;
+
+        callbacks.onAgentMessage?.("查完了。");
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+      botInstance = mockGrammy.bots[0];
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 1361, text: "跑一个长工具任务" },
+        api: bot.api,
+      });
+
+      expect(typingCallsDuringToolWait).toBeGreaterThanOrEqual(3);
+
+      const typingCallsAfterTurn = bot.api.sendChatAction.mock.calls.filter(
+        (call: unknown[]) => call[1] === "typing",
+      ).length;
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBe(typingCallsAfterTurn);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps streaming agent deltas when response streaming is enabled", async () => {
     let sendsBeforeAgentEnd = -1;
     let botInstance: any;
