@@ -210,7 +210,8 @@ export function renderHandoff(
   // the most recent exchange always survives the total cap. Without a context the
   // newest entry is always kept, even if it alone exceeds the budget; with a
   // context the protected sections win and the conversation may drop entirely.
-  const recentHeading = "\n--- 旧 thread 最近对话 ---\n";
+  // 契约 §A.2：已答侧显式标注（待答侧由 未答消息 / 最后断点 段显式承担）。
+  const recentHeading = "\n--- 旧 thread 最近对话（以下均已答过，勿重答） ---\n";
   const budget = Math.max(
     0,
     maxTotalChars - header.length - footer.length - contextBlock.length - (contextBlock ? recentHeading.length : 0),

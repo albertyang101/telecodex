@@ -64,6 +64,15 @@ describe("handoff-buffer", () => {
       expect(out.indexOf("帮我看下部署脚本")).toBeLessThan(out.indexOf("超时没兜住"));
     });
 
+    it("marks the recent-conversation section as already answered (契约 §A.2)", () => {
+      // 待答侧已有显式的 未答消息 / 最后断点 段；已答侧也必须显式标注，
+      // 新棒才能据此不重答已答的（而不是靠 [用户]/[你] 成对去猜）。
+      const out = renderHandoff(sample);
+      expect(out).toContain("--- 旧 thread 最近对话（以下均已答过，勿重答） ---");
+      const withContext = renderHandoff(sample, { reason: "threshold" });
+      expect(withContext).toContain("--- 旧 thread 最近对话（以下均已答过，勿重答） ---");
+    });
+
     it("truncates an over-long single entry", () => {
       const huge = "x".repeat(DEFAULT_MAX_ENTRY_CHARS + 500);
       const out = renderHandoff([entry("user", huge)], { maxEntryChars: DEFAULT_MAX_ENTRY_CHARS });
