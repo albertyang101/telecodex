@@ -87,6 +87,22 @@ describe("handoff-buffer", () => {
       expect(out).toContain(HANDOFF_MARKER);
       expect(out.length).toBeGreaterThan(0);
     });
+
+    it("states in the header that live messages override the handoff narrative (契约 §A.1)", () => {
+      // The live-envelope-supremacy line must be part of the fixed header so it
+      // survives every render shape: with conversation, empty buffer, and context.
+      for (const out of [
+        renderHandoff(sample),
+        renderHandoff([]),
+        renderHandoff(sample, { reason: "hard-cap" }),
+      ]) {
+        expect(out).toContain("实时收到的用户消息永远压过本交接单的叙述");
+        expect(out).toContain("归属只认实时信封");
+        // ...and it must sit in the header, before any context/conversation section.
+        expect(out.indexOf("实时收到的用户消息")).toBeLessThan(out.indexOf("--- 交接结束"));
+        expect(out.indexOf("实时收到的用户消息")).toBeLessThan(200);
+      }
+    });
   });
 
   describe("renderHandoff with structured context (ALB-1205)", () => {

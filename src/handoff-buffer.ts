@@ -142,7 +142,9 @@ export function renderHandoff(
   const header =
     `${HANDOFF_MARKER}\n` +
     "你正从一个接近上下文上限的旧 thread 自动翻到这个新 thread。新 thread 上下文已清空，" +
-    "只有这段交接 + 用户接下来的消息。请无缝接着聊：别重新自我介绍、别把已经聊过的重新问一遍。\n";
+    "只有这段交接 + 用户接下来的消息。请无缝接着聊：别重新自我介绍、别把已经聊过的重新问一遍。\n" +
+    // 契约 §A.1（canonical_handoff_crosssession_contract）：live envelope 永远压过交接叙述。
+    "实时收到的用户消息永远压过本交接单的叙述；消息归属只认实时信封，绝不因交接内容把实时消息当成已答或不属于自己。\n";
   const footer = "\n--- 交接结束，请接着回应用户接下来的消息 ---";
 
   // Fixed context sections (reason / recovery / unanswered / interrupted) come
