@@ -5,6 +5,7 @@ import path from "node:path";
 import type { CodexPromptInput, CodexSessionCallbacks, CodexSessionService } from "./codex-session.js";
 import type { MailboxBridgeConfig, TeleCodexConfig } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
+import { DEFAULT_MAX_ENTRY_CHARS } from "./handoff-buffer.js";
 import { loadChatState, saveChatState } from "./handoff-store.js";
 import { stripVisiblePromptGuardEcho, withDispatcherDisciplineGuard, withRotationHandoff } from "./prompt-guard.js";
 import type { SessionRegistry } from "./session-registry.js";
@@ -527,9 +528,35 @@ async function promptMailboxMessage(
   return { text: stripVisiblePromptGuardEcho(completedAgentText || accumulatedText), usage: lastUsage };
 }
 
-/** Compact one-line descriptor of a mailbox turn for the rotation buffer/HANDOFF. */
+/**
+ * Compact one-line descriptor of a mailbox turn for the rotation buffer/HANDOFF.
+ *
+ * Carries a bounded body excerpt (契约 §A.4 保真度): a subject-only descriptor
+ * loses "那封信要干嘛" across a rotation — worst at the interrupted breakpoint,
+ * where the letter being answered would survive as nothing but a title. The
+ * excerpt is collapsed to a single line and cut at the same per-entry cap the
+ * HANDOFF renderer uses for Telegram turns, so both paths keep equal fidelity
+ * and the renderer's per-entry/total budgets stay the backstop.
+ */
 function mailboxTurnDescriptor(message: MailboxMessage): string {
-  return `[内部信] ${message.from} → ${message.subject}`;
+  const subjectLine = `[内部信] ${message.from} → ${message.subject}`;
+  // The mailbox writer duplicates the subject as a leading `# <subject>` heading
+  // inside the body; the descriptor already carries the subject, so drop the
+  // duplicate (a genuine content heading that differs stays).
+  let rawBody = message.body.trim();
+  const firstLineEnd = rawBody.indexOf("\n");
+  const firstLine = firstLineEnd === -1 ? rawBody : rawBody.slice(0, firstLineEnd);
+  const heading = /^#{1,6}\s+(.*)$/.exec(firstLine.trim());
+  if (heading && heading[1]!.trim() === message.subject) {
+    rawBody = firstLineEnd === -1 ? "" : rawBody.slice(firstLineEnd + 1);
+  }
+  const body = rawBody.replace(/\s+/g, " ").trim();
+  if (!body) {
+    return subjectLine;
+  }
+  const excerpt =
+    body.length > DEFAULT_MAX_ENTRY_CHARS ? body.slice(0, DEFAULT_MAX_ENTRY_CHARS) + "…" : body;
+  return `${subjectLine} | 正文摘录: ${excerpt}`;
 }
 
 function mailboxRotationConfig(config: TeleCodexConfig): RotationConfig {

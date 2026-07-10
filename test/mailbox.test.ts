@@ -1179,6 +1179,66 @@ describe("mailbox bridge", () => {
     expect(errSpy.mock.calls.some((c) => String(c[0]).includes("Auto-rotated"))).toBe(true);
   });
 
+  it("carries a bounded single-line body excerpt in mailbox rotation descriptors (ALB-1205 §A.4)", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    // Bodies deliberately differ from subjects: subject-only descriptors would
+    // still pass the older rotation tests (where subject === body) while losing
+    // "那封信要干嘛" across the rotation — the exact §A.4 fidelity gap.
+    const longTail = "x".repeat(900);
+    writeMailboxMessage({
+      personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-fid-a",
+      subject: "重活A", body: "重活A的正文：请先核对部署脚本超时兜底",
+    });
+    writeMailboxMessage({
+      personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-fid-b",
+      subject: "接着B", body: "接着B的正文",
+    });
+    writeMailboxMessage({
+      personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-fid-c",
+      subject: "排队C", body: `排队C正文第一行\n排队C正文第二行 ${longTail}`,
+    });
+
+    let turn = 0;
+    const session = createSession(async (_input, callbacks) => {
+      turn += 1;
+      callbacks.onAgentMessage?.(`ok-${turn}`);
+      // Turn 1 crosses the rotate threshold (130000/258400 ≈ 0.50 ≥ 0.45).
+      callbacks.onTurnComplete?.({ inputTokens: turn === 1 ? 130000 : 40000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await runMailboxDeliveryOnce(
+      createConfig({
+        personasRoot,
+        workspace,
+        maxMessagesPerTick: 3,
+        autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 } as never,
+      }),
+      registry as never,
+    );
+
+    const rotatedInput = JSON.stringify(session.prompt.mock.calls[1]![0]);
+    expect(rotatedInput).toContain(HANDOFF_MARKER);
+    // recordTurn path: message A's descriptor in the recent-conversation section
+    // carries the body excerpt, not just the subject line.
+    expect(rotatedInput).toContain("[内部信] cody → 重活A | 正文摘录: 重活A的正文：请先核对部署脚本超时兜底");
+    // unanswered-snapshot path: still-queued message C carries its body excerpt too.
+    expect(rotatedInput).toContain("[内部信] cody → 排队C | 正文摘录: 排队C正文第一行 排队C正文第二行");
+    // The mailbox writer duplicates the subject as a leading `# <subject>` body
+    // heading (real inbox files do this); the excerpt must not waste its budget
+    // repeating the subject the descriptor already carries.
+    expect(rotatedInput).not.toContain("正文摘录: # 排队C");
+    // A multi-line body is collapsed to a single line so it cannot break the
+    // HANDOFF's line-oriented sections ("\\n" here is the JSON-escaped newline).
+    expect(rotatedInput).not.toContain("排队C正文第一行\\n");
+    // The excerpt is bounded by the shared per-entry cap: the 900-char tail is cut.
+    expect(rotatedInput).not.toContain(longTail);
+    expect(rotatedInput).toContain("…");
+  });
+
   it("carries a 最后断点 into the next mailbox rotation when a heavy turn times out (ALB-1205)", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
@@ -1209,7 +1269,8 @@ describe("mailbox bridge", () => {
     await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
 
     // Tick 2: message B rotates onto a fresh thread, then times out mid-answer.
-    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-2", subject: "会超时的二", body: "会超时的二" });
+    // Body differs from subject so the breakpoint fidelity (§A.4) is observable.
+    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-2", subject: "会超时的二", body: "会超时的二的正文：先把 rotation 设计稿补完" });
     await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
     expect(session.abort).toHaveBeenCalled();
 
@@ -1221,6 +1282,9 @@ describe("mailbox bridge", () => {
     expect(lastPrompt).toContain(HANDOFF_MARKER);
     expect(lastPrompt).toContain("最后断点");
     expect(lastPrompt).toContain("会超时的二");
+    // §A.4: the interrupted breakpoint keeps the letter's body excerpt — a
+    // subject-only breakpoint loses what the interrupted letter was asking for.
+    expect(lastPrompt).toContain("正文摘录: 会超时的二的正文：先把 rotation 设计稿补完");
   });
 
   it("refuses a mandatory (hard-cap) mailbox rotation on the over-cap thread when newThread fails, deferring the message (ALB-1205)", async () => {
