@@ -23,7 +23,7 @@ export interface HandoffEntry {
 export const HANDOFF_MARKER = "[THREAD ROTATION / 自动翻页续接]";
 
 export const DEFAULT_MAX_HANDOFF_ENTRIES = 20;
-export const DEFAULT_MAX_ENTRY_CHARS = 800;
+export const DEFAULT_MAX_ENTRY_CHARS = 1200; // 契约 §A.4 定数（ALB-1220, Cody 拍板 1200）
 export const DEFAULT_MAX_HANDOFF_CHARS = 6000;
 
 const ELLIPSIS = "…";

@@ -1185,7 +1185,7 @@ describe("mailbox bridge", () => {
     // Bodies deliberately differ from subjects: subject-only descriptors would
     // still pass the older rotation tests (where subject === body) while losing
     // "那封信要干嘛" across the rotation — the exact §A.4 fidelity gap.
-    const longTail = "x".repeat(900);
+    const longTail = "x".repeat(1300);
     writeMailboxMessage({
       personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-fid-a",
       subject: "重活A", body: "重活A的正文：请先核对部署脚本超时兜底",
@@ -1234,7 +1234,7 @@ describe("mailbox bridge", () => {
     // A multi-line body is collapsed to a single line so it cannot break the
     // HANDOFF's line-oriented sections ("\\n" here is the JSON-escaped newline).
     expect(rotatedInput).not.toContain("排队C正文第一行\\n");
-    // The excerpt is bounded by the shared per-entry cap: the 900-char tail is cut.
+    // The excerpt is bounded by the shared per-entry cap (1200, §A.4/ALB-1220): the 1300-char tail is cut.
     expect(rotatedInput).not.toContain(longTail);
     expect(rotatedInput).toContain("…");
   });

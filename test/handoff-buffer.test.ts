@@ -257,5 +257,9 @@ describe("handoff-buffer", () => {
       expect(DEFAULT_MAX_ENTRY_CHARS).toBeGreaterThan(0);
       expect(DEFAULT_MAX_HANDOFF_CHARS).toBeGreaterThan(DEFAULT_MAX_ENTRY_CHARS);
     });
+
+    it("pins the per-entry excerpt cap at 1200 (契约 §A.4, ALB-1220)", () => {
+      expect(DEFAULT_MAX_ENTRY_CHARS).toBe(1200);
+    });
   });
 });
