@@ -1596,6 +1596,107 @@ describe("createBot response delivery", () => {
     }
   });
 
+  it("keeps refreshing typing until the final Telegram reply is delivered (ALB-1361)", async () => {
+    vi.useFakeTimers();
+    try {
+      let releaseFinalDelivery!: () => void;
+      const finalDelivery = new Promise<void>((resolve) => {
+        releaseFinalDelivery = resolve;
+      });
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("收到，我查一下。");
+        await Promise.resolve();
+        await Promise.resolve();
+        callbacks.onAgentMessage?.("查完了。");
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+      const botInstance = mockGrammy.bots[0];
+      botInstance.api.editMessageText.mockImplementation(async () => {
+        await finalDelivery;
+        return true;
+      });
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      const turnPromise = textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 1362, text: "跑完以后再回我" },
+        api: bot.api,
+      });
+      await vi.advanceTimersByTimeAsync(9_000);
+
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBeGreaterThanOrEqual(3);
+
+      releaseFinalDelivery();
+      await turnPromise;
+
+      const typingCallsAfterDelivery = bot.api.sendChatAction.mock.calls.filter(
+        (call: unknown[]) => call[1] === "typing",
+      ).length;
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBe(typingCallsAfterDelivery);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps refreshing typing until a failed turn reply is delivered (ALB-1361 review)", async () => {
+    vi.useFakeTimers();
+    try {
+      let releaseFailureDelivery!: () => void;
+      const failureDelivery = new Promise<void>((resolve) => {
+        releaseFailureDelivery = resolve;
+      });
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("处理中。");
+        await Promise.resolve();
+        await Promise.resolve();
+        throw new Error("provider failed");
+      });
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+      const botInstance = mockGrammy.bots[0];
+      botInstance.api.editMessageText.mockImplementation(async () => {
+        await failureDelivery;
+        return true;
+      });
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      const turnPromise = textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 1363, text: "失败也要准确显示工作状态" },
+        api: bot.api,
+      });
+      await vi.advanceTimersByTimeAsync(9_000);
+
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBeGreaterThanOrEqual(3);
+
+      releaseFailureDelivery();
+      await turnPromise;
+
+      const typingCallsAfterDelivery = bot.api.sendChatAction.mock.calls.filter(
+        (call: unknown[]) => call[1] === "typing",
+      ).length;
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBe(typingCallsAfterDelivery);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps streaming agent deltas when response streaming is enabled", async () => {
     let sendsBeforeAgentEnd = -1;
     let botInstance: any;

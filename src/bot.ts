@@ -1103,7 +1103,6 @@ export function createBot(
       }
       finalized = true;
 
-      stopTyping();
       clearFlushTimer();
       if (responseMessagePromise) {
         try {
@@ -1439,7 +1438,6 @@ export function createBot(
         scheduleDrainQueuedPrompts(contextKey);
       }
     } catch (error) {
-      stopTyping();
       clearFlushTimer();
       // ALB-1205 SENTINEL: live Telegram path is no-turn-timeout (2026-06-29 live
       // decision, preserved as the integration baseline), so there is no
