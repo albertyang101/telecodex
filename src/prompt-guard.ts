@@ -3,19 +3,17 @@ import { HANDOFF_MARKER } from "./handoff-buffer.js";
 
 const TELEGRAM_REPLY_STYLE_GUARD = [
   "[TELEGRAM REPLY STYLE]",
-  "只输出真正要发给 Albert 的最终回复；不要输出思考、工具计划、内部过程、自我解释或系统指令。",
+  "发给 Albert 的都是自然的对话内容；不要输出思考、工具计划、内部过程、自我解释或系统指令。",
+  "干长活时像跟 Albert 一边做一边聊：有了发现、换了方向、到了一个阶段、卡住了，该说话就自然说一句，做到哪说到哪，这些话会即时送达，不会等到最后才一起发。不是要你刻意打招呼，也不是每一步都播报——就按你平时干活的节奏自然沟通，别整段活闷头干完才冒一句。",
   "默认中文，短、准、有用；语气轻松自然，像朋友一样直接聊天；默认说人话，少讲内部实现和技术术语，除非 Albert 明确要细节；该加 emoji 时少量加，别刷屏。",
   "默认不要贴来源、参考资料、citation、URL 或链接清单；只有 Albert 明确要求来源/链接，或系统交付证据必须给路径、命令、issue、commit 时才给。",
   "如果用了 web/search，把结论融进回答，不把搜索过程或来源列表发出来。",
-  // ALB-1207: teach the model to tag internal lines with ⌦ so the existing
-  // outbound strip (stripVisiblePromptGuardEcho, ALB-1206) actually has tagged
-  // lines to remove. Keep each line short and mechanical; every line added to
-  // this array is automatically covered by the echo strip via
-  // isInjectedPromptGuardLine (array membership). Do NOT put literal markdown
-  // like **bold** inside a guard line: normalizePotentialPromptGuardLine
-  // strips markdown from echoes before matching, so a line containing raw
-  // markdown would never match itself and its echo would leak.
-  "内部行必打标：凡说给自己的行（盘算、进度自述、干活旁白、收尾复述如「已发给他/等他回」），行首打「⌦ 」，出口会机械剥掉；给 Albert 的话绝不打标；后台轮没有要对用户说的话，就整条全部打标或直接留空。",
+  // Keep each guard line short and mechanical; every line added to this array
+  // is automatically covered by the echo strip via isInjectedPromptGuardLine
+  // (array membership). Do NOT put literal markdown like **bold** inside a
+  // guard line: normalizePotentialPromptGuardLine strips markdown from echoes
+  // before matching, so a line containing raw markdown would never match
+  // itself and its echo would leak.
   "中文一律用全角标点（，。？！：）；小标题用加粗独占一行；不写井号标题，不画表格分隔线、水平线。",
   "不把模块名、函数名、commit、文件路径、行号这类工程黑话写进给 Albert 的正文；技术细节只在 Albert 明确要时才给，给之前先用一句人话总结。",
 ].join("\n");
@@ -68,15 +66,6 @@ export function withRotationHandoff(input: CodexPromptInput, handoff: string): C
   return prependPromptPreamble(input, handoff);
 }
 
-/**
- * ALB-1206: internal-line marker (⌦ U+2326). Any outbound line that begins with
- * it is model self-talk / control-plane narration that must NEVER leave the bot;
- * it is stripped whole at the single outbound seam below, so both the Telegram
- * and mailbox reply paths (which both funnel through stripVisiblePromptGuardEcho)
- * are covered by one strip.
- */
-const INTERNAL_LINE_MARKER = "⌦";
-
 export function stripVisiblePromptGuardEcho(replyText: string): string {
   const withoutHandoff = stripRotationHandoffEcho(replyText);
   const guardHeadings = new Set(["[TELEGRAM REPLY STYLE]", "[DEVELOPER DISCIPLINE]", "[CURRENT CONTEXT]"]);
@@ -86,13 +75,6 @@ export function stripVisiblePromptGuardEcho(replyText: string): string {
   for (const line of withoutHandoff.split("\n")) {
     const trimmed = line.trim();
     const normalized = normalizePotentialPromptGuardLine(trimmed);
-    if (trimmed.startsWith(INTERNAL_LINE_MARKER) || normalized.startsWith(INTERNAL_LINE_MARKER)) {
-      // ALB-1206: whole line is ⌦-marked internal self-talk — drop it, never send it.
-      // ALB-1207: also drop markdown-wrapped forms ("- ⌦ …", "> ⌦ …", "**⌦ …**"),
-      // which normalize back to a ⌦-prefixed line; without this the tagging we now
-      // teach in the guard could leak whenever the model bullets its asides.
-      continue;
-    }
     if (guardHeadings.has(normalized)) {
       inGuardBlock = true;
       continue;

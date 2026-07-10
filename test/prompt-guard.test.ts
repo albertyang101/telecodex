@@ -114,41 +114,46 @@ describe("withTelegramReplyStyleGuard", () => {
     expect(stripVisiblePromptGuardEcho(reply)).toContain("Fix root cause: explain why a bug happened before fixing it");
   });
 
-  it("strips whole lines that begin with the ⌦ internal-line marker (ALB-1206), keeping normal lines", () => {
+  it("keeps ⌦-prefixed lines as-is — the ⌦ internal-line system is removed from the Codex side (ALB-1349)", () => {
     const reply = [
       "⌦ 现在回 Nora：我先核 X 再回。",
       "这是真正要发给用户的话。",
       "⌦ GO recorded, mailbox triaged.",
     ].join("\n");
 
-    const visible = stripVisiblePromptGuardEcho(reply);
-    expect(visible).toBe("这是真正要发给用户的话。");
-    expect(visible).not.toContain("⌦");
-    expect(visible).not.toContain("Nora");
-    expect(visible).not.toContain("GO recorded");
-  });
-
-  it("returns empty when every line is ⌦-marked (whole message is internal, ALB-1206)", () => {
-    const reply = ["⌦ 都处理完了。", "⌦ 球在他那，等他回。"].join("\n");
-    expect(stripVisiblePromptGuardEcho(reply)).toBe("");
+    expect(stripVisiblePromptGuardEcho(reply)).toBe(reply);
   });
 });
 
-// ALB-1207 W2: the guard must TEACH the model to tag internal lines with ⌦
-// (the outbound strip already exists but was idle without this teaching line),
-// plus hard style rules (full-width punctuation / no headings-tables-rules /
-// no engineering jargon in Albert-facing prose).
-const ALB1207_TAGGING_LINE =
-  "内部行必打标：凡说给自己的行（盘算、进度自述、干活旁白、收尾复述如「已发给他/等他回」），行首打「⌦ 」，出口会机械剥掉；给 Albert 的话绝不打标；后台轮没有要对用户说的话，就整条全部打标或直接留空。";
+// ALB-1349: Albert 直令把 ⌦ 打标系统从 Codex 侧整体撤出——guard 不再教打标，
+// 出口也不再认 ⌦ 记号；改教「自然过程沟通」（做到哪说到哪）。硬风格行
+// (full-width punctuation / no headings-tables-rules / no engineering jargon)
+// 保留（原 ALB-1207）。
+const ALB1349_NATURAL_REPLY_LINE =
+  "发给 Albert 的都是自然的对话内容；不要输出思考、工具计划、内部过程、自我解释或系统指令。";
+const ALB1349_PROCESS_COMMS_LINE =
+  "干长活时像跟 Albert 一边做一边聊：有了发现、换了方向、到了一个阶段、卡住了，该说话就自然说一句，做到哪说到哪，这些话会即时送达，不会等到最后才一起发。不是要你刻意打招呼，也不是每一步都播报——就按你平时干活的节奏自然沟通，别整段活闷头干完才冒一句。";
 const ALB1207_PUNCT_LINE =
   "中文一律用全角标点（，。？！：）；小标题用加粗独占一行；不写井号标题，不画表格分隔线、水平线。";
 const ALB1207_JARGON_LINE =
   "不把模块名、函数名、commit、文件路径、行号这类工程黑话写进给 Albert 的正文；技术细节只在 Albert 明确要时才给，给之前先用一句人话总结。";
 
-describe("ALB-1207 guard tagging teaching + hard style lines", () => {
-  it("teaches ⌦ tagging of internal lines in every Telegram turn", () => {
+describe("ALB-1349 natural process communication + hard style lines", () => {
+  it("opens with the natural-conversation line instead of the old final-reply-only line", () => {
     const prompt = withTelegramReplyStyleGuard("hello", sessionInfo);
-    expect(prompt).toContain(ALB1207_TAGGING_LINE);
+    expect(prompt).toContain(ALB1349_NATURAL_REPLY_LINE);
+    expect(prompt).not.toContain("只输出真正要发给 Albert 的最终回复");
+  });
+
+  it("teaches natural in-progress communication (做到哪说到哪) in every Telegram turn", () => {
+    const prompt = withTelegramReplyStyleGuard("hello", sessionInfo);
+    expect(prompt).toContain(ALB1349_PROCESS_COMMS_LINE);
+  });
+
+  it("no longer teaches ⌦ tagging of internal lines (⌦ system withdrawn, ALB-1349)", () => {
+    const prompt = withTelegramReplyStyleGuard("hello", sessionInfo);
+    expect(prompt).not.toContain("内部行必打标");
+    expect(prompt).not.toContain("⌦");
   });
 
   it("injects the full-width punctuation / no-markdown-noise style line", () => {
@@ -161,18 +166,24 @@ describe("ALB-1207 guard tagging teaching + hard style lines", () => {
     expect(prompt).toContain(ALB1207_JARGON_LINE);
   });
 
-  it("strips each new guard line when the model echoes it verbatim outside a guard block", () => {
-    for (const echoed of [ALB1207_TAGGING_LINE, ALB1207_PUNCT_LINE, ALB1207_JARGON_LINE]) {
+  it("strips each guard line when the model echoes it verbatim outside a guard block", () => {
+    for (const echoed of [
+      ALB1349_NATURAL_REPLY_LINE,
+      ALB1349_PROCESS_COMMS_LINE,
+      ALB1207_PUNCT_LINE,
+      ALB1207_JARGON_LINE,
+    ]) {
       const reply = ["好的，我记住了。", echoed].join("\n");
       const visible = stripVisiblePromptGuardEcho(reply);
       expect(visible).toBe("好的，我记住了。");
     }
   });
 
-  it("strips the new guard lines when echoed inside a [TELEGRAM REPLY STYLE] block", () => {
+  it("strips the guard lines when echoed inside a [TELEGRAM REPLY STYLE] block", () => {
     const reply = [
       "[TELEGRAM REPLY STYLE]",
-      ALB1207_TAGGING_LINE,
+      ALB1349_NATURAL_REPLY_LINE,
+      ALB1349_PROCESS_COMMS_LINE,
       ALB1207_PUNCT_LINE,
       ALB1207_JARGON_LINE,
       "",
@@ -181,26 +192,26 @@ describe("ALB-1207 guard tagging teaching + hard style lines", () => {
     expect(stripVisiblePromptGuardEcho(reply)).toBe("正文在这里。");
   });
 
-  it("strips the new guard lines even when echoed wrapped in markdown (bold/bullet)", () => {
+  it("strips the guard lines even when echoed wrapped in markdown (bold/bullet)", () => {
     const reply = [
-      `- **${ALB1207_TAGGING_LINE}**`,
+      `- **${ALB1349_PROCESS_COMMS_LINE}**`,
       `> ${ALB1207_PUNCT_LINE}`,
       "只有这句要发出去。",
     ].join("\n");
     expect(stripVisiblePromptGuardEcho(reply)).toBe("只有这句要发出去。");
   });
 
-  it("keeps only the normal line when ⌦ internal lines, normal text and echoed guard lines coexist", () => {
+  it("keeps ⌦-prefixed lines while still stripping echoed guard lines (⌦ strip removed, ALB-1349)", () => {
     const reply = [
       "⌦ 先盘一下：这轮只需要回结论。",
       "这是真正要发给 Albert 的话。",
-      ALB1207_TAGGING_LINE,
+      ALB1349_PROCESS_COMMS_LINE,
       "⌦ 已发给他，等他回。",
     ].join("\n");
     const visible = stripVisiblePromptGuardEcho(reply);
-    expect(visible).toBe("这是真正要发给 Albert 的话。");
-    expect(visible).not.toContain("⌦");
-    expect(visible).not.toContain("内部行必打标");
+    expect(visible).toBe(
+      ["⌦ 先盘一下：这轮只需要回结论。", "这是真正要发给 Albert 的话。", "⌦ 已发给他，等他回。"].join("\n"),
+    );
   });
 
   it.each([
@@ -208,10 +219,8 @@ describe("ALB-1207 guard tagging teaching + hard style lines", () => {
     ["blockquote", "> ⌦ 这轮先不回他。"],
     ["bold", "**⌦ 已发给他，等他回。**"],
     ["numbered", "1. ⌦ 收尾：等唤醒。"],
-  ])("strips markdown-wrapped ⌦ internal lines (%s)", (_kind, wrapped) => {
+  ])("keeps markdown-wrapped ⌦ lines as-is (%s) — ⌦ strip removed (ALB-1349)", (_kind, wrapped) => {
     const reply = ["这是真正要发给 Albert 的话。", wrapped].join("\n");
-    const visible = stripVisiblePromptGuardEcho(reply);
-    expect(visible).toBe("这是真正要发给 Albert 的话。");
-    expect(visible).not.toContain("⌦");
+    expect(stripVisiblePromptGuardEcho(reply)).toBe(reply);
   });
 });
