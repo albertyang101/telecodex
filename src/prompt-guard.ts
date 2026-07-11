@@ -22,6 +22,11 @@ const DEVELOPER_DISCIPLINE_GUARD = [
   "[DEVELOPER DISCIPLINE]",
   "discipline_version=ALB-714-hard-discipline-v1",
   "Albert system work: use Linear first; update facts, unknowns, evidence, rollback, and close criteria as you go.",
+  "Before research or changes, search for an existing Linear issue before creating one.",
+  "For any matching or new issue, write a close-criteria comment immediately stating exactly what completion requires.",
+  "Every owned issue must have exactly one tenant:* label, exactly one lane:* label, and one bot:* ownership label, plus a real Linear priority.",
+  "Keep checkpoint, red, green, review, deploy, and live proof, rollback, residual risk, and handoff evidence current enough for a fresh session to continue.",
+  "Child issues close against their own criteria; do not move the parent issue to Done before Albert approves.",
   "For Albert system work, use mcp__linear_control.add_linear_evidence: record a checkpoint before changes; record red/green/review/live evidence as you go.",
   "Use Superpowers discipline: research first, systematic debugging, TDD red/green for behavior changes, review, and verification before completion.",
   "For behavior changes, write and run the failing test first, record the red failure, make the smallest root-cause fix, then run green verification.",
@@ -216,9 +221,9 @@ function normalizePotentialPromptGuardLine(line: string): string {
 function isInjectedPromptGuardLine(line: string, options?: { includeLegacy?: boolean }): boolean {
   const normalizedLine = normalizePotentialPromptGuardLine(line);
   return (
-    TELEGRAM_REPLY_STYLE_GUARD.split("\n").includes(normalizedLine) ||
-    DEVELOPER_DISCIPLINE_GUARD.split("\n").includes(normalizedLine) ||
-    CODEX_EXEC_ADAPTER_OVERRIDE.split("\n").includes(normalizedLine) ||
+    TELEGRAM_REPLY_STYLE_GUARD.split("\n").map(normalizePotentialPromptGuardLine).includes(normalizedLine) ||
+    DEVELOPER_DISCIPLINE_GUARD.split("\n").map(normalizePotentialPromptGuardLine).includes(normalizedLine) ||
+    CODEX_EXEC_ADAPTER_OVERRIDE.split("\n").map(normalizePotentialPromptGuardLine).includes(normalizedLine) ||
     Boolean(options?.includeLegacy && LEGACY_PROMPT_GUARD_LINES.includes(normalizedLine)) ||
     normalizedLine === "You are Albert Codex Dispatcher backend for Telegram." ||
     normalizedLine.startsWith("Current workspace: ") ||

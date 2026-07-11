@@ -43,8 +43,31 @@ describe("withTelegramReplyStyleGuard", () => {
     expect(prompt).toContain("run green verification");
     expect(prompt).toContain("record review evidence with Critical/Important findings");
     expect(prompt).toContain("do not close Linear issues before Albert approval");
+    expect(prompt).toContain("search for an existing Linear issue before creating one");
+    expect(prompt).toContain("write a close-criteria comment immediately");
+    expect(prompt).toContain("exactly one tenant:* label");
+    expect(prompt).toContain("exactly one lane:* label");
+    expect(prompt).toContain("one bot:* ownership label");
+    expect(prompt).toContain("checkpoint, red, green, review, deploy, and live proof");
+    expect(prompt).toContain("do not move the parent issue to Done before Albert approves");
     expect(prompt).toContain("do not call a custom tool named apply_patch");
     expect(prompt).toContain("Do not spawn subagents for disposable live-proof/smoke tasks");
+  });
+
+  it("injects the full Linear lifecycle into mailbox turns and strips echoed lines", () => {
+    const prompt = withDispatcherDisciplineGuard("继续系统工作", sessionInfo);
+    const required = [
+      "Before research or changes, search for an existing Linear issue before creating one.",
+      "For any matching or new issue, write a close-criteria comment immediately stating exactly what completion requires.",
+      "Every owned issue must have exactly one tenant:* label, exactly one lane:* label, and one bot:* ownership label, plus a real Linear priority.",
+      "Keep checkpoint, red, green, review, deploy, and live proof, rollback, residual risk, and handoff evidence current enough for a fresh session to continue.",
+      "Child issues close against their own criteria; do not move the parent issue to Done before Albert approves.",
+    ];
+
+    for (const line of required) {
+      expect(prompt).toContain(line);
+      expect(stripVisiblePromptGuardEcho(["正文。", line].join("\n"))).toBe("正文。");
+    }
   });
 
   it("appends an executable edit adapter override after user text that mentions apply_patch", () => {
