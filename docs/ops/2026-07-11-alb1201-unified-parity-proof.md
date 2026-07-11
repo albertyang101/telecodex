@@ -1,41 +1,65 @@
 # ALB-1201 Unified Codex Parity Integration Proof
 
-Date: 2026-07-11 AEST
+Date: 2026-07-12 AEST
 Branch: alb-1201-unified-parity
-Base: 1d7393758b9a32065d7c105cbeeb9e530f559c73
-Head before this proof commit: 3b6d832
+Reviewed code head: 860b5c6
+Control plane: Linear ALB-1201 with child evidence in ALB-747, ALB-1379, and ALB-1388
 
-## Integrated source contracts
+## Integrated contracts
 
-The candidate preserves the ecosystem base and adds the three reviewed basic-experience commits in order:
+The candidate keeps TeleCodex as the thin Telegram bridge and aligns final capability with CC except for the explicitly different dispatcher implementation.
 
-- 3242864: completed Codex messages are delivered as separate Telegram bubbles; long-message chunks remain ordered; transport failure does not stop later messages; typing remains active through delivery.
-- 31723a5: Telegram ingress audit records only a coarse media class and does not expose body, caption, file id, filename, or MIME data.
-- 3b6d832: Telegram native Reply preserves replied text/caption separately from the current visible message; retry preserves original-message pending-answer tracking.
+- Telegram output uses Codex event lifecycle metadata: useful intermediate milestones and direct questions are separate bubbles; process narration is suppressed; final messages are always preserved.
+- A provider failure preserves any unsent completed result, a newer partial, and the failure notice in order without duplicate bubbles.
+- Tool status shares the same delivery sequence as agent bubbles, so it cannot overtake preceding progress.
+- Typing remains active for the entire foreground/tool/background turn and stops only after final Telegram delivery.
+- Photo plus caption, native Reply context, long-message chunking, and transport retry remain integrated.
+- Per-turn Linear discipline, Linear-aware rotation HANDOFF, pending-answer recovery, and one bounded mailbox resume are included.
+- Graphify is enforced before code inspection/editing through the audited wrapper with unified_exec disabled; Personal Memory/Graphiti remains disconnected.
+- Mailbox processing claims before side effects, quarantines poison messages, continues later mail after persistence failures, and validates terminal receipts by status, identity, bridge, and mailbox-contained path.
 
-The base already contains source-first runtime guards, full Linear lifecycle discipline, Linear-aware HANDOFF, one automatic mailbox resume after a heavy timeout, shared graphify enforcement, and newborn role-bundle defaults.
+## RED and root-cause evidence
 
-## Integration RED and root cause
+The integration was driven by failing tests at the earliest reliable boundaries.
 
-The first focused integration run produced two expected failures in the existing ALB-1361 typing tests. Both tests were still blocking the legacy edit-in-place Telegram seam, while the reviewed bubble implementation now delivers completed messages through sendMessage.
-
-The minimal integration fix changed only the tests' transport observation point from editMessageText to sendMessage. No production behavior was added for this compatibility fix.
+- Legacy edit-in-place typing tests failed after the reviewed bubble transport moved completed messages to separate sends; the tests were corrected to observe the actual transport.
+- Text-regex bubble filtering both leaked narration and discarded useful results. The fix moved classification to Codex event lifecycle metadata.
+- Failure recovery lost an unsent completed result when a newer partial existed. The fix composes all undelivered failure parts once and in order.
+- Generic question marks and confirmation keywords leaked process narration. The fix separates structured updates, direct questions, and process-prefixed declarative narration.
+- Tool status could overtake a blocked progress send. The fix serializes both through one delivery promise.
+- A forged mailbox receipt could be trusted as terminal, while an authentic processed receipt could be rejected because it points to archive rather than inbox. The fix validates an allowlisted terminal status and derives the correct status-specific path.
+- unified_exec bypassed the official PreToolUse hook surface. The SDK now disables unified_exec while the audited wrapper keeps hook trust explicit.
 
 ## Fresh GREEN evidence
 
-- Focused bubble/typing/rotation/mailbox/prompt suite: 5 files, 196 tests passed.
-- Focused image and bot suite after media replay: 2 files, 74 tests passed.
-- Focused Reply/image suite after Reply replay: 2 files, 77 tests passed.
-- Final Python compile for graphify/core installers and hooks: exit 0.
-- Final full npm test: 38 files, 703 tests passed, 0 failed.
-- Final npm run build: exit 0.
-- git diff --check: exit 0.
-- Base ancestry check: exit 0; the three reviewed commits are consecutive descendants of 1d73937.
+- Full test suite at reviewed code head 860b5c6: 38 files, 720 tests passed, 0 failed.
+- Focused output review suite: 147 passed.
+- Focused mailbox review suite: 86 passed.
+- TypeScript build: passed.
+- Graphify policy Python compile: passed.
+- git diff --check: passed.
+- Integration worktree tracked status: clean after every commit.
 
-## Safety, rollback, and remaining gates
+## Independent review
 
-- Work occurred only in the isolated alb-1201-unified-parity worktree.
-- No Theo, Ada, CC bot, Codex Testbot poller, launch profile, production runtime, token, supervisor, or Memory/Graphiti system was changed.
-- Source rollback is the verified base 1d73937.
-- Live rollback remains the prior immutable runtime plus the existing audited per-bot restart helper.
-- Still required: independent review of the combined range, immutable Codex Testbot build, full Telegram live matrix, builder completion, four dedicated Codex Testbot runtimes, and Albert's rollout gate before Theo/Ada production changes.
+- Graphify gate: Critical 0, Important 0.
+- Mailbox claim and receipt recovery: Critical 0, Important 0, Minor 0, Ready.
+- Output lifecycle on 860b5c6: Critical 0, Important 0, Minor 0, Ready.
+- Ada independently found additional output edge cases that the general reviewer missed; all are now explicit RED/GREEN tests. Her exact-head final sign-off remains a deployment gate.
+
+## Deployment, rollback, and remaining gates
+
+No production or Testbot runtime was changed by this integration work.
+
+Cody remains the deployment owner. After Ada signs the reviewed code head, Cody must:
+
+1. Create a fresh immutable runtime from the reviewed commit; never deploy from the mutable integration worktree.
+2. Confirm one poller only and record the previous immutable runtime as rollback.
+3. Run Testbot-first Telegram proofs for bubble lifecycle, output density, provider failure, typing, photo plus caption, Reply, rotation HANDOFF, Linear evidence, Graphify adversarial no-write, and mailbox fault recovery.
+4. Record exact sent/reply identifiers and timestamps without secrets.
+5. Stop on any Critical or Important regression, restore the previous immutable runtime, and update Linear.
+6. Keep canonical, integration, and immutable runtime tracked-clean before any Theo or Ada rollout.
+
+Known residual dependency audit from the controlled npm install: 5 existing findings (1 low, 1 moderate, 2 high, 1 critical). Cody must record these as residual risk; they are not silently accepted or fixed by this change.
+
+Theo/Ada production rollout, four dedicated Codex Testbot runtimes, builder completion, and Albert's final acceptance remain open. Parent ALB-1201 must not be closed before Albert approves the live result.
