@@ -866,6 +866,9 @@ export function createBot(
     let accumulatedText = "";
     let completedAgentText = "";
     let hasCompletedAgentText = false;
+    const completedStreamMessages: string[] = [];
+    let streamDeliveryPromise: Promise<void> = Promise.resolve();
+    let streamDeliveryError: unknown;
     let responseMessageId: number | undefined;
     let responseMessagePromise: Promise<void> | undefined;
     let lastRenderedText = "";
@@ -1097,6 +1100,49 @@ export function createBot(
       }
     };
 
+    const visibleCompletedAgentMessage = (text: string): string =>
+      stripVisibleSourceFooter(userVisibleText, stripVisiblePromptGuardEcho(text.trim()));
+
+    const deliverCompletedStreamMessage = async (visibleText: string): Promise<void> => {
+      for (const chunk of splitMarkdownForTelegram(visibleText)) {
+        const options = {
+          parseMode: chunk.parseMode,
+          fallbackText: chunk.fallbackText,
+          messageThreadId,
+        };
+        try {
+          await sendTextMessage(bot.api, chatId, chunk.text, options);
+        } catch (firstError) {
+          try {
+            await sendTextMessage(bot.api, chatId, chunk.text, options);
+          } catch (retryError) {
+            const warning = renderMarkdownChunkWithinLimit("⚠️ 有一段回复发送失败，后续结果仍会继续发送。");
+            await sendTextMessage(bot.api, chatId, warning.text, {
+              parseMode: warning.parseMode,
+              fallbackText: warning.fallbackText,
+              messageThreadId,
+            }).catch(() => {});
+            throw retryError ?? firstError;
+          }
+        }
+      }
+    };
+
+    const enqueueCompletedStreamMessage = (text: string): void => {
+      const visibleText = visibleCompletedAgentMessage(text);
+      accumulatedText = "";
+      if (!visibleText) {
+        return;
+      }
+
+      completedStreamMessages.push(visibleText);
+      streamDeliveryPromise = streamDeliveryPromise
+        .then(() => deliverCompletedStreamMessage(visibleText))
+        .catch((error) => {
+          streamDeliveryError ??= error;
+          console.error("Failed to deliver completed Telegram agent message:", formatError(error));
+        });
+    };
     const finalizeResponse = async (): Promise<string> => {
       if (finalized) {
         return "";
@@ -1110,6 +1156,24 @@ export function createBot(
         } catch {
           // If the initial send failed, we will fall back to sending the final response below.
         }
+      }
+
+      if (streamAgentResponses && completedStreamMessages.length > 0) {
+        await streamDeliveryPromise;
+        const footerText = buildFinalResponseText("");
+        if (footerText) {
+          completedStreamMessages.push(footerText);
+          try {
+            await deliverCompletedStreamMessage(footerText);
+          } catch (error) {
+            streamDeliveryError ??= error;
+            console.error("Failed to deliver Telegram response footer:", formatError(error));
+          }
+        }
+        if (streamDeliveryError) {
+          console.error("One or more completed Telegram agent messages were not delivered.");
+        }
+        return completedStreamMessages.join("\n\n");
       }
 
       const finalText = buildFinalResponseText(finalResponseSourceText());
@@ -1140,26 +1204,13 @@ export function createBot(
     const callbacks: CodexSessionCallbacks = {
       onTextDelta: (delta: string) => {
         accumulatedText += delta;
-        if (!streamAgentResponses) {
-          return;
-        }
-
-        if (!responseMessageId) {
-          void ensureResponseMessage()
-            .then(() => {
-              scheduleFlush();
-            })
-            .catch((error) => {
-              console.error("Failed to send initial Telegram response message", error);
-            });
-          return;
-        }
-
-        scheduleFlush();
       },
       onAgentMessage: (text: string) => {
         completedAgentText = text;
         hasCompletedAgentText = true;
+        if (streamAgentResponses) {
+          enqueueCompletedStreamMessage(text);
+        }
       },
       onToolStart: (toolName: string, toolCallId: string) => {
         if (toolVerbosity === "summary") {
@@ -1439,6 +1490,9 @@ export function createBot(
       }
     } catch (error) {
       clearFlushTimer();
+      if (streamAgentResponses) {
+        await streamDeliveryPromise;
+      }
       // ALB-1205 SENTINEL: live Telegram path is no-turn-timeout (2026-06-29 live
       // decision, preserved as the integration baseline), so there is no
       // CodexTurnTimeoutError to catch here — the canonical interrupted-turn (最后断点)

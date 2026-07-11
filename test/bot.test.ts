@@ -1160,7 +1160,7 @@ describe("createBot response delivery", () => {
     expect(sent).not.toContain("OpenAI docs");
   });
 
-  it("does not expose partial source headings in streaming previews", async () => {
+  it("does not expose partial source headings in completed streaming messages", async () => {
     let sendsBeforeAgentEnd = -1;
     let botInstance: any;
     const session = createSession(async (callbacks) => {
@@ -1183,13 +1183,13 @@ describe("createBot response delivery", () => {
       api: bot.api,
     });
 
-    expect(sendsBeforeAgentEnd).toBe(1);
+    expect(sendsBeforeAgentEnd).toBe(0);
     const firstVisible = bot.api.sendMessage.mock.calls[0][1] as string;
     expect(firstVisible).toContain("结论是配置问题。");
     expect(firstVisible).not.toContain("来源");
   });
 
-  it("does not expose source footers in streaming previews", async () => {
+  it("does not expose source footers in completed streaming messages", async () => {
     let sendsBeforeAgentEnd = -1;
     let botInstance: any;
     const session = createSession(async (callbacks) => {
@@ -1226,7 +1226,7 @@ describe("createBot response delivery", () => {
       api: bot.api,
     });
 
-    expect(sendsBeforeAgentEnd).toBe(1);
+    expect(sendsBeforeAgentEnd).toBe(0);
     const firstVisible = bot.api.sendMessage.mock.calls[0][1] as string;
     expect(firstVisible).toContain("巴黎下周会比墨尔本热很多");
     expect(firstVisible).not.toContain("来源");
@@ -1614,9 +1614,9 @@ describe("createBot response delivery", () => {
 
       const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
       const botInstance = mockGrammy.bots[0];
-      botInstance.api.editMessageText.mockImplementation(async () => {
+      botInstance.api.sendMessage.mockImplementation(async () => {
         await finalDelivery;
-        return true;
+        return { message_id: 1362 };
       });
       const textHandler = bot.__handlers.on.get("message:text");
 
@@ -1664,9 +1664,9 @@ describe("createBot response delivery", () => {
 
       const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
       const botInstance = mockGrammy.bots[0];
-      botInstance.api.editMessageText.mockImplementation(async () => {
+      botInstance.api.sendMessage.mockImplementation(async () => {
         await failureDelivery;
-        return true;
+        return { message_id: 1363 };
       });
       const textHandler = bot.__handlers.on.get("message:text");
 
@@ -1697,20 +1697,19 @@ describe("createBot response delivery", () => {
     }
   });
 
-  it("keeps streaming agent deltas when response streaming is enabled", async () => {
-    let sendsBeforeAgentEnd = -1;
-    let botInstance: any;
+  it("sends completed streaming agent messages as separate Telegram bubbles", async () => {
     const session = createSession(async (callbacks) => {
-      callbacks.onTextDelta("流式预览。");
+      callbacks.onTextDelta("第一段进度。");
+      await callbacks.onAgentMessage?.("第一段进度。");
       await Promise.resolve();
-      sendsBeforeAgentEnd = botInstance.api.sendMessage.mock.calls.length;
 
+      callbacks.onTextDelta("第二段结果。");
+      await callbacks.onAgentMessage?.("第二段结果。");
       callbacks.onAgentEnd();
     });
     const registry = createRegistry(session);
 
     const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
-    botInstance = mockGrammy.bots[0];
     const textHandler = bot.__handlers.on.get("message:text");
 
     await textHandler({
@@ -1720,11 +1719,115 @@ describe("createBot response delivery", () => {
       api: bot.api,
     });
 
-    expect(sendsBeforeAgentEnd).toBe(1);
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
-    expect(bot.api.sendMessage.mock.calls[0][1]).toContain("流式预览。");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
+    expect(bot.api.editMessageText).not.toHaveBeenCalled();
+    expect(bot.api.sendMessage.mock.calls[0][1]).toContain("第一段进度。");
+    expect(bot.api.sendMessage.mock.calls[0][1]).not.toContain("第二段结果。");
+    expect(bot.api.sendMessage.mock.calls[1][1]).toContain("第二段结果。");
+    expect(bot.api.sendMessage.mock.calls[1][1]).not.toContain("第一段进度。");
   });
 
+  it("continues with later streaming messages after a long-message chunk fails", async () => {
+    const longProgress = "阶段".repeat(2_100);
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(longProgress);
+      callbacks.onAgentMessage?.(longProgress);
+      callbacks.onTextDelta("最终结果。");
+      callbacks.onAgentMessage?.("最终结果。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    bot.api.sendMessage
+      .mockResolvedValueOnce({ message_id: 1 })
+      .mockRejectedValueOnce(new Error("telegram chunk failed"));
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 10, text: "继续处理" },
+      api: bot.api,
+    });
+
+    const sentTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+    expect(sentTexts[2]).toBe(sentTexts[1]);
+    expect(sentTexts.filter((text: string) => text.includes("最终结果。"))).toHaveLength(1);
+  });
+  it("waits for queued streaming delivery before finishing a failed turn", async () => {
+    const releaseDelivery = deferred<void>();
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("已完成的阶段进度。");
+      callbacks.onAgentMessage?.("已完成的阶段进度。");
+      throw new Error("provider failed");
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    bot.api.sendMessage.mockImplementationOnce(async () => {
+      await releaseDelivery.promise;
+      return { message_id: 1 };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    let settled = false;
+    const handling = textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 11, text: "继续处理" },
+      api: bot.api,
+    }).then(() => {
+      settled = true;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    releaseDelivery.resolve();
+    await handling;
+    expect(settled).toBe(true);
+  });
+  it("keeps the typing heartbeat active after a completed progress bubble appears", async () => {
+    vi.useFakeTimers();
+    try {
+      let messagesAfterProgress = -1;
+      let actionsAfterPreview = -1;
+      let actionsAfterWorking = -1;
+      let botInstance: any;
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("阶段进度。");
+        callbacks.onAgentMessage?.("阶段进度。");
+        await Promise.resolve();
+        await Promise.resolve();
+        messagesAfterProgress = botInstance.api.sendMessage.mock.calls.length;
+        actionsAfterPreview = botInstance.api.sendChatAction.mock.calls.length;
+
+        await vi.advanceTimersByTimeAsync(10_000);
+        actionsAfterWorking = botInstance.api.sendChatAction.mock.calls.length;
+
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+
+      const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+      botInstance = mockGrammy.bots[0];
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 9, text: "继续处理" },
+        api: bot.api,
+      });
+
+      expect(messagesAfterProgress).toBeGreaterThan(0);
+      expect(actionsAfterPreview).toBeGreaterThan(0);
+      expect(actionsAfterWorking).toBeGreaterThan(actionsAfterPreview);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it("does not expose echoed developer discipline in streaming previews", async () => {
     const session = createSession(async (callbacks) => {
       callbacks.onTextDelta(

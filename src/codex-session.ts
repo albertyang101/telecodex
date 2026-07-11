@@ -271,7 +271,11 @@ export class CodexSessionService {
                 callbacks.onTextDelta(delta);
               }
               lastAgentText = item.text;
-              callbacks.onAgentMessage?.(item.text);
+              try {
+                callbacks.onAgentMessage?.(item.text);
+              } catch (error) {
+                console.error("Agent message callback failed; continuing Codex event consumption:", error);
+              }
             } else if (item.type === "command_execution") {
               // Pass any output that arrived only in the completion event (e.g. fast
               // commands that never fired item.updated).

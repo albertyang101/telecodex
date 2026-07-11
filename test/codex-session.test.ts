@@ -576,6 +576,26 @@ describe("CodexSessionService", () => {
     ]);
   });
 
+  it("continues consuming Codex events when an agent-message delivery callback throws", async () => {
+    const service = await CodexSessionService.create(createConfig());
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+    callbacks.onAgentMessage.mockImplementationOnce(() => {
+      throw new Error("telegram unavailable");
+    });
+
+    thread.runStreamed.mockResolvedValueOnce({
+      events: streamEvents([
+        { type: "item.completed", item: { id: "msg-1", type: "agent_message", text: "阶段进度" } },
+        { type: "item.completed", item: { id: "msg-2", type: "agent_message", text: "最终结果" } },
+        { type: "turn.completed", usage },
+      ]),
+    });
+
+    await expect(service.prompt("hello", callbacks)).resolves.toBeUndefined();
+    expect(callbacks.onAgentMessage.mock.calls.map(([text]) => text)).toEqual(["阶段进度", "最终结果"]);
+    expect(callbacks.onAgentEnd).toHaveBeenCalledTimes(1);
+  });
   it("maps command_execution events to tool callbacks", async () => {
     const service = await CodexSessionService.create(createConfig());
     const thread = mockState.createdThreads[0];
