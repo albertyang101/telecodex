@@ -894,6 +894,11 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
+      callbacks.onTextDelta("我先检查日志，发现逻辑也要一起看。");
+      callbacks.onAgentMessage?.("我先检查日志，发现逻辑也要一起看。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       callbacks.onTextDelta("我先检查了配置，生产服务依然运行旧版本。");
       callbacks.onAgentMessage?.("我先检查了配置，生产服务依然运行旧版本。", {
         isFinal: false,
@@ -953,6 +958,7 @@ describe("createBot response delivery", () => {
     expect(visibleReplyTexts.join("\n")).not.toContain("我先把文件检查一下。");
     expect(visibleReplyTexts.join("\n")).not.toContain("失败日志。");
     expect(visibleReplyTexts.join("\n")).not.toContain("我先检查字段：失败日志。");
+    expect(visibleReplyTexts.join("\n")).not.toContain("发现逻辑也要一起看。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("生产服务依然运行旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.join("\n")).not.toContain("再继续跑测试。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后发现服务仍在旧版本。"))).toHaveLength(1);
@@ -968,6 +974,7 @@ describe("createBot response delivery", () => {
     expect(transcript).not.toContain("我先把文件检查一下。");
     expect(transcript).not.toContain("失败日志。");
     expect(transcript).not.toContain("我先检查字段：失败日志。");
+    expect(transcript).not.toContain("发现逻辑也要一起看。");
     expect(transcript).toContain("生产服务依然运行旧版本。");
     expect(transcript).not.toContain("再继续跑测试。");
     expect(transcript).toContain("随后发现服务仍在旧版本。");
