@@ -48,14 +48,16 @@ def atomic_write(path: Path, data: bytes) -> None:
             pass
 
 
-def managed_hooks_document(codex_home: Path, include_graphify: bool) -> bytes:
-    core_context = codex_home / "hooks/core-discipline/codex-core-discipline-turn-context.py"
-    user_hooks = [{
-        "type": "command",
-        "command": f'/usr/bin/python3 "{core_context}"',
-        "timeout": 5,
-        "statusMessage": "Loading Codex core work contract",
-    }]
+def managed_hooks_document(codex_home: Path, include_graphify: bool, include_core: bool = True) -> bytes:
+    user_hooks = []
+    if include_core:
+        core_context = codex_home / "hooks/core-discipline/codex-core-discipline-turn-context.py"
+        user_hooks.append({
+            "type": "command",
+            "command": f'/usr/bin/python3 "{core_context}"',
+            "timeout": 5,
+            "statusMessage": "Loading Codex core work contract",
+        })
     hooks = {"UserPromptSubmit": [{"hooks": user_hooks}]}
     if include_graphify:
         policy = codex_home / "hooks/graphify/codex-pre-tool-use-policy.py"
@@ -120,8 +122,13 @@ def main() -> int:
 
         hooks_path = codex_home / "hooks.json"
         rendered_hooks = managed_hooks_document(codex_home, "graphify" in bundles)
-        if hooks_path.exists() and hooks_path.read_bytes() != rendered_hooks:
-            raise ValueError("target CODEX_HOME/hooks.json already contains unmanaged hooks")
+        if hooks_path.exists():
+            existing_hooks = hooks_path.read_bytes()
+            known_hooks = {rendered_hooks}
+            if "graphify" in bundles:
+                known_hooks.add(managed_hooks_document(codex_home, True, include_core=False))
+            if existing_hooks not in known_hooks:
+                raise ValueError("target CODEX_HOME/hooks.json already contains unmanaged hooks")
 
         installed = []
         if "core-discipline" in bundles:

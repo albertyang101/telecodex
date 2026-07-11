@@ -12,6 +12,9 @@ const installerPath = fileURLToPath(
 const manifestPath = fileURLToPath(
   new URL("../scripts/codex-bot-role-bundles.json", import.meta.url),
 );
+const graphifyInstallerPath = fileURLToPath(
+  new URL("../scripts/install-codex-graphify-bundle.py", import.meta.url),
+);
 
 function runInstaller(role: string, codexHome: string, workspace: string) {
   return spawnSync("/usr/bin/python3", [
@@ -84,6 +87,22 @@ describe("Codex Bot builder role bundles", () => {
       }
     },
   );
+
+  it("upgrades the known graphify-only hook document to the combined core contract", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "codex-role-upgrade-graphify-"));
+    const codexHome = join(fixture, "codex-home");
+    const workspace = join(fixture, "workspace");
+    try {
+      const legacy = spawnSync("/usr/bin/python3", [graphifyInstallerPath, "--codex-home", codexHome, "--workspace", workspace, "--role", "developer"], { encoding: "utf8" });
+      expect(legacy.status).toBe(0);
+      expect(readFileSync(join(codexHome, "hooks.json"), "utf8")).not.toContain("core-discipline");
+      const upgraded = runInstaller("developer", codexHome, workspace);
+      expect(upgraded.status).toBe(0);
+      const hooks = readFileSync(join(codexHome, "hooks.json"), "utf8");
+      expect(hooks).toContain("codex-core-discipline-turn-context.py");
+      expect(hooks).toContain("codex-graphify-turn-context.py");
+    } finally { rmSync(fixture, { recursive: true, force: true }); }
+  });
 
   it("fails closed on unmanaged hooks without partially installing core files", () => {
     const fixture = mkdtempSync(join(tmpdir(), "codex-role-unmanaged-hooks-"));
