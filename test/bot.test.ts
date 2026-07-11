@@ -869,6 +869,7 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
+      callbacks.onTextDelta("第二阶段刚开始。");
       throw new Error("provider failed");
     });
     const registry = createRegistry(session);
@@ -891,8 +892,10 @@ describe("createBot response delivery", () => {
     const visibleReplyTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
 
     expect(visibleReplyTexts.filter((text: string) => text.includes("已完成第一阶段，但这条没有进度标签。"))).toHaveLength(1);
+    expect(visibleReplyTexts.join("\n")).toContain("第二阶段刚开始。");
     expect(visibleReplyTexts.join("\n")).toContain("provider failed");
     expect(transcript).toContain("已完成第一阶段，但这条没有进度标签。");
+    expect(transcript).toContain("第二阶段刚开始。");
     expect(transcript).toContain("provider failed");
   });
 
@@ -1861,6 +1864,10 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("我先看看有没有问题？", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先看看这样可以吗？");
       callbacks.onAgentMessage?.("我先看看这样可以吗？", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("我先看看你是否在线。");
+      callbacks.onAgentMessage?.("我先看看你是否在线。", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("我先检查你要不要保留日志。");
+      callbacks.onAgentMessage?.("我先检查你要不要保留日志。", { isFinal: false, followedByTool: true });
       for (const narration of [
         "我先看一下。",
         "我先查一下。",
@@ -1946,6 +1953,8 @@ describe("createBot response delivery", () => {
     expect(visible).not.toContain("我先去看看有没有问题。");
     expect(visible).not.toContain("我先看看有没有问题？");
     expect(visible).not.toContain("我先看看这样可以吗？");
+    expect(visible).not.toContain("我先看看你是否在线。");
+    expect(visible).not.toContain("我先检查你要不要保留日志。");
     for (const narration of [
       "我先看一下。",
       "我先查一下。",
