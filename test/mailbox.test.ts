@@ -697,6 +697,23 @@ describe("mailbox bridge", () => {
     );
     mkdirRecursive(receiptDir);
     const receiptPath = path.join(receiptDir, msgId + ".json");
+    const terminalMessagePath =
+      status === "processed"
+        ? path.join(
+            personasRoot,
+            "_shared",
+            "memory",
+            "mailbox",
+            "albert-v3",
+            "archive",
+            "2026-06",
+            path.basename(messagePath),
+          )
+        : messagePath;
+    if (status === "processed") {
+      mkdirRecursive(path.dirname(terminalMessagePath));
+      writeFileSync(terminalMessagePath, "archived message", "utf8");
+    }
     const terminalReceipt = {
       msg_id: msgId,
       from: "cody",
@@ -706,7 +723,7 @@ describe("mailbox bridge", () => {
       status,
       delivered_by: "telecodex-mailbox-bridge",
       recorded_at: "2026-06-21T00:00:01.000Z",
-      message_path: messagePath,
+      message_path: terminalMessagePath,
       failure_reason: failureReason,
     };
     writeFileSync(receiptPath, JSON.stringify(terminalReceipt), "utf8");
@@ -728,6 +745,7 @@ describe("mailbox bridge", () => {
     );
     expect(seen.messages[msgId]).toMatchObject({
       status,
+      path: terminalMessagePath,
       ...(failureReason ? { failureReason } : {}),
     });
     if (!failureReason) {

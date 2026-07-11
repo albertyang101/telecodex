@@ -701,6 +701,21 @@ interface ExistingTerminalReceipt {
   messagePath?: string;
 }
 
+function isPathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative));
+}
+
+function expectedTerminalMessagePath(
+  settings: MailboxBridgeConfig,
+  message: MailboxMessage,
+  status: string,
+): string {
+  return status === "processed"
+    ? path.join(archiveDir(settings, message.to, mailboxMonth(message.sentAt)), path.basename(message.path))
+    : message.path;
+}
+
 async function loadExistingTerminalReceipt(
   settings: MailboxBridgeConfig,
   message: MailboxMessage,
@@ -717,7 +732,9 @@ async function loadExistingTerminalReceipt(
       parsed.to !== message.to ||
       parsed.delivered_by !== BRIDGE_DELIVERED_BY ||
       typeof parsed.message_path !== "string" ||
-      path.resolve(parsed.message_path) !== path.resolve(message.path)
+      !isPathWithin(mailboxRoot(settings), parsed.message_path) ||
+      path.resolve(parsed.message_path) !==
+        path.resolve(expectedTerminalMessagePath(settings, message, parsed.status))
     ) {
       return null;
     }
