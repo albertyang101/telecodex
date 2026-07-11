@@ -3093,6 +3093,12 @@ function isObviousProcessNarration(text: string): boolean {
   if (/[？?]/.test(candidate) || /(需要你|需要确认|请确认|你要不要)/.test(candidate)) {
     return false;
   }
+  if (
+    /[：:]/.test(candidate) ||
+    /(?:失败|完成|查明|确认(?:清楚|过)|发现|根因|仍在|已经|已|成功|通过|回滚|验收|没有|没|未|异常|阻塞|结论|结果|修好|解决|生效|\b(?:failed|completed?|done|found|root cause|rolled back|ready)\b)/i.test(candidate)
+  ) {
+    return false;
+  }
   if (/^(?:关键发现|阶段结果|进度|结果|阻塞|需要确认|已完成|已验证)[：:]/i.test(candidate)) {
     return false;
   }

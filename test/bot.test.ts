@@ -1820,6 +1820,14 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("我现在部署失败，需要回滚。");
       callbacks.onTextDelta("现在修复完成，可以验收。");
       callbacks.onAgentMessage?.("现在修复完成，可以验收。");
+      callbacks.onTextDelta("我先把根因确认清楚了：旧 poller 没退出。");
+      callbacks.onAgentMessage?.("我先把根因确认清楚了：旧 poller 没退出。");
+      callbacks.onTextDelta("我现在就部署失败，需要回滚。");
+      callbacks.onAgentMessage?.("我现在就部署失败，需要回滚。");
+      callbacks.onTextDelta("现在就修复完成，可以验收。");
+      callbacks.onAgentMessage?.("现在就修复完成，可以验收。");
+      callbacks.onTextDelta("我现在就查明了根因：旧版本仍在运行。");
+      callbacks.onAgentMessage?.("我现在就查明了根因：旧版本仍在运行。");
       callbacks.onTextDelta("已经按新口径收紧。");
       callbacks.onAgentMessage?.("已经按新口径收紧。");
       callbacks.onAgentEnd();
@@ -1844,6 +1852,10 @@ describe("createBot response delivery", () => {
     expect(visible).toContain("我先确认过了：生产仍在跑旧版本。");
     expect(visible).toContain("我现在部署失败，需要回滚。");
     expect(visible).toContain("现在修复完成，可以验收。");
+    expect(visible).toContain("我先把根因确认清楚了：旧 poller 没退出。");
+    expect(visible).toContain("我现在就部署失败，需要回滚。");
+    expect(visible).toContain("现在就修复完成，可以验收。");
+    expect(visible).toContain("我现在就查明了根因：旧版本仍在运行。");
     expect(visible).toContain("已经按新口径收紧。");
   });
 
