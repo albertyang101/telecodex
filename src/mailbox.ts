@@ -67,6 +67,11 @@ export interface MailboxRecoveryOptions {
 const MAILBOX_PROMPT_TIMEOUT_STATUS = "failed_prompt_timeout";
 const MAILBOX_UNEXPECTED_FAILURE_STATUS = "failed_unexpected";
 const MAILBOX_PROCESSING_STATUS = "processing";
+const MAILBOX_TERMINAL_STATUSES = new Set([
+  "processed",
+  MAILBOX_PROMPT_TIMEOUT_STATUS,
+  MAILBOX_UNEXPECTED_FAILURE_STATUS,
+]);
 
 export async function runMailboxDeliveryOnce(
   config: TeleCodexConfig,
@@ -707,7 +712,12 @@ async function loadExistingTerminalReceipt(
     if (
       parsed.msg_id !== message.msgId ||
       typeof parsed.status !== "string" ||
-      parsed.status === MAILBOX_PROCESSING_STATUS
+      !MAILBOX_TERMINAL_STATUSES.has(parsed.status) ||
+      parsed.from !== message.from ||
+      parsed.to !== message.to ||
+      parsed.delivered_by !== BRIDGE_DELIVERED_BY ||
+      typeof parsed.message_path !== "string" ||
+      path.resolve(parsed.message_path) !== path.resolve(message.path)
     ) {
       return null;
     }

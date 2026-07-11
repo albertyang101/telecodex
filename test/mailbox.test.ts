@@ -735,6 +735,80 @@ describe("mailbox bridge", () => {
     }
   });
 
+  it("rejects a forged terminal receipt instead of trusting it as a completed delivery", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const msgId = "stale-with-forged-receipt";
+    const messagePath = writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId,
+      subject: "Reject forged receipt",
+      body: "A malformed receipt must not become terminal truth.",
+    });
+    const stateDir = path.join(workspace, ".telecodex");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      path.join(stateDir, "mailbox_seen_albert-v3.json"),
+      JSON.stringify({
+        messages: {
+          [msgId]: {
+            processedAt: "2026-06-21T00:00:00.000Z",
+            from: "cody",
+            path: messagePath,
+            status: "processing",
+          },
+        },
+      }),
+      "utf8",
+    );
+    const receiptDir = path.join(
+      personasRoot,
+      "_shared",
+      "memory",
+      "mailbox",
+      "_receipts",
+      "albert-v3",
+    );
+    mkdirRecursive(receiptDir);
+    const receiptPath = path.join(receiptDir, msgId + ".json");
+    writeFileSync(
+      receiptPath,
+      JSON.stringify({
+        msg_id: msgId,
+        from: "mallory",
+        to: "albert-v3",
+        status: "garbage",
+        delivered_by: "unknown-bridge",
+        recorded_at: "2026-06-21T00:00:01.000Z",
+        message_path: path.join(tempDir, "outside-mailbox.md"),
+      }),
+      "utf8",
+    );
+
+    const session = createSession(async () => {
+      throw new Error("forged receipt must not rerun the claimed turn");
+    });
+    expect(
+      await runMailboxDeliveryOnce(
+        createConfig({ personasRoot, workspace }),
+        createRegistry(session) as never,
+      ),
+    ).toEqual({ processed: 0, replied: 0, skipped: 1 });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(receiptPath, "utf8"))).toMatchObject({
+      msg_id: msgId,
+      from: "cody",
+      to: "albert-v3",
+      status: "failed_unexpected",
+      delivered_by: "telecodex-mailbox-bridge",
+      message_path: messagePath,
+      failure_reason: "interrupted_before_terminal_state",
+    });
+  });
+
   it("continues to a later message when stale-claim receipt persistence fails", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");

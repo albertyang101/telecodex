@@ -1277,27 +1277,29 @@ export function createBot(
 
         const messageText = renderToolStartMessage(toolName);
 
-        void (async () => {
-          const message = await sendTextMessage(bot.api, chatId, messageText.text, {
-            parseMode: messageText.parseMode,
-            fallbackText: messageText.fallbackText,
-            messageThreadId,
-          });
-          const state = toolStates.get(toolCallId);
-          if (!state) {
-            return;
-          }
-
-          state.messageId = message.message_id;
-          if (state.finalStatus) {
-            await safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
-              parseMode: state.finalStatus.parseMode,
-              fallbackText: state.finalStatus.fallbackText,
+        streamDeliveryPromise = streamDeliveryPromise
+          .then(async () => {
+            const message = await sendTextMessage(bot.api, chatId, messageText.text, {
+              parseMode: messageText.parseMode,
+              fallbackText: messageText.fallbackText,
+              messageThreadId,
             });
-          }
-        })().catch((error) => {
-          console.error(`Failed to send tool start message for ${toolName}`, error);
-        });
+            const state = toolStates.get(toolCallId);
+            if (!state) {
+              return;
+            }
+
+            state.messageId = message.message_id;
+            if (state.finalStatus) {
+              await safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
+                parseMode: state.finalStatus.parseMode,
+                fallbackText: state.finalStatus.fallbackText,
+              });
+            }
+          })
+          .catch((error) => {
+            console.error(`Failed to send tool start message for ${toolName}`, error);
+          });
       },
       onToolUpdate: (toolCallId: string, partialResult: string) => {
         if (toolVerbosity === "none" || toolVerbosity === "summary") {
@@ -1562,7 +1564,13 @@ export function createBot(
       } else {
         finalized = true;
 
-        const failureSourceText = streamAgentResponses ? accumulatedText : completedAgentText;
+        const completedFailureText = visibleCompletedAgentMessage(completedAgentText);
+        const failureSourceText = streamAgentResponses
+          ? accumulatedText ||
+            (completedFailureText && !completedStreamMessages.includes(completedFailureText)
+              ? completedAgentText
+              : "")
+          : completedAgentText;
         const failureReplyText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
         const transcriptFailureText = [...completedStreamMessages, failureReplyText]
           .filter((text) => Boolean(text))
@@ -3099,8 +3107,7 @@ function visibleIntermediateUpdate(text: string): string {
     const head = normalizeIntermediateUpdateHead(line);
     return (
       STRUCTURED_INTERMEDIATE_UPDATE_RE.test(head) ||
-      /[？?]/.test(head) ||
-      /(需要你|需要确认|请确认|你要不要)/.test(head)
+      /(需要你|需要确认|请确认|你要不要|你是否|您是否)/.test(head)
     );
   });
   return firstVisibleLine >= 0 ? lines.slice(firstVisibleLine).join("\n").trim() : "";
@@ -3578,9 +3585,10 @@ function isTelegramParseError(error: unknown): boolean {
   );
 }
 
-function renderPromptFailure(_accumulatedText: string, error: unknown): string {
+function renderPromptFailure(accumulatedText: string, error: unknown): string {
   const message = friendlyErrorText(error);
-  return `⚠️ ${message}`;
+  const completedText = accumulatedText.trim();
+  return completedText ? `${completedText}\n\n⚠️ ${message}` : `⚠️ ${message}`;
 }
 
 function isCodexTurnBusyError(error: unknown): boolean {

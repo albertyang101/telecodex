@@ -859,6 +859,43 @@ describe("createBot response delivery", () => {
     expect(transcript).toContain("provider failed");
   });
 
+  it("preserves an untagged completed partial in the failure reply without sending it as a progress bubble", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-untagged-failure-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("已完成第一阶段，但这条没有进度标签。");
+      callbacks.onAgentMessage?.("已完成第一阶段，但这条没有进度标签。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      throw new Error("provider failed");
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(
+      createConfig({ memoryTranscriptRoot: sessionsRoot, streamAgentResponses: true }),
+      registry as any,
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 99, text: "无标签阶段后失败" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    const visibleReplyTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+
+    expect(visibleReplyTexts.filter((text: string) => text.includes("已完成第一阶段，但这条没有进度标签。"))).toHaveLength(1);
+    expect(visibleReplyTexts.join("\n")).toContain("provider failed");
+    expect(transcript).toContain("已完成第一阶段，但这条没有进度标签。");
+    expect(transcript).toContain("provider failed");
+  });
+
   it("records prompt failure replies as bot turns without leaking raw provider URLs", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-prompt-failure-"));
     tempDirs.push(root);
@@ -1820,6 +1857,8 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("我先去检查已有测试。", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先去看看有没有问题。");
       callbacks.onAgentMessage?.("我先去看看有没有问题。", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("我先看看有没有问题？");
+      callbacks.onAgentMessage?.("我先看看有没有问题？", { isFinal: false, followedByTool: true });
       for (const narration of [
         "我先看一下。",
         "我先查一下。",
@@ -1895,6 +1934,7 @@ describe("createBot response delivery", () => {
     expect(visible).not.toContain("我先去做两件事：读文件、跑测试。");
     expect(visible).not.toContain("我先去检查已有测试。");
     expect(visible).not.toContain("我先去看看有没有问题。");
+    expect(visible).not.toContain("我先看看有没有问题？");
     for (const narration of [
       "我先看一下。",
       "我先查一下。",
@@ -1936,6 +1976,54 @@ describe("createBot response delivery", () => {
       expect(visible).toContain(result);
     }
     expect(visible).toContain("已经按新口径收紧。");
+  });
+
+  it("keeps tool status behind the progress bubble that preceded it", async () => {
+    const releaseProgress = deferred<void>();
+    let callsBeforeRelease = -1;
+    let botInstance: any;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("阶段结果：先完成准备。");
+      callbacks.onAgentMessage?.("阶段结果：先完成准备。", {
+        isFinal: false,
+        followedByTool: true,
+      });
+      callbacks.onToolStart("ls -la", "tool-order");
+      await Promise.resolve();
+      await Promise.resolve();
+      callsBeforeRelease = botInstance.api.sendMessage.mock.calls.length;
+      releaseProgress.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      callbacks.onTextDelta("最终结果。");
+      callbacks.onAgentMessage?.("最终结果。", { isFinal: true, followedByTool: false });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(
+      createConfig({ streamAgentResponses: true, toolVerbosity: "all" }),
+      registry as any,
+    ) as any;
+    botInstance = mockGrammy.bots[0];
+    bot.api.sendMessage.mockImplementationOnce(async () => {
+      await releaseProgress.promise;
+      return { message_id: 1 };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 14, text: "保持消息顺序" },
+      api: bot.api,
+    });
+
+    expect(callsBeforeRelease).toBe(1);
+    const sentTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+    expect(sentTexts[0]).toContain("阶段结果：先完成准备。");
+    expect(sentTexts[1]).toContain("ls -la");
+    expect(sentTexts.some((text: string) => text.includes("最终结果。"))).toBe(true);
   });
 
   it("continues with later streaming messages after a long-message chunk fails", async () => {
