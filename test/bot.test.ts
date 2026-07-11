@@ -1868,6 +1868,12 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("我先看看你是否在线。", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先检查你要不要保留日志。");
       callbacks.onAgentMessage?.("我先检查你要不要保留日志。", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("我先检查需要确认哪些日志。");
+      callbacks.onAgentMessage?.("我先检查需要确认哪些日志。", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("我先看看请确认按钮是否出现。");
+      callbacks.onAgentMessage?.("我先看看请确认按钮是否出现。", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("我先查需要你提供哪些字段。");
+      callbacks.onAgentMessage?.("我先查需要你提供哪些字段。", { isFinal: false, followedByTool: true });
       for (const narration of [
         "我先看一下。",
         "我先查一下。",
@@ -1955,6 +1961,9 @@ describe("createBot response delivery", () => {
     expect(visible).not.toContain("我先看看这样可以吗？");
     expect(visible).not.toContain("我先看看你是否在线。");
     expect(visible).not.toContain("我先检查你要不要保留日志。");
+    expect(visible).not.toContain("我先检查需要确认哪些日志。");
+    expect(visible).not.toContain("我先看看请确认按钮是否出现。");
+    expect(visible).not.toContain("我先查需要你提供哪些字段。");
     for (const narration of [
       "我先看一下。",
       "我先查一下。",

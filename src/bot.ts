@@ -3111,7 +3111,7 @@ function visibleIntermediateUpdate(text: string): string {
     const processNarration = /^(?:我先(?:去|来|看|看看|确认|检查|查)|收到[，。]?\s*我先)/.test(head);
     return (
       STRUCTURED_INTERMEDIATE_UPDATE_RE.test(head) ||
-      /(需要你|需要确认|请确认)/.test(head) ||
+      (!processNarration && /(需要你|请确认)/.test(head)) ||
       ((!processNarration || /[：:]/.test(head)) &&
         /(你要不要|你是否|您是否)/.test(head) &&
         /[？?]$/.test(head)) ||
