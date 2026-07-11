@@ -1814,6 +1814,12 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("关键发现：消息过密来自进度策略。");
       callbacks.onTextDelta("我先确认一下：你要不要保留这条提醒？");
       callbacks.onAgentMessage?.("我先确认一下：你要不要保留这条提醒？");
+      callbacks.onTextDelta("我先确认过了：生产仍在跑旧版本。");
+      callbacks.onAgentMessage?.("我先确认过了：生产仍在跑旧版本。");
+      callbacks.onTextDelta("我现在部署失败，需要回滚。");
+      callbacks.onAgentMessage?.("我现在部署失败，需要回滚。");
+      callbacks.onTextDelta("现在修复完成，可以验收。");
+      callbacks.onAgentMessage?.("现在修复完成，可以验收。");
       callbacks.onTextDelta("已经按新口径收紧。");
       callbacks.onAgentMessage?.("已经按新口径收紧。");
       callbacks.onAgentEnd();
@@ -1835,6 +1841,9 @@ describe("createBot response delivery", () => {
     expect(visible).not.toContain("Let me run tests.");
     expect(visible).toContain("关键发现：消息过密来自进度策略。");
     expect(visible).toContain("我先确认一下：你要不要保留这条提醒？");
+    expect(visible).toContain("我先确认过了：生产仍在跑旧版本。");
+    expect(visible).toContain("我现在部署失败，需要回滚。");
+    expect(visible).toContain("现在修复完成，可以验收。");
     expect(visible).toContain("已经按新口径收紧。");
   });
 

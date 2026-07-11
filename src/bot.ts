@@ -3080,8 +3080,8 @@ function renderSessionInfoPlain(info: CodexSessionInfo): string {
 }
 
 const PROCESS_NARRATION_PATTERNS = [
-  /^(?:收到[，,]?\s*)?(?:我)?先(?:把|去|来|开始|准备|做|改|跑|加|写|装|测|看|查|搜|找|确认|检查|研究|整理|读)/i,
-  /^(?:我)?现在(?:就)?(?:去|来|开始|准备|做|改|跑|加|写|装|测|看|查|合并|部署|修|派|启动|触发)/i,
+  /^(?:收到[，,]?\s*)?(?:我)?先(?:把|去|来|开始|准备)/i,
+  /^(?:我)?现在(?:去|来|开始|准备|就(?:去|来|开始|准备|做|改|跑|加|写|装|测|看|查|合并|部署|修|派|启动|触发))/i,
   /^(?:Now|Let me|I['’]?ll|I will|I am|I['’]?m|Going to|Next[,:]?)\s+(?:update|fix|add|write|run|merge|deploy|test|check|read|build)\b/i,
 ];
 
