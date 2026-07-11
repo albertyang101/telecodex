@@ -1575,8 +1575,14 @@ export function createBot(
         finalized = true;
 
         const failureSourceText = streamAgentResponses
-          ? [...new Set([...undeliveredCompletedMessages, accumulatedText].filter((text) => Boolean(text)))]
-              .join("\n\n")
+          ? [
+              ...new Set(
+                [
+                  ...undeliveredCompletedMessages,
+                  recoverableIntermediateUpdate(accumulatedText),
+                ].filter((text) => Boolean(text)),
+              ),
+            ].join("\n\n")
           : completedAgentText;
         const failureReplyText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
         const transcriptFailureText = [...completedStreamMessages, failureReplyText]
