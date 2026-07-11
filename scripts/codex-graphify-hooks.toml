@@ -1,0 +1,37 @@
+# Source fragment for isolated validation. Deployment must replace <ABSOLUTE_HOOK_SCRIPT> with the reviewed workspace hook copy.
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/usr/bin/python3 <ABSOLUTE_HOOK_SCRIPT>"
+timeout = 10
+statusMessage = "Checking canonical graphify first"
+
+[[hooks.PreToolUse]]
+matcher = "^(apply_patch|Edit|Write)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/usr/bin/python3 <ABSOLUTE_HOOK_SCRIPT>"
+timeout = 10
+statusMessage = "Checking canonical graphify before edit"
+
+[[hooks.PreToolUse]]
+matcher = "^mcp__filesystem__.*$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/usr/bin/python3 <ABSOLUTE_HOOK_SCRIPT>"
+timeout = 10
+statusMessage = "Checking canonical graphify before filesystem access"
+
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/usr/bin/python3 <ABSOLUTE_TURN_CONTEXT_SCRIPT>"
+timeout = 5
+statusMessage = "Loading graphify development contract"
