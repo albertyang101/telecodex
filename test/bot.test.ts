@@ -869,7 +869,17 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
-      callbacks.onTextDelta("第二阶段刚开始。");
+      callbacks.onTextDelta("我先检查文件。");
+      callbacks.onAgentMessage?.("我先检查文件。", {
+        isFinal: false,
+        followedByTool: true,
+      });
+      callbacks.onTextDelta("已完成第二阶段，这条也没有进度标签。");
+      callbacks.onAgentMessage?.("已完成第二阶段，这条也没有进度标签。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("第三阶段刚开始。");
       throw new Error("provider failed");
     });
     const registry = createRegistry(session);
@@ -892,10 +902,14 @@ describe("createBot response delivery", () => {
     const visibleReplyTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
 
     expect(visibleReplyTexts.filter((text: string) => text.includes("已完成第一阶段，但这条没有进度标签。"))).toHaveLength(1);
-    expect(visibleReplyTexts.join("\n")).toContain("第二阶段刚开始。");
+    expect(visibleReplyTexts.filter((text: string) => text.includes("已完成第二阶段，这条也没有进度标签。"))).toHaveLength(1);
+    expect(visibleReplyTexts.join("\n")).not.toContain("我先检查文件。");
+    expect(visibleReplyTexts.join("\n")).toContain("第三阶段刚开始。");
     expect(visibleReplyTexts.join("\n")).toContain("provider failed");
     expect(transcript).toContain("已完成第一阶段，但这条没有进度标签。");
-    expect(transcript).toContain("第二阶段刚开始。");
+    expect(transcript).toContain("已完成第二阶段，这条也没有进度标签。");
+    expect(transcript).not.toContain("我先检查文件。");
+    expect(transcript).toContain("第三阶段刚开始。");
     expect(transcript).toContain("provider failed");
   });
 
@@ -1874,6 +1888,10 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("我先看看请确认按钮是否出现。", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先查需要你提供哪些字段。");
       callbacks.onAgentMessage?.("我先查需要你提供哪些字段。", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("我准备检查需要你提供哪些字段。");
+      callbacks.onAgentMessage?.("我准备检查需要你提供哪些字段。", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("下一步请确认按钮是否出现。");
+      callbacks.onAgentMessage?.("下一步请确认按钮是否出现。", { isFinal: false, followedByTool: true });
       for (const narration of [
         "我先看一下。",
         "我先查一下。",
@@ -1904,6 +1922,12 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("这样可以吗？", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("Should I continue?");
       callbacks.onAgentMessage?.("Should I continue?", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("还继续吗？");
+      callbacks.onAgentMessage?.("还继续吗？", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("你希望我怎么做？");
+      callbacks.onAgentMessage?.("你希望我怎么做？", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("What should I do?");
+      callbacks.onAgentMessage?.("What should I do?", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("“这样可以吗？”");
       callbacks.onAgentMessage?.("“这样可以吗？”", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("**这样可以吗？**");
@@ -1964,6 +1988,8 @@ describe("createBot response delivery", () => {
     expect(visible).not.toContain("我先检查需要确认哪些日志。");
     expect(visible).not.toContain("我先看看请确认按钮是否出现。");
     expect(visible).not.toContain("我先查需要你提供哪些字段。");
+    expect(visible).not.toContain("我准备检查需要你提供哪些字段。");
+    expect(visible).not.toContain("下一步请确认按钮是否出现。");
     for (const narration of [
       "我先看一下。",
       "我先查一下。",
@@ -1988,6 +2014,9 @@ describe("createBot response delivery", () => {
     expect(visible).toContain("我先确认一下：你要不要保留这条提醒？");
     expect(visible).toContain("这样可以吗？");
     expect(visible).toContain("Should I continue?");
+    expect(visible).toContain("还继续吗？");
+    expect(visible).toContain("你希望我怎么做？");
+    expect(visible).toContain("What should I do?");
     expect(visible).toContain("“这样可以吗？”");
     expect(visible).toContain("<b>这样可以吗？</b>");
     expect(visible).toContain("我先确认过了：生产仍在跑旧版本。");

@@ -910,6 +910,7 @@ export function createBot(
     let completedAgentText = "";
     let hasCompletedAgentText = false;
     const completedStreamMessages: string[] = [];
+    const undeliveredCompletedMessages: string[] = [];
     let streamDeliveryPromise: Promise<void> = Promise.resolve();
     let streamDeliveryError: unknown;
     let responseMessageId: number | undefined;
@@ -1177,9 +1178,17 @@ export function createBot(
     };
 
     const enqueueCompletedStreamMessage = (text: string, metadata?: AgentMessageDeliveryMetadata): void => {
+      const completedText = visibleCompletedAgentMessage(text);
       const visibleText = visibleCompletedAgentMessage(text, metadata);
       accumulatedText = "";
       if (!visibleText) {
+        if (
+          completedText &&
+          metadata?.isFinal === false &&
+          metadata.followedByTool === false
+        ) {
+          undeliveredCompletedMessages.push(completedText);
+        }
         return;
       }
 
@@ -1564,13 +1573,8 @@ export function createBot(
       } else {
         finalized = true;
 
-        const completedFailureText = visibleCompletedAgentMessage(completedAgentText);
-        const undeliveredCompletedText =
-          completedFailureText && !completedStreamMessages.includes(completedFailureText)
-            ? completedAgentText
-            : "";
         const failureSourceText = streamAgentResponses
-          ? [...new Set([undeliveredCompletedText, accumulatedText].filter((text) => Boolean(text)))]
+          ? [...new Set([...undeliveredCompletedMessages, accumulatedText].filter((text) => Boolean(text)))]
               .join("\n\n")
           : completedAgentText;
         const failureReplyText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
@@ -3108,16 +3112,12 @@ function visibleIntermediateUpdate(text: string): string {
   const lines = text.trim().split("\n");
   const firstVisibleLine = lines.findIndex((line) => {
     const head = normalizeIntermediateUpdateHead(line);
-    const processNarration = /^(?:我先(?:去|来|看|看看|确认|检查|查)|收到[，。]?\s*我先)/.test(head);
+    const processNarration =
+      /^(?:我(?:先|准备|接下来|现在(?:要|去|来)?)|下一步|接下来|然后|收到[，。]?\s*我先|let me\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i.test(head);
     return (
       STRUCTURED_INTERMEDIATE_UPDATE_RE.test(head) ||
       (!processNarration && /(需要你|请确认)/.test(head)) ||
-      ((!processNarration || /[：:]/.test(head)) &&
-        /(你要不要|你是否|您是否)/.test(head) &&
-        /[？?]$/.test(head)) ||
-      (!processNarration &&
-        (/(?:要保留|要删除|要继续|可以|行|好|对|确定|怎么办|怎么处理|选哪个|哪一个|哪种)(?:吗|呢)?[？?]$/.test(head) ||
-          /^(?:should|shall|would|could|can|do|does|did|is|are|will)\b.*\?$/i.test(head)))
+      ((!processNarration || /[：:]/.test(head)) && /[？?]$/.test(head))
     );
   });
   return firstVisibleLine >= 0 ? lines.slice(firstVisibleLine).join("\n").trim() : "";
