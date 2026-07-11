@@ -903,12 +903,9 @@ export function createBot(
 
     const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
     const toolVerbosity: ToolVerbosity = config.toolVerbosity;
-    const streamAgentResponses = config.streamAgentResponses;
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
     let accumulatedText = "";
-    let completedAgentText = "";
-    let hasCompletedAgentText = false;
     const completedStreamMessages: string[] = [];
     const undeliveredCompletedMessages: string[] = [];
     let streamDeliveryPromise: Promise<void> = Promise.resolve();
@@ -987,13 +984,6 @@ export function createBot(
       }
 
       return trimmedText;
-    };
-
-    const finalResponseSourceText = (): string => {
-      if (!streamAgentResponses && hasCompletedAgentText) {
-        return completedAgentText;
-      }
-      return accumulatedText;
     };
 
     const ensureResponseMessage = async (): Promise<void> => {
@@ -1224,7 +1214,7 @@ export function createBot(
         }
       }
 
-      if (streamAgentResponses && completedStreamMessages.length > 0) {
+      if (completedStreamMessages.length > 0) {
         await streamDeliveryPromise;
         const footerText = buildFinalResponseText("");
         if (footerText) {
@@ -1242,7 +1232,7 @@ export function createBot(
         return completedStreamMessages.join("\n\n");
       }
 
-      const finalText = buildFinalResponseText(finalResponseSourceText());
+      const finalText = buildFinalResponseText(accumulatedText);
       if (!finalText) {
         const html = "<b>✅ Done</b>";
         const plainText = "✅ Done";
@@ -1272,21 +1262,7 @@ export function createBot(
         accumulatedText += delta;
       },
       onAgentMessage: (text: string, metadata: AgentMessageDeliveryMetadata) => {
-        completedAgentText = text;
-        hasCompletedAgentText = true;
-        if (streamAgentResponses) {
-          enqueueCompletedStreamMessage(text, metadata);
-        } else {
-          accumulatedText = "";
-          const recoverableText = recoverableIntermediateUpdate(visibleCompletedAgentMessage(text));
-          if (
-            recoverableText &&
-            metadata?.isFinal === false &&
-            metadata.followedByTool === false
-          ) {
-            undeliveredCompletedMessages.push(recoverableText);
-          }
-        }
+        enqueueCompletedStreamMessage(text, metadata);
       },
       onToolStart: (toolName: string, toolCallId: string) => {
         if (toolVerbosity === "summary") {
@@ -1574,9 +1550,7 @@ export function createBot(
       }
     } catch (error) {
       clearFlushTimer();
-      if (streamAgentResponses) {
-        await streamDeliveryPromise;
-      }
+      await streamDeliveryPromise;
       // ALB-1205 SENTINEL: live Telegram path is no-turn-timeout (2026-06-29 live
       // decision, preserved as the integration baseline), so there is no
       // CodexTurnTimeoutError to catch here — the canonical interrupted-turn (最后断点)

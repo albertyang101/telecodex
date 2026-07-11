@@ -131,7 +131,6 @@ describe("createBot response delivery", () => {
     showTurnTokenUsage: false,
     enableTelegramLogin: true,
     enableTelegramReactions: false,
-    streamAgentResponses: false,
     memoryTranscriptRoot: undefined,
     mailboxBridge: {
       enabled: false,
@@ -857,7 +856,7 @@ describe("createBot response delivery", () => {
     const registry = createRegistry(session);
 
     const bot = createBot(
-      createConfig({ memoryTranscriptRoot: sessionsRoot, streamAgentResponses: true }),
+      createConfig({ memoryTranscriptRoot: sessionsRoot }),
       registry as any,
     ) as any;
     const textHandler = bot.__handlers.on.get("message:text");
@@ -1053,7 +1052,7 @@ describe("createBot response delivery", () => {
     const registry = createRegistry(session);
 
     const bot = createBot(
-      createConfig({ memoryTranscriptRoot: sessionsRoot, streamAgentResponses: true }),
+      createConfig({ memoryTranscriptRoot: sessionsRoot }),
       registry as any,
     ) as any;
     const textHandler = bot.__handlers.on.get("message:text");
@@ -1157,7 +1156,7 @@ describe("createBot response delivery", () => {
     const registry = createRegistry(session);
 
     const bot = createBot(
-      createConfig({ memoryTranscriptRoot: sessionsRoot, streamAgentResponses: true }),
+      createConfig({ memoryTranscriptRoot: sessionsRoot }),
       registry as any,
     ) as any;
     const textHandler = bot.__handlers.on.get("message:text");
@@ -1182,8 +1181,8 @@ describe("createBot response delivery", () => {
     expect(normalizeSpacing(transcript).split(result)).toHaveLength(2);
   });
 
-  it("recovers every useful completed partial on the quiet-default failure path", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-quiet-failure-"));
+  it("recovers every useful completed partial on the native completed-message failure path", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-native-failure-"));
     tempDirs.push(root);
     const sessionsRoot = path.join(root, "Sessions");
     const session = createSession(async (callbacks) => {
@@ -1203,7 +1202,7 @@ describe("createBot response delivery", () => {
     await textHandler({
       chat: { id: 42 },
       from: { id: 123 },
-      message: { message_id: 992, text: "安静模式失败恢复" },
+      message: { message_id: 992, text: "原生消息失败恢复" },
       api: bot.api,
     });
 
@@ -1571,7 +1570,7 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const bot = createBot(createConfig(), registry as any) as any;
     botInstance = mockGrammy.bots[0];
     const textHandler = bot.__handlers.on.get("message:text");
 
@@ -1614,7 +1613,7 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const bot = createBot(createConfig(), registry as any) as any;
     botInstance = mockGrammy.bots[0];
     const textHandler = bot.__handlers.on.get("message:text");
 
@@ -1646,7 +1645,7 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const bot = createBot(createConfig(), registry as any) as any;
     const textHandler = bot.__handlers.on.get("message:text");
 
     await textHandler({
@@ -2010,7 +2009,7 @@ describe("createBot response delivery", () => {
       });
       const registry = createRegistry(session);
 
-      const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+      const bot = createBot(createConfig(), registry as any) as any;
       botInstance = mockGrammy.bots[0];
       const textHandler = bot.__handlers.on.get("message:text");
 
@@ -2051,7 +2050,7 @@ describe("createBot response delivery", () => {
       });
       const registry = createRegistry(session);
 
-      const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+      const bot = createBot(createConfig(), registry as any) as any;
       const botInstance = mockGrammy.bots[0];
       botInstance.api.sendMessage.mockImplementation(async () => {
         await finalDelivery;
@@ -2101,7 +2100,7 @@ describe("createBot response delivery", () => {
       });
       const registry = createRegistry(session);
 
-      const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+      const bot = createBot(createConfig(), registry as any) as any;
       const botInstance = mockGrammy.bots[0];
       botInstance.api.sendMessage.mockImplementation(async () => {
         await failureDelivery;
@@ -2151,7 +2150,7 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const bot = createBot(createConfig(), registry as any) as any;
     const textHandler = bot.__handlers.on.get("message:text");
 
     await textHandler({
@@ -2277,7 +2276,7 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const bot = createBot(createConfig(), registry as any) as any;
     const textHandler = bot.__handlers.on.get("message:text");
 
     await textHandler({
@@ -2378,7 +2377,7 @@ describe("createBot response delivery", () => {
     const registry = createRegistry(session);
 
     const bot = createBot(
-      createConfig({ streamAgentResponses: true, toolVerbosity: "all" }),
+      createConfig({ toolVerbosity: "all" }),
       registry as any,
     ) as any;
     botInstance = mockGrammy.bots[0];
@@ -2413,7 +2412,7 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const bot = createBot(createConfig(), registry as any) as any;
     bot.api.sendMessage
       .mockResolvedValueOnce({ message_id: 1 })
       .mockRejectedValueOnce(new Error("telegram chunk failed"));
@@ -2440,7 +2439,7 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const bot = createBot(createConfig(), registry as any) as any;
     bot.api.sendMessage
       .mockRejectedValueOnce(new Error("first attempt failed"))
       .mockRejectedValueOnce(new Error("retry failed"));
@@ -2471,7 +2470,7 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const bot = createBot(createConfig(), registry as any) as any;
     bot.api.sendMessage.mockImplementationOnce(async () => {
       await releaseDelivery.promise;
       return { message_id: 1 };
@@ -2520,7 +2519,7 @@ describe("createBot response delivery", () => {
       });
       const registry = createRegistry(session);
 
-      const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+      const bot = createBot(createConfig(), registry as any) as any;
       botInstance = mockGrammy.bots[0];
       const textHandler = bot.__handlers.on.get("message:text");
 
@@ -2554,7 +2553,7 @@ describe("createBot response delivery", () => {
     });
     const registry = createRegistry(session);
 
-    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const bot = createBot(createConfig(), registry as any) as any;
     const textHandler = bot.__handlers.on.get("message:text");
 
     await textHandler({

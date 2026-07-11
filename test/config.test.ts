@@ -147,7 +147,6 @@ describe("loadConfig", () => {
       defaultLaunchProfileId: "default",
       enableUnsafeLaunchProfiles: false,
       toolVerbosity: "all",
-      streamAgentResponses: false,
       showTurnTokenUsage: false,
       enableTelegramLogin: true,
       enableTelegramReactions: false,
@@ -292,7 +291,6 @@ describe("loadConfig", () => {
     expect(config.defaultLaunchProfileId).toBe("default");
     expect(config.enableUnsafeLaunchProfiles).toBe(false);
     expect(config.toolVerbosity).toBe("none");
-    expect(config.streamAgentResponses).toBe(false);
     expect(config.showTurnTokenUsage).toBe(false);
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
@@ -753,28 +751,14 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow("MAILBOX_MIN_SENT_AT must be an ISO or compact UTC timestamp");
   });
 
-  it("parses STREAM_AGENT_RESPONSES boolean values", () => {
+  it("ignores the retired STREAM_AGENT_RESPONSES switch", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.STREAM_AGENT_RESPONSES = "false";
 
-    const truthyValues = ["true", "1", "yes"];
-    const falsyValues = ["false", "0", "no"];
-
-    for (const value of truthyValues) {
-      process.env.STREAM_AGENT_RESPONSES = value;
-      const config = loadConfig();
-      expect(config.streamAgentResponses).toBe(true);
-    }
-
-    for (const value of falsyValues) {
-      process.env.STREAM_AGENT_RESPONSES = value;
-      const config = loadConfig();
-      expect(config.streamAgentResponses).toBe(false);
-    }
-
-    delete process.env.STREAM_AGENT_RESPONSES;
     const config = loadConfig();
-    expect(config.streamAgentResponses).toBe(false);
+
+    expect(config).not.toHaveProperty("streamAgentResponses");
   });
 
   it("falls back to defaults for invalid optional enum values", () => {

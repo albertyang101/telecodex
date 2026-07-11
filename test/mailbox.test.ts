@@ -1924,7 +1924,6 @@ function createConfig(overrides: {
     defaultLaunchProfileId: "default",
     enableUnsafeLaunchProfiles: false,
     toolVerbosity: "none",
-    streamAgentResponses: false,
     showTurnTokenUsage: false,
     enableTelegramLogin: false,
     enableTelegramReactions: false,
