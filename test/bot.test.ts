@@ -914,6 +914,11 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
+      callbacks.onTextDelta("随后测试结果显示服务仍在旧版本。");
+      callbacks.onAgentMessage?.("随后测试结果显示服务仍在旧版本。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       callbacks.onTextDelta("我先查了一下，结果是生产仍在旧版本。");
       callbacks.onAgentMessage?.("我先查了一下，结果是生产仍在旧版本。", {
         isFinal: false,
@@ -962,6 +967,7 @@ describe("createBot response delivery", () => {
     expect(visibleReplyTexts.filter((text: string) => text.includes("生产服务依然运行旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.join("\n")).not.toContain("再继续跑测试。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后发现服务仍在旧版本。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试结果显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.join("\n")).not.toContain("我先检查第三份文件。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("结果是生产仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("发现配置没有生效。"))).toHaveLength(1);
@@ -978,6 +984,7 @@ describe("createBot response delivery", () => {
     expect(transcript).toContain("生产服务依然运行旧版本。");
     expect(transcript).not.toContain("再继续跑测试。");
     expect(transcript).toContain("随后发现服务仍在旧版本。");
+    expect(transcript).toContain("随后测试结果显示服务仍在旧版本。");
     expect(transcript).not.toContain("我先检查第三份文件。");
     expect(transcript).toContain("结果是生产仍在旧版本。");
     expect(transcript).toContain("发现配置没有生效。");
