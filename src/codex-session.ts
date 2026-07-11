@@ -561,6 +561,7 @@ export class CodexSessionService {
   private resetCodexClient(): void {
     const configOverrides: CodexConfigObject = {
       approval_policy: this.currentLaunchProfile.approvalPolicy,
+      features: { unified_exec: false },
     };
     const mcpServers: CodexConfigObject = {};
     const telegramTransportMcp = buildTelegramTransportMcpConfig(this.config);

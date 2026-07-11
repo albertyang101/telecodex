@@ -185,7 +185,7 @@ describe("CodexSessionService", () => {
       expect.objectContaining({
         codexPathOverride: "/opt/homebrew/bin/codex",
         apiKey: "codex-key",
-        config: { approval_policy: "never" },
+        config: { approval_policy: "never", features: { unified_exec: false } },
         env: expect.objectContaining({ CODEX_API_KEY: "codex-key" }),
       }),
     );
