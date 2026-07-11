@@ -689,6 +689,39 @@ class MailboxPromptAbortGraceError extends Error {
   }
 }
 
+interface ExistingTerminalReceipt {
+  status: string;
+  failureReason?: string;
+  recordedAt?: string;
+  messagePath?: string;
+}
+
+async function loadExistingTerminalReceipt(
+  settings: MailboxBridgeConfig,
+  message: MailboxMessage,
+): Promise<ExistingTerminalReceipt | null> {
+  try {
+    const parsed = JSON.parse(
+      await readFile(path.join(receiptsDir(settings, message.to), message.msgId + ".json"), "utf8"),
+    ) as Record<string, unknown>;
+    if (
+      parsed.msg_id !== message.msgId ||
+      typeof parsed.status !== "string" ||
+      parsed.status === MAILBOX_PROCESSING_STATUS
+    ) {
+      return null;
+    }
+    return {
+      status: parsed.status,
+      failureReason: typeof parsed.failure_reason === "string" ? parsed.failure_reason : undefined,
+      recordedAt: typeof parsed.recorded_at === "string" ? parsed.recorded_at : undefined,
+      messagePath: typeof parsed.message_path === "string" ? parsed.message_path : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function quarantineStaleMailboxClaims(
   settings: MailboxBridgeConfig,
   statePath: string,
@@ -702,28 +735,57 @@ async function quarantineStaleMailboxClaims(
     return 0;
   }
 
-  const failureReason = "interrupted_before_terminal_state";
+  const interruptedReason = "interrupted_before_terminal_state";
   for (const message of staleMessages) {
-    seen.messages[message.msgId] = {
-      processedAt: new Date().toISOString(),
-      from: message.from,
-      path: message.path,
-      status: MAILBOX_UNEXPECTED_FAILURE_STATUS,
-      failureReason,
-    };
-    await recordDeliveryReceipt(
-      settings,
-      message,
-      MAILBOX_UNEXPECTED_FAILURE_STATUS,
-      message.path,
-      failureReason,
+    const existingReceipt = await loadExistingTerminalReceipt(settings, message);
+    const failureReason = existingReceipt?.failureReason ?? (
+      existingReceipt ? undefined : interruptedReason
     );
-  }
-  await saveSeenState(statePath, seen);
-  for (const message of staleMessages) {
-    await ackDeliveryEvents(settings, message.msgId);
+    seen.messages[message.msgId] = {
+      processedAt: existingReceipt?.recordedAt ?? new Date().toISOString(),
+      from: message.from,
+      path: existingReceipt?.messagePath ?? message.path,
+      status: existingReceipt?.status ?? MAILBOX_UNEXPECTED_FAILURE_STATUS,
+      ...(failureReason ? { failureReason } : {}),
+    };
+
+    const persistenceErrors: string[] = [];
+    if (!existingReceipt) {
+      try {
+        await recordDeliveryReceipt(
+          settings,
+          message,
+          MAILBOX_UNEXPECTED_FAILURE_STATUS,
+          message.path,
+          interruptedReason,
+        );
+      } catch (receiptError) {
+        persistenceErrors.push(
+          "receipt: " + (receiptError instanceof Error ? receiptError.message : String(receiptError)),
+        );
+      }
+    }
+    try {
+      await saveSeenState(statePath, seen);
+    } catch (seenError) {
+      persistenceErrors.push(
+        "seen: " + (seenError instanceof Error ? seenError.message : String(seenError)),
+      );
+    }
+    try {
+      await ackDeliveryEvents(settings, message.msgId);
+    } catch (eventError) {
+      persistenceErrors.push(
+        "event: " + (eventError instanceof Error ? eventError.message : String(eventError)),
+      );
+    }
+
     console.error(
-      "mailbox message " + message.msgId + " quarantined from stale processing claim after restart",
+      (
+        existingReceipt
+          ? "mailbox message " + message.msgId + " restored from terminal receipt after stale claim"
+          : "mailbox message " + message.msgId + " quarantined from stale processing claim after restart"
+      ) + (persistenceErrors.length > 0 ? "; persistence warnings: " + persistenceErrors.join("; ") : ""),
     );
   }
   return staleMessages.length;

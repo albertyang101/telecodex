@@ -655,6 +655,155 @@ describe("mailbox bridge", () => {
     });
   });
 
+
+  it.each([
+    ["processed", undefined],
+    ["failed_unexpected", "codex turn.failed: original provider error"],
+  ])("recovers stale seen state from an existing %s receipt without overwriting terminal evidence", async (status, failureReason) => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const msgId = "stale-with-" + status;
+    const messagePath = writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId,
+      subject: "Recover terminal receipt",
+      body: "Do not overwrite the terminal receipt after restart.",
+    });
+    const stateDir = path.join(workspace, ".telecodex");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      path.join(stateDir, "mailbox_seen_albert-v3.json"),
+      JSON.stringify({
+        messages: {
+          [msgId]: {
+            processedAt: "2026-06-21T00:00:00.000Z",
+            from: "cody",
+            path: messagePath,
+            status: "processing",
+          },
+        },
+      }),
+      "utf8",
+    );
+    const receiptDir = path.join(
+      personasRoot,
+      "_shared",
+      "memory",
+      "mailbox",
+      "_receipts",
+      "albert-v3",
+    );
+    mkdirRecursive(receiptDir);
+    const receiptPath = path.join(receiptDir, msgId + ".json");
+    const terminalReceipt = {
+      msg_id: msgId,
+      from: "cody",
+      to: "albert-v3",
+      subject: "Recover terminal receipt",
+      sent_at: "2026-06-21T00:00:00Z",
+      status,
+      delivered_by: "telecodex-mailbox-bridge",
+      recorded_at: "2026-06-21T00:00:01.000Z",
+      message_path: messagePath,
+      failure_reason: failureReason,
+    };
+    writeFileSync(receiptPath, JSON.stringify(terminalReceipt), "utf8");
+
+    const session = createSession(async () => {
+      throw new Error("terminal receipt must prevent rerun");
+    });
+    expect(
+      await runMailboxDeliveryOnce(
+        createConfig({ personasRoot, workspace }),
+        createRegistry(session) as never,
+      ),
+    ).toEqual({ processed: 0, replied: 0, skipped: 1 });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(receiptPath, "utf8"))).toEqual(terminalReceipt);
+    const seen = JSON.parse(
+      readFileSync(path.join(stateDir, "mailbox_seen_albert-v3.json"), "utf8"),
+    );
+    expect(seen.messages[msgId]).toMatchObject({
+      status,
+      ...(failureReason ? { failureReason } : {}),
+    });
+    if (!failureReason) {
+      expect(seen.messages[msgId]).not.toHaveProperty("failureReason");
+    }
+  });
+
+  it("continues to a later message when stale-claim receipt persistence fails", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const stalePath = writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "stale-receipt-fails",
+      subject: "Broken stale receipt",
+      body: "This stale claim must not block the next message.",
+      sentAt: "2026-06-21T00:00:00Z",
+    });
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "later-after-stale",
+      subject: "Later message",
+      body: "Process this after isolating the stale claim.",
+      sentAt: "2026-06-21T00:00:01Z",
+    });
+    const stateDir = path.join(workspace, ".telecodex");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      path.join(stateDir, "mailbox_seen_albert-v3.json"),
+      JSON.stringify({
+        messages: {
+          "stale-receipt-fails": {
+            processedAt: "2026-06-21T00:00:00.000Z",
+            from: "cody",
+            path: stalePath,
+            status: "processing",
+          },
+        },
+      }),
+      "utf8",
+    );
+    const brokenReceiptPath = path.join(
+      personasRoot,
+      "_shared",
+      "memory",
+      "mailbox",
+      "_receipts",
+      "albert-v3",
+      "stale-receipt-fails.json",
+    );
+    mkdirRecursive(brokenReceiptPath);
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("later message processed");
+      callbacks.onAgentEnd();
+    });
+    const result = await runMailboxDeliveryOnce(
+      createConfig({ personasRoot, workspace, maxMessagesPerTick: 2 }),
+      createRegistry(session) as never,
+    );
+
+    expect(result).toEqual({ processed: 1, replied: 1, skipped: 1 });
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const seen = JSON.parse(
+      readFileSync(path.join(stateDir, "mailbox_seen_albert-v3.json"), "utf8"),
+    );
+    expect(seen.messages["stale-receipt-fails"]).toMatchObject({
+      status: "failed_unexpected",
+      failureReason: "interrupted_before_terminal_state",
+    });
+    expect(seen.messages["later-after-stale"].status).toBe("processed");
+  });
+
   it("claims a message before reply side effects so finalization failure cannot rerun the Codex turn", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
