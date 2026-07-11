@@ -929,6 +929,21 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
+      callbacks.onTextDelta("随后测试报告显示服务仍在旧版本。");
+      callbacks.onAgentMessage?.("随后测试报告显示服务仍在旧版本。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("随后测试任务已完成。");
+      callbacks.onAgentMessage?.("随后测试任务已完成。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("随后检查报告显示配置未生效。");
+      callbacks.onAgentMessage?.("随后检查报告显示配置未生效。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       callbacks.onTextDelta("随后检查配置是否生效。");
       callbacks.onAgentMessage?.("随后检查配置是否生效。", {
         isFinal: false,
@@ -985,6 +1000,9 @@ describe("createBot response delivery", () => {
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后发现服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试结果显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后检查结果显示配置未生效。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试报告显示服务仍在旧版本。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试任务已完成。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("随后检查报告显示配置未生效。"))).toHaveLength(1);
     expect(visibleReplyTexts.join("\n")).not.toContain("随后检查配置是否生效。");
     expect(visibleReplyTexts.join("\n")).not.toContain("我先检查第三份文件。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("结果是生产仍在旧版本。"))).toHaveLength(1);
@@ -1005,6 +1023,9 @@ describe("createBot response delivery", () => {
     expect(transcript).toContain("随后发现服务仍在旧版本。");
     expect(transcript).toContain("随后测试结果显示服务仍在旧版本。");
     expect(transcript).toContain("随后检查结果显示配置未生效。");
+    expect(transcript).toContain("随后测试报告显示服务仍在旧版本。");
+    expect(transcript).toContain("随后测试任务已完成。");
+    expect(transcript).toContain("随后检查报告显示配置未生效。");
     expect(transcript).not.toContain("随后检查配置是否生效。");
     expect(transcript).not.toContain("我先检查第三份文件。");
     expect(transcript).toContain("结果是生产仍在旧版本。");
