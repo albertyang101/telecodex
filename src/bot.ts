@@ -1142,8 +1142,10 @@ export function createBot(
       }
     };
 
-    const visibleCompletedAgentMessage = (text: string): string =>
-      stripVisibleSourceFooter(userVisibleText, stripVisiblePromptGuardEcho(text.trim()));
+    const visibleCompletedAgentMessage = (text: string): string => {
+      const visibleText = stripVisibleSourceFooter(userVisibleText, stripVisiblePromptGuardEcho(text.trim()));
+      return isObviousProcessNarration(visibleText) ? "" : visibleText;
+    };
 
     const deliverCompletedStreamMessage = async (visibleText: string): Promise<void> => {
       for (const chunk of splitMarkdownForTelegram(visibleText)) {
@@ -3075,6 +3077,26 @@ function renderSessionInfoPlain(info: CodexSessionInfo): string {
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
+}
+
+const PROCESS_NARRATION_PATTERNS = [
+  /^(?:收到[，,]?\s*)?(?:我)?先(?:把|去|来|开始|准备|做|改|跑|加|写|装|测|看|查|搜|找|确认|检查|研究|整理|读)/i,
+  /^(?:我)?现在(?:就)?(?:去|来|开始|准备|做|改|跑|加|写|装|测|看|查|合并|部署|修|派|启动|触发)/i,
+  /^(?:Now|Let me|I['’]?ll|I will|I am|I['’]?m|Going to|Next[,:]?)\s+(?:update|fix|add|write|run|merge|deploy|test|check|read|build)\b/i,
+];
+
+function isObviousProcessNarration(text: string): boolean {
+  const candidate = text.trim();
+  if (!candidate || candidate.length > 200 || candidate.includes("\n")) {
+    return false;
+  }
+  if (/[？?]/.test(candidate) || /(需要你|需要确认|请确认|你要不要)/.test(candidate)) {
+    return false;
+  }
+  if (/^(?:关键发现|阶段结果|进度|结果|阻塞|需要确认|已完成|已验证)[：:]/i.test(candidate)) {
+    return false;
+  }
+  return PROCESS_NARRATION_PATTERNS.some((pattern) => pattern.test(candidate));
 }
 
 function renderSessionInfoHTML(info: CodexSessionInfo): string {

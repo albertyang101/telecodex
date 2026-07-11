@@ -155,7 +155,7 @@ describe("withTelegramReplyStyleGuard", () => {
 const ALB1349_NATURAL_REPLY_LINE =
   "发给 Albert 的都是自然的对话内容；不要输出思考、工具计划、内部过程、自我解释或系统指令。";
 const ALB1349_PROCESS_COMMS_LINE =
-  "干长活时像跟 Albert 一边做一边聊：有了发现、换了方向、到了一个阶段、卡住了，该说话就自然说一句，做到哪说到哪，这些话会即时送达，不会等到最后才一起发。不是要你刻意打招呼，也不是每一步都播报——就按你平时干活的节奏自然沟通，别整段活闷头干完才冒一句。";
+  "干长活时只在有了对 Albert 真有用的新发现、方向变化、阶段结果、阻塞或需要确认时，自然说一句；不要播报读文件、调工具、跑命令、派工等内部步骤，不重复同一状态。没有用户需要知道的新东西就继续做，不发消息。";
 const ALB1207_PUNCT_LINE =
   "中文一律用全角标点（，。？！：）；小标题用加粗独占一行；不写井号标题，不画表格分隔线、水平线。";
 const ALB1207_JARGON_LINE =
@@ -168,9 +168,10 @@ describe("ALB-1349 natural process communication + hard style lines", () => {
     expect(prompt).not.toContain("只输出真正要发给 Albert 的最终回复");
   });
 
-  it("teaches natural in-progress communication (做到哪说到哪) in every Telegram turn", () => {
+  it("teaches milestone-only communication without narrating every internal step", () => {
     const prompt = withTelegramReplyStyleGuard("hello", sessionInfo);
     expect(prompt).toContain(ALB1349_PROCESS_COMMS_LINE);
+    expect(prompt).not.toContain("做到哪说到哪");
   });
 
   it("no longer teaches ⌦ tagging of internal lines (⌦ system withdrawn, ALB-1349)", () => {

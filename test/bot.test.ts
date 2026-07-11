@@ -1804,6 +1804,40 @@ describe("createBot response delivery", () => {
     expect(bot.api.sendMessage.mock.calls[1][1]).not.toContain("第一段进度。");
   });
 
+  it("drops obvious process narration but keeps useful milestone and final bubbles", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("我先去读文件、跑命令。");
+      callbacks.onAgentMessage?.("我先去读文件、跑命令。");
+      callbacks.onTextDelta("Let me run tests.");
+      callbacks.onAgentMessage?.("Let me run tests.");
+      callbacks.onTextDelta("关键发现：消息过密来自进度策略。");
+      callbacks.onAgentMessage?.("关键发现：消息过密来自进度策略。");
+      callbacks.onTextDelta("我先确认一下：你要不要保留这条提醒？");
+      callbacks.onAgentMessage?.("我先确认一下：你要不要保留这条提醒？");
+      callbacks.onTextDelta("已经按新口径收紧。");
+      callbacks.onAgentMessage?.("已经按新口径收紧。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 13, text: "继续处理" },
+      api: bot.api,
+    });
+
+    const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(visible).not.toContain("我先去读文件、跑命令。");
+    expect(visible).not.toContain("Let me run tests.");
+    expect(visible).toContain("关键发现：消息过密来自进度策略。");
+    expect(visible).toContain("我先确认一下：你要不要保留这条提醒？");
+    expect(visible).toContain("已经按新口径收紧。");
+  });
+
   it("continues with later streaming messages after a long-message chunk fails", async () => {
     const longProgress = "阶段".repeat(2_100);
     const session = createSession(async (callbacks) => {
