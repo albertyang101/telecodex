@@ -2,7 +2,7 @@
 
 Date: 2026-07-12 AEST
 Branch: alb-1201-unified-parity
-Reviewed code head: 860b5c6
+Reviewed code head: aba3024
 Control plane: Linear ALB-1201 with child evidence in ALB-747, ALB-1379, and ALB-1388
 
 ## Integrated contracts
@@ -32,7 +32,7 @@ The integration was driven by failing tests at the earliest reliable boundaries.
 
 ## Fresh GREEN evidence
 
-- Full test suite at reviewed code head 860b5c6: 38 files, 720 tests passed, 0 failed.
+- Full test suite at reviewed code head aba3024: 38 files, 720 tests passed, 0 failed.
 - Focused output review suite: 147 passed.
 - Focused mailbox review suite: 86 passed.
 - TypeScript build: passed.
@@ -44,8 +44,8 @@ The integration was driven by failing tests at the earliest reliable boundaries.
 
 - Graphify gate: Critical 0, Important 0.
 - Mailbox claim and receipt recovery: Critical 0, Important 0, Minor 0, Ready.
-- Output lifecycle on 860b5c6: Critical 0, Important 0, Minor 0, Ready.
-- Ada independently found additional output edge cases that the general reviewer missed; all are now explicit RED/GREEN tests. Her exact-head final sign-off remains a deployment gate.
+- Output lifecycle on aba3024: Critical 0, Important 0, Minor 0, Ready.
+- Ada independently found additional output edge cases that the general reviewer missed; all findings received through 1594ceb are covered by later RED/GREEN tests. Her exact aba3024 sign-off remains a deployment gate.
 
 ## Deployment, rollback, and remaining gates
 
