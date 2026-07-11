@@ -119,6 +119,21 @@ export type TeleCodexBot = Bot<Context> & {
 export function formatTelegramIngressAuditLine(ctx: Context, authorized: boolean): string {
   const updateId = (ctx.update as { update_id?: number } | undefined)?.update_id ?? "unknown";
   const updateType = ctx.message ? "message" : ctx.callbackQuery ? "callback_query" : "unknown";
+  const contentType = ctx.message
+    ? ctx.message.photo
+      ? "photo"
+      : ctx.message.document
+        ? "document"
+        : ctx.message.voice
+          ? "voice"
+          : ctx.message.audio
+            ? "audio"
+            : ctx.message.text
+              ? "text"
+              : "other"
+    : ctx.callbackQuery
+      ? "callback"
+      : "unknown";
   const fromId = ctx.from?.id ?? "unknown";
   const chatId = ctx.chat?.id ?? "unknown";
   const chatType = ctx.chat?.type ?? "unknown";
@@ -126,6 +141,7 @@ export function formatTelegramIngressAuditLine(ctx: Context, authorized: boolean
   return [
     `Telegram ingress update_id=${updateId}`,
     `type=${updateType}`,
+    `content=${contentType}`,
     `from_id=${fromId}`,
     `chat_id=${chatId}`,
     `chat_type=${chatType}`,
