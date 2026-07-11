@@ -3141,6 +3141,17 @@ function recoverableIntermediateUpdate(text: string): string {
       ].join("\n").trim();
     }
 
+    const completedProcessClause = head.match(/^(.+?[，,；;。.!：:])\s*(.+)$/);
+    if (
+      completedProcessClause?.[1] &&
+      completedProcessClause[2] &&
+      /(?:看|查看|查|检查|确认|跑|读|做|处理|核实|测试)(?:完)?了/.test(completedProcessClause[1])
+    ) {
+      return recoverableIntermediateUpdate(
+        [completedProcessClause[2], ...lines.slice(index + 1)].join("\n"),
+      );
+    }
+
     if (/了[。！？!?]?$/.test(head) && !/一下[。！？!?]?$/.test(head)) {
       return lines.slice(index).join("\n").trim();
     }
