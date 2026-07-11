@@ -213,6 +213,24 @@ describe("thread-rotation", () => {
     });
   });
 
+  describe("Linear control-plane extraction", () => {
+    it("collects stable refs from recent, unanswered, and interrupted sources", () => {
+      const state = {
+        buffer: [
+          { role: "user" as const, text: "主单 ALB-1201" },
+          { role: "assistant" as const, text: "子单 alb-958，重复 ALB-1201" },
+        ],
+        pendingRotation: true,
+        interruptedTurn: "最后断点 ALB-1350",
+      };
+      const out = takeRotationHandoff(state, cfg, { unanswered: ["排队 ALB-1208"] });
+      expect(out.handoff).toContain("--- Linear 在途控制面 ---");
+      expect(out.handoff).toContain("ALB-1201, ALB-958, ALB-1208, ALB-1350");
+      const control = out.handoff?.split("\n").find((line) => line.startsWith("- refs:")) ?? "";
+      expect(control.match(/ALB-1201/g)).toHaveLength(1);
+    });
+  });
+
   describe("unanswered snapshot pass-through (ALB-1205)", () => {
     it("renders caller-provided unanswered messages into the handoff", () => {
       const s = recordTurn(emptyChatState(), { userText: "重活", assistantText: "ok", lastInputTokens: HEAVY }, cfg);

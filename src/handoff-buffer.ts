@@ -79,6 +79,8 @@ export interface HandoffContext {
   reason: HandoffReason;
   /** Last known context fill ratio, rendered as a percentage when present. */
   ratio?: number;
+  /** Stable Linear issue identifiers needed to restore the active control plane. */
+  linearIssues?: string[];
   /** Verbatim queued-but-unanswered user messages, oldest first. */
   unanswered?: string[];
   /** Verbatim user text of the turn that was aborted mid-answer, if any. */
@@ -152,6 +154,18 @@ export function renderHandoff(
   const contextSections: string[] = [];
   if (context) {
     contextSections.push(reasonLine(context), RECOVERY_GUIDANCE);
+
+    const linearIssues = [...new Set((context.linearIssues ?? [])
+      .map((issue) => normalize(issue).toUpperCase())
+      .filter((issue) => /^ALB-\d+$/.test(issue)))]
+      .slice(0, 20);
+    if (linearIssues.length > 0) {
+      contextSections.push(
+        "--- Linear 在途控制面 ---\n" +
+        "- refs: " + linearIssues.join(", ") + "\n" +
+        "- 必须逐张读取 issue/comments/status/close criteria，再沿真实断点续做。",
+      );
+    }
 
     const interruptedText = normalize(context.interruptedTurn ?? "");
     const interruptedSection = interruptedText

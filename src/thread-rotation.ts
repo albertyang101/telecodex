@@ -175,6 +175,32 @@ export interface TakeRotationHandoffExtras {
  * `pendingRotation`, `pendingMandatory`, and `interruptedTurn` are all consumed
  * together. Idempotent: a second call after clearing returns null.
  */
+const LINEAR_ISSUE_RE = /\bALB-\d+\b/gi;
+const MAX_LINEAR_ISSUES = 20;
+
+function collectLinearIssues(state: ChatRotationState, extras: TakeRotationHandoffExtras): string[] {
+  const texts = [
+    ...state.buffer.map((entry) => entry.text),
+    ...(extras.unanswered ?? []),
+    state.interruptedTurn ?? "",
+  ];
+  const issues: string[] = [];
+  const seen = new Set<string>();
+  for (const text of texts) {
+    for (const match of text.matchAll(LINEAR_ISSUE_RE)) {
+      const issue = match[0].toUpperCase();
+      if (!seen.has(issue)) {
+        seen.add(issue);
+        issues.push(issue);
+        if (issues.length >= MAX_LINEAR_ISSUES) {
+          return issues;
+        }
+      }
+    }
+  }
+  return issues;
+}
+
 export function takeRotationHandoff(
   state: ChatRotationState,
   cfg: RotationConfig,
@@ -189,6 +215,7 @@ export function takeRotationHandoff(
   const context: HandoffContext = {
     reason,
     ratio: state.lastKnownRatio,
+    linearIssues: collectLinearIssues(state, extras),
     unanswered: extras.unanswered,
     interruptedTurn,
   };

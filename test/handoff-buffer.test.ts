@@ -159,6 +159,20 @@ describe("handoff-buffer", () => {
       expect(out).toContain("Linear");
     });
 
+    it("renders explicit deduplicated Linear control-plane refs before unfinished work", () => {
+      const out = renderHandoff([], {
+        reason: "threshold",
+        linearIssues: ["ALB-1201", "alb-958", "ALB-1201"],
+        unanswered: ["继续 ALB-1208"],
+      });
+      expect(out).toContain("--- Linear 在途控制面 ---");
+      expect(out).toContain("ALB-1201");
+      expect(out).toContain("ALB-958");
+      expect(out.match(/ALB-1201/g)).toHaveLength(1);
+      expect(out).toContain("issue/comments/status/close criteria");
+      expect(out.indexOf("Linear 在途控制面")).toBeLessThan(out.indexOf("未答消息"));
+    });
+
     it("renders each unanswered message verbatim under a 未答消息 section", () => {
       const out = renderHandoff(sample, {
         reason: "threshold",
