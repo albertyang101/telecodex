@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,9 @@ describe("Codex Bot builder role bundles", () => {
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 
     expect(manifest.version).toBe(1);
+    expect(manifest.roles.developer.default_bundles).toContain("core-discipline");
+    expect(manifest.roles["albert-personal"].default_bundles).toContain("core-discipline");
+    expect(manifest.roles["family-personal"].default_bundles).toContain("core-discipline");
     expect(manifest.roles.developer.default_bundles).toContain("graphify");
     expect(manifest.roles["albert-personal"].default_bundles).not.toContain("graphify");
     expect(manifest.roles["family-personal"].default_bundles).not.toContain("graphify");
@@ -49,7 +52,8 @@ describe("Codex Bot builder role bundles", () => {
         readFileSync(join(workspace, ".codex/role-bundles.json"), "utf8"),
       );
       expect(receipt.role).toBe("developer");
-      expect(receipt.installed_bundles).toEqual(["graphify"]);
+      expect(receipt.installed_bundles).toEqual(["core-discipline", "graphify"]);
+      expect(readFileSync(join(codexHome, "hooks.json"), "utf8")).toContain("codex-core-discipline-turn-context.py");
     } finally {
       rmSync(fixture, { recursive: true, force: true });
     }
@@ -66,17 +70,38 @@ describe("Codex Bot builder role bundles", () => {
 
         expect(result.status).toBe(0);
         expect(existsSync(join(codexHome, "skills/graphify/SKILL.md"))).toBe(false);
-        expect(existsSync(join(codexHome, "hooks.json"))).toBe(false);
+        expect(existsSync(join(codexHome, "hooks.json"))).toBe(true);
+        const hooks = readFileSync(join(codexHome, "hooks.json"), "utf8");
+        expect(hooks).toContain("codex-core-discipline-turn-context.py");
+        expect(hooks).not.toContain("graphify");
         const receipt = JSON.parse(
           readFileSync(join(workspace, ".codex/role-bundles.json"), "utf8"),
         );
         expect(receipt.role).toBe(role);
-        expect(receipt.installed_bundles).toEqual([]);
+        expect(receipt.installed_bundles).toEqual(["core-discipline"]);
       } finally {
         rmSync(fixture, { recursive: true, force: true });
       }
     },
   );
+
+  it("fails closed on unmanaged hooks without partially installing core files", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "codex-role-unmanaged-hooks-"));
+    const codexHome = join(fixture, "codex-home");
+    const workspace = join(fixture, "workspace");
+    const hooksPath = join(codexHome, "hooks.json");
+    try {
+      mkdirSync(codexHome, { recursive: true });
+      writeFileSync(hooksPath, JSON.stringify({ hooks: { Stop: [] } }), { encoding: "utf8", flag: "w" });
+      const before = readFileSync(hooksPath, "utf8");
+      const result = runInstaller("family-personal", codexHome, workspace);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("unmanaged hooks");
+      expect(readFileSync(hooksPath, "utf8")).toBe(before);
+      expect(existsSync(join(codexHome, "hooks/core-discipline/codex-core-discipline-turn-context.py"))).toBe(false);
+      expect(existsSync(join(workspace, ".codex/role-bundles.json"))).toBe(false);
+    } finally { rmSync(fixture, { recursive: true, force: true }); }
+  });
 
   it("fails closed when the shared role manifest names an unsupported bundle", () => {
     const fixture = mkdtempSync(join(tmpdir(), "codex-role-unknown-bundle-"));
@@ -117,12 +142,14 @@ describe("Codex Bot builder role bundles", () => {
       expect(runInstaller("developer", codexHome, workspace).status).toBe(0);
       const first = [
         readFileSync(join(codexHome, "hooks.json"), "utf8"),
+        readFileSync(join(codexHome, "hooks/core-discipline/codex-core-discipline-turn-context.py"), "utf8"),
         readFileSync(join(workspace, ".codex/graphify-install.json"), "utf8"),
         readFileSync(join(workspace, ".codex/role-bundles.json"), "utf8"),
       ];
       expect(runInstaller("developer", codexHome, workspace).status).toBe(0);
       const second = [
         readFileSync(join(codexHome, "hooks.json"), "utf8"),
+        readFileSync(join(codexHome, "hooks/core-discipline/codex-core-discipline-turn-context.py"), "utf8"),
         readFileSync(join(workspace, ".codex/graphify-install.json"), "utf8"),
         readFileSync(join(workspace, ".codex/role-bundles.json"), "utf8"),
       ];

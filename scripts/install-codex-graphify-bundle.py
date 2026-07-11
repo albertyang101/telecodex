@@ -120,6 +120,7 @@ def main() -> int:
     parser.add_argument("--codex-home", required=True)
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--role", required=True)
+    parser.add_argument("--skip-hooks", action="store_true")
     args = parser.parse_args()
 
     if args.role != "developer":
@@ -143,7 +144,7 @@ def main() -> int:
         turn_context = codex_home / "hooks/graphify/codex-graphify-turn-context.py"
         hooks_path = codex_home / "hooks.json"
         rendered_hooks = hooks_document(policy, turn_context)
-        if hooks_path.exists() and hooks_path.read_bytes() != rendered_hooks:
+        if not args.skip_hooks and hooks_path.exists() and hooks_path.read_bytes() != rendered_hooks:
             raise ValueError("target CODEX_HOME/hooks.json already contains unmanaged hooks")
 
         installed = {}
@@ -154,8 +155,9 @@ def main() -> int:
             atomic_write(target, data, int(entry["mode"], 8))
             installed[str(target)] = digest(data)
 
-        atomic_write(hooks_path, rendered_hooks, 0o600)
-        installed[str(hooks_path)] = digest(rendered_hooks)
+        if not args.skip_hooks:
+            atomic_write(hooks_path, rendered_hooks, 0o600)
+            installed[str(hooks_path)] = digest(rendered_hooks)
 
         receipt = {
             "version": 1,

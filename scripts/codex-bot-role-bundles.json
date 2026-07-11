@@ -3,14 +3,19 @@
   "roles": {
     "developer": {
       "default_bundles": [
+        "core-discipline",
         "graphify"
       ]
     },
     "albert-personal": {
-      "default_bundles": []
+      "default_bundles": [
+        "core-discipline"
+      ]
     },
     "family-personal": {
-      "default_bundles": []
+      "default_bundles": [
+        "core-discipline"
+      ]
     }
   }
 }
