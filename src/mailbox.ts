@@ -57,6 +57,8 @@ export interface MailboxRecoveryOptions {
 }
 
 const MAILBOX_PROMPT_TIMEOUT_STATUS = "failed_prompt_timeout";
+const MAILBOX_UNEXPECTED_FAILURE_STATUS = "failed_unexpected";
+const MAILBOX_PROCESSING_STATUS = "processing";
 
 export async function runMailboxDeliveryOnce(
   config: TeleCodexConfig,
@@ -126,74 +128,64 @@ export async function runMailboxDeliveryOnce(
       break;
     }
 
-    // Rotate before the turn when a prior turn crossed the threshold; otherwise
-    // keep the existing thread (opening one only if none is active yet).
-    let rotationHandoff: string | null = null;
-    if (rotationCfg.enabled) {
-      const unanswered = messages.slice(index + 1).map(mailboxTurnDescriptor);
-      const taken = takeRotationHandoff(rotationState, rotationCfg, { unanswered });
-      if (taken.handoff) {
-        // A mandatory (hard-cap) rotation must not fall back to the over-cap thread:
-        // try once more before giving up, and if it still fails, refuse this turn and
-        // leave the message for a later tick. The pending rotation is preserved because
-        // taken.state is only adopted on success. Mirrors the Telegram path (ALB-1205).
-        const maxNewThreadAttempts = taken.mandatory ? 2 : 1;
-        let rotated = false;
-        let lastNewThreadError: unknown;
-        for (let attempt = 0; attempt < maxNewThreadAttempts; attempt += 1) {
-          try {
-            await session.newThread();
-            rotated = true;
-            break;
-          } catch (error) {
-            lastNewThreadError = error;
-          }
-        }
-        if (rotated) {
-          rotationState = taken.state;
-          rotationHandoff = taken.handoff;
-          persistRotationState();
-          // Observable rotation (ALB-1205 A7): the Telegram path logs "Auto-rotated";
-          // the mailbox path — where worker bots spend most turns — rotated silently,
-          // leaving prod monitoring blind to the main rotation path. Log symmetrically.
-          console.error(
-            `Auto-rotated Codex mailbox thread for ${contextKey} on context pressure (ALB-1205).`,
-          );
-        } else if (taken.mandatory) {
-          console.error(
-            "mailbox mandatory auto-rotation newThread failed; deferring the message rather than running it on the over-cap thread (ALB-1205):",
-            lastNewThreadError instanceof Error ? lastNewThreadError.message : String(lastNewThreadError),
-          );
-          skipped += 1;
-          break;
-        } else {
-          console.error(
-            "mailbox auto-rotation newThread failed; continuing on the existing thread:",
-            lastNewThreadError instanceof Error ? lastNewThreadError.message : String(lastNewThreadError),
-          );
-          if (!session.hasActiveThread()) {
+    await claimMailboxMessage(statePath, seen, message);
+    let deliveryError: unknown;
+
+    try {
+      // Rotate before the turn when a prior turn crossed the threshold; otherwise
+      // keep the existing thread (opening one only if none is active yet).
+      let rotationHandoff: string | null = null;
+      if (rotationCfg.enabled) {
+        const unanswered = messages.slice(index + 1).map(mailboxTurnDescriptor);
+        const taken = takeRotationHandoff(rotationState, rotationCfg, { unanswered });
+        if (taken.handoff) {
+          // A mandatory (hard-cap) rotation must not fall back to the over-cap thread:
+          // try once more before giving up, and if it still fails, refuse this turn and
+          // leave the message for a later tick. The pending rotation is preserved because
+          // taken.state is only adopted on success. Mirrors the Telegram path (ALB-1205).
+          const maxNewThreadAttempts = taken.mandatory ? 2 : 1;
+          let rotated = false;
+          let lastNewThreadError: unknown;
+          for (let attempt = 0; attempt < maxNewThreadAttempts; attempt += 1) {
             try {
               await session.newThread();
-            } catch (error) {
-              console.error(
-                "mailbox fallback newThread failed; deferring the message (ALB-1205):",
-                error instanceof Error ? error.message : String(error),
-              );
-              skipped += 1;
+              rotated = true;
               break;
+            } catch (error) {
+              lastNewThreadError = error;
             }
           }
+          if (rotated) {
+            rotationState = taken.state;
+            rotationHandoff = taken.handoff;
+            persistRotationState();
+            console.error(
+              `Auto-rotated Codex mailbox thread for ${contextKey} on context pressure (ALB-1205).`,
+            );
+          } else if (taken.mandatory) {
+            console.error(
+              "mailbox mandatory auto-rotation newThread failed; deferring the message rather than running it on the over-cap thread (ALB-1205):",
+              lastNewThreadError instanceof Error ? lastNewThreadError.message : String(lastNewThreadError),
+            );
+            await releaseMailboxClaim(statePath, seen, message);
+            skipped += 1;
+            break;
+          } else {
+            console.error(
+              "mailbox auto-rotation newThread failed; continuing on the existing thread:",
+              lastNewThreadError instanceof Error ? lastNewThreadError.message : String(lastNewThreadError),
+            );
+            if (!session.hasActiveThread()) {
+              await session.newThread();
+            }
+          }
+        } else if (!session.hasActiveThread()) {
+          await session.newThread();
         }
       } else if (!session.hasActiveThread()) {
         await session.newThread();
       }
-    } else if (!session.hasActiveThread()) {
-      await session.newThread();
-    }
 
-    let finalText: string;
-    let turnUsage: { inputTokens: number } | undefined;
-    try {
       const outcome = await promptMailboxMessage(
         session,
         message,
@@ -201,12 +193,52 @@ export async function runMailboxDeliveryOnce(
         abortGraceMs,
         rotationHandoff,
       );
-      finalText = outcome.text;
-      turnUsage = outcome.usage;
-    } catch (error) {
-      if (!(error instanceof MailboxPromptTimeoutError)) {
-        throw error;
+      const finalText = outcome.text;
+      const turnUsage = outcome.usage;
+
+      if (rotationCfg.enabled) {
+        rotationState = recordTurn(
+          rotationState,
+          { userText: mailboxTurnDescriptor(message), assistantText: finalText, lastInputTokens: turnUsage?.inputTokens },
+          rotationCfg,
+        );
+        persistRotationState();
       }
+
+      if (shouldWriteReply(settings, message, finalText)) {
+        await sendMailboxReply(settings, message, finalText.trim());
+        replied += 1;
+      }
+
+      const archivePath = await archiveInboxMessage(settings, message);
+      await recordDeliveryReceipt(settings, message, "processed", archivePath);
+      await ackDeliveryEvents(settings, message.msgId);
+      seen.messages[message.msgId] = {
+        processedAt: new Date().toISOString(),
+        from: message.from,
+        path: archivePath,
+        status: "processed",
+      };
+      await saveSeenState(statePath, seen);
+      await unlink(message.path).catch(() => undefined);
+      try {
+        registry.updateMetadata(contextKey, session);
+      } catch (error) {
+        console.error(
+          "mailbox registry metadata update failed after durable completion:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      processed += 1;
+    } catch (error) {
+      deliveryError = error;
+    }
+
+    if (!deliveryError) {
+      continue;
+    }
+
+    if (deliveryError instanceof MailboxPromptTimeoutError) {
       // A turn cut short by the timeout on an already-heavy thread becomes a
       // rotation breakpoint: the next thread's HANDOFF resumes it (ALB-1205).
       let retryInterruptedMessage = false;
@@ -215,41 +247,28 @@ export async function runMailboxDeliveryOnce(
         retryInterruptedMessage = rotationState.interruptedAttempts === 1;
         persistRotationState();
       }
-      if (!retryInterruptedMessage) {
+      if (retryInterruptedMessage) {
+        await releaseMailboxClaim(statePath, seen, message);
+      } else {
         await quarantineTimedOutMailboxMessage(settings, statePath, seen, message);
       }
-      error.startAbortGrace(onFatalRecovery);
+      deliveryError.startAbortGrace(onFatalRecovery);
       registry.updateMetadata(contextKey, session);
       skipped += 1;
       break;
     }
 
-    if (rotationCfg.enabled) {
-      rotationState = recordTurn(
-        rotationState,
-        { userText: mailboxTurnDescriptor(message), assistantText: finalText, lastInputTokens: turnUsage?.inputTokens },
-        rotationCfg,
+    await quarantineUnexpectedMailboxMessage(settings, statePath, seen, message, deliveryError);
+    try {
+      registry.updateMetadata(contextKey, session);
+    } catch (error) {
+      console.error(
+        "mailbox registry metadata update failed after unexpected quarantine:",
+        error instanceof Error ? error.message : String(error),
       );
-      persistRotationState();
     }
-
-    if (shouldWriteReply(settings, message, finalText)) {
-      await sendMailboxReply(settings, message, finalText.trim());
-      replied += 1;
-    }
-
-    const archivePath = await archiveInboxMessage(settings, message);
-    await recordDeliveryReceipt(settings, message, "processed", archivePath);
-    await ackDeliveryEvents(settings, message.msgId);
-    seen.messages[message.msgId] = {
-      processedAt: new Date().toISOString(),
-      from: message.from,
-      path: archivePath,
-    };
-    await saveSeenState(statePath, seen);
-    await unlink(message.path).catch(() => undefined);
-    registry.updateMetadata(contextKey, session);
-    processed += 1;
+    skipped += 1;
+    break;
   }
 
   return { processed, replied, skipped };
@@ -652,6 +671,73 @@ class MailboxPromptAbortGraceError extends Error {
     super(`Mailbox Codex turn remained active after timeout abort grace (${timeoutMs}ms timeout, ${abortGraceMs}ms grace)`);
     this.name = "MailboxPromptAbortGraceError";
   }
+}
+
+async function claimMailboxMessage(
+  statePath: string,
+  seen: SeenState,
+  message: MailboxMessage,
+): Promise<void> {
+  seen.messages[message.msgId] = {
+    processedAt: new Date().toISOString(),
+    from: message.from,
+    path: message.path,
+    status: MAILBOX_PROCESSING_STATUS,
+  };
+  await saveSeenState(statePath, seen);
+}
+
+async function releaseMailboxClaim(
+  statePath: string,
+  seen: SeenState,
+  message: MailboxMessage,
+): Promise<void> {
+  delete seen.messages[message.msgId];
+  await saveSeenState(statePath, seen);
+}
+
+async function quarantineUnexpectedMailboxMessage(
+  settings: MailboxBridgeConfig,
+  statePath: string,
+  seen: SeenState,
+  message: MailboxMessage,
+  error: unknown,
+): Promise<void> {
+  const errorText = error instanceof Error ? error.message : String(error);
+  seen.messages[message.msgId] = {
+    processedAt: new Date().toISOString(),
+    from: message.from,
+    path: message.path,
+    status: MAILBOX_UNEXPECTED_FAILURE_STATUS,
+  };
+
+  const persistenceErrors: string[] = [];
+  try {
+    await recordDeliveryReceipt(settings, message, MAILBOX_UNEXPECTED_FAILURE_STATUS, message.path);
+  } catch (receiptError) {
+    persistenceErrors.push(
+      `receipt: ${receiptError instanceof Error ? receiptError.message : String(receiptError)}`,
+    );
+  }
+  try {
+    await saveSeenState(statePath, seen);
+  } catch (seenError) {
+    persistenceErrors.push(
+      `seen: ${seenError instanceof Error ? seenError.message : String(seenError)}`,
+    );
+  }
+  try {
+    await ackDeliveryEvents(settings, message.msgId);
+  } catch (eventError) {
+    persistenceErrors.push(
+      `event: ${eventError instanceof Error ? eventError.message : String(eventError)}`,
+    );
+  }
+
+  console.error(
+    `mailbox message ${message.msgId} quarantined after unexpected failure: ${errorText}` +
+      (persistenceErrors.length > 0 ? `; persistence warnings: ${persistenceErrors.join("; ")}` : ""),
+  );
 }
 
 async function quarantineTimedOutMailboxMessage(

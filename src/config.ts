@@ -20,6 +20,8 @@ import {
   resolveHardCap,
 } from "./rotation-policy.js";
 
+const DEFAULT_MAILBOX_PROMPT_TIMEOUT_MS = 120_000;
+
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
 export type CodexReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -421,10 +423,11 @@ function parseMailboxBridgeConfig(): MailboxBridgeConfig {
       "MAILBOX_MAX_MESSAGES_PER_TICK",
     ),
     minSentAt: parseMailboxMinSentAt(optionalString(process.env.MAILBOX_MIN_SENT_AT)),
-    promptTimeoutMs: parseOptionalPositiveIntegerEnv(
-      optionalString(process.env.MAILBOX_PROMPT_TIMEOUT_MS),
-      "MAILBOX_PROMPT_TIMEOUT_MS",
-    ),
+    promptTimeoutMs:
+      parseOptionalPositiveIntegerEnv(
+        optionalString(process.env.MAILBOX_PROMPT_TIMEOUT_MS),
+        "MAILBOX_PROMPT_TIMEOUT_MS",
+      ) ?? DEFAULT_MAILBOX_PROMPT_TIMEOUT_MS,
   };
 }
 

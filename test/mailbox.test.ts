@@ -481,6 +481,171 @@ describe("mailbox bridge", () => {
     expect(existsSync(path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox"))).toBe(false);
   });
 
+  it("quarantines a non-timeout Codex failure once so a bad message cannot starve the next one", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    for (const [msgId, sentAt] of [
+      ["fatal-first", "2026-06-21T00:00:00Z"],
+      ["second-ok-after-fatal", "2026-06-21T00:00:01Z"],
+    ] as const) {
+      writeMailboxMessage({
+        personasRoot,
+        sender: "cody",
+        recipient: "albert-v3",
+        msgId,
+        sentAt,
+        subject: msgId,
+        body: msgId,
+      });
+      writeDeliveryEvent({
+        personasRoot,
+        sender: "cody",
+        recipient: "albert-v3",
+        msgId,
+        sentAt,
+        subject: msgId,
+        messagePath: "unused",
+      });
+    }
+
+    const session = createSession(async (input, callbacks) => {
+      if (String(input).includes("msg_id: fatal-first")) {
+        throw new Error("codex turn.failed");
+      }
+      callbacks.onAgentMessage?.("later message processed");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const config = createConfig({ personasRoot, workspace });
+
+    expect(await runMailboxDeliveryOnce(config, registry as never)).toEqual({
+      processed: 0,
+      replied: 0,
+      skipped: 1,
+    });
+    expect(await runMailboxDeliveryOnce(config, registry as never)).toEqual({
+      processed: 1,
+      replied: 1,
+      skipped: 0,
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    const seen = JSON.parse(
+      readFileSync(path.join(workspace, ".telecodex", "mailbox_seen_albert-v3.json"), "utf8"),
+    );
+    expect(seen.messages["fatal-first"].status).toBe("failed_unexpected");
+    const receipt = JSON.parse(
+      readFileSync(
+        path.join(
+          personasRoot,
+          "_shared",
+          "memory",
+          "mailbox",
+          "_receipts",
+          "albert-v3",
+          "fatal-first.json",
+        ),
+        "utf8",
+      ),
+    );
+    expect(receipt.status).toBe("failed_unexpected");
+  });
+
+  it("claims a message before reply side effects so finalization failure cannot rerun the Codex turn", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "claimed-before-reply",
+      subject: "Claim before reply",
+      body: "Reply exactly once even if receipt persistence fails.",
+    });
+    const brokenReceiptDir = path.join(
+      personasRoot,
+      "_shared",
+      "memory",
+      "mailbox",
+      "_receipts",
+      "albert-v3",
+    );
+    mkdirRecursive(path.dirname(brokenReceiptDir));
+    writeFileSync(brokenReceiptDir, "not a directory", "utf8");
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("one reply only");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const config = createConfig({ personasRoot, workspace });
+
+    expect(await runMailboxDeliveryOnce(config, registry as never)).toEqual({
+      processed: 0,
+      replied: 1,
+      skipped: 1,
+    });
+
+    rmSync(brokenReceiptDir, { force: true });
+    mkdirRecursive(brokenReceiptDir);
+    expect(await runMailboxDeliveryOnce(config, registry as never)).toEqual({
+      processed: 0,
+      replied: 0,
+      skipped: 0,
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const replies = await readdir(
+      path.join(personasRoot, "_shared", "memory", "mailbox", "cody", "inbox"),
+    );
+    expect(replies).toHaveLength(1);
+    const seen = JSON.parse(
+      readFileSync(path.join(workspace, ".telecodex", "mailbox_seen_albert-v3.json"), "utf8"),
+    );
+    expect(seen.messages["claimed-before-reply"].status).toBe("failed_unexpected");
+  });
+
+  it("quarantines a newThread failure before moving on to a later message", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    for (const [msgId, sentAt] of [
+      ["new-thread-fails", "2026-06-21T00:00:00Z"],
+      ["new-thread-recovers", "2026-06-21T00:00:01Z"],
+    ] as const) {
+      writeMailboxMessage({
+        personasRoot,
+        sender: "cody",
+        recipient: "albert-v3",
+        msgId,
+        sentAt,
+        subject: msgId,
+        body: msgId,
+      });
+    }
+
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("thread recovered");
+      callbacks.onAgentEnd();
+    });
+    session.hasActiveThread.mockReturnValue(false);
+    session.newThread.mockRejectedValueOnce(new Error("session.newThread failed")).mockResolvedValue(undefined);
+    const registry = createRegistry(session);
+    const config = createConfig({ personasRoot, workspace });
+
+    expect(await runMailboxDeliveryOnce(config, registry as never)).toEqual({
+      processed: 0,
+      replied: 0,
+      skipped: 1,
+    });
+    expect(await runMailboxDeliveryOnce(config, registry as never)).toEqual({
+      processed: 1,
+      replied: 1,
+      skipped: 0,
+    });
+    expect(session.newThread).toHaveBeenCalledTimes(2);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
   it("quarantines a stuck mailbox Codex turn without archiving or marking the message read", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
@@ -764,7 +929,7 @@ describe("mailbox bridge", () => {
     expect(onFatalRecovery).not.toHaveBeenCalled();
   });
 
-  it("does not start mailbox fatal recovery when timeout seen-state persistence fails", async () => {
+  it("does not start a mailbox turn when durable claim persistence fails", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
     writeMailboxMessage({
@@ -795,21 +960,7 @@ describe("mailbox bridge", () => {
     ).rejects.toThrow();
     await delay(10);
 
-    const receipt = JSON.parse(
-      readFileSync(
-        path.join(
-          personasRoot,
-          "_shared",
-          "memory",
-          "mailbox",
-          "_receipts",
-          "albert-v3",
-          "seen-fails-before-fatal.json",
-        ),
-        "utf8",
-      ),
-    );
-    expect(receipt.status).toBe("failed_prompt_timeout");
+    expect(session.prompt).not.toHaveBeenCalled();
     expect(onFatalRecovery).not.toHaveBeenCalled();
   });
 
@@ -1022,7 +1173,7 @@ describe("mailbox bridge", () => {
     expect(replyText).not.toContain("sent_at: 2026-06-21T00:00:00Z");
   });
 
-  it("keeps the inbox message recoverable if receipt persistence fails after archive copy", async () => {
+  it("keeps the inbox message for audit and marks it failed if receipt persistence breaks after archive copy", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");
     const inboundPath = writeMailboxMessage({
@@ -1049,9 +1200,9 @@ describe("mailbox bridge", () => {
       callbacks.onAgentEnd();
     });
 
-    await expect(
-      runMailboxDeliveryOnce(createConfig({ personasRoot, workspace }), createRegistry(session) as never),
-    ).rejects.toThrow();
+    expect(
+      await runMailboxDeliveryOnce(createConfig({ personasRoot, workspace }), createRegistry(session) as never),
+    ).toEqual({ processed: 0, replied: 0, skipped: 1 });
 
     expect(existsSync(inboundPath)).toBe(true);
     expect(
@@ -1068,7 +1219,10 @@ describe("mailbox bridge", () => {
         ),
       ),
     ).toBe(true);
-    expect(existsSync(path.join(workspace, ".telecodex", "mailbox_seen_albert-v3.json"))).toBe(false);
+    const seen = JSON.parse(
+      readFileSync(path.join(workspace, ".telecodex", "mailbox_seen_albert-v3.json"), "utf8"),
+    );
+    expect(seen.messages["receipt-fails"].status).toBe("failed_unexpected");
   });
 
   it("ignores misfiled messages whose frontmatter recipient does not match the bridge persona", async () => {

@@ -164,7 +164,7 @@ describe("loadConfig", () => {
         autoReply: false,
         maxMessagesPerTick: 1,
         minSentAt: undefined,
-        promptTimeoutMs: undefined,
+        promptTimeoutMs: 120_000,
       },
       telegramTransport: {
         enabled: false,
@@ -297,7 +297,7 @@ describe("loadConfig", () => {
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
     expect(config.memoryTranscriptRoot).toBeUndefined();
-    expect(config.mailboxBridge.promptTimeoutMs).toBeUndefined();
+    expect(config.mailboxBridge.promptTimeoutMs).toBe(120_000);
     expect((config as any).autoRotate).toEqual({ enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 });
     expect(config.workspace).toBe(process.cwd());
   });
