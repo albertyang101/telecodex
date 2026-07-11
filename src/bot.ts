@@ -3110,7 +3110,7 @@ function normalizeIntermediateUpdateHead(text: string): string {
 }
 
 const PROCESS_NARRATION_HEAD_RE =
-  /^(?:我先(?:去|来)?(?:看|看看|查看|查|检查|确认一下|跑|读|做|处理|准备)|我准备(?:去|先)?(?:看|查看|查|检查|确认|跑|读|做|处理)|我接下来|我现在(?:要|去|来|先)|下一步|接下来|然后|收到[，。]?\s*我先|let me\b|going to\b|now(?:\s+|,\s*)(?:i(?:['’]ll|\s+will|\s+am|['’]m)|going to)\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i;
+  /^(?:我先(?:把|将)|我先(?:去|来)?(?:看|看看|查看|查|检查|确认一下|跑|读|做|处理|准备)|我准备(?:把|将)|我准备(?:去|先)?(?:看|查看|查|检查|确认|跑|读|做|处理)|我接下来|我现在(?:要|去|来|先)|下一步|接下来|然后|收到[，。]?\s*我先|let me\b|going to\b|now(?:\s+|,\s*)(?:i(?:['’]ll|\s+will|\s+am|['’]m)|going to)\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i;
 
 function isProcessNarrationHead(head: string): boolean {
   return PROCESS_NARRATION_HEAD_RE.test(head);
@@ -3118,14 +3118,24 @@ function isProcessNarrationHead(head: string): boolean {
 
 function recoverableIntermediateUpdate(text: string): string {
   const lines = text.trim().split("\n");
-  let firstRecoverableLine = 0;
-  while (
-    firstRecoverableLine < lines.length &&
-    isProcessNarrationHead(normalizeIntermediateUpdateHead(lines[firstRecoverableLine] ?? ""))
-  ) {
-    firstRecoverableLine += 1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const head = normalizeIntermediateUpdateHead(lines[index] ?? "");
+    if (!isProcessNarrationHead(head)) {
+      return lines.slice(index).join("\n").trim();
+    }
+
+    const resultClause = head.match(
+      /(?:关键发现|阶段结果|结果(?:是|为)?|发现|查明|已完成|成功|失败|通过|根因|已经|仍在)[：:]?/,
+    );
+    if (resultClause?.index !== undefined) {
+      return [head.slice(resultClause.index), ...lines.slice(index + 1)].join("\n").trim();
+    }
+
+    if (/了[。！？!?]?$/.test(head) && !/一下[。！？!?]?$/.test(head)) {
+      return lines.slice(index).join("\n").trim();
+    }
   }
-  return lines.slice(firstRecoverableLine).join("\n").trim();
+  return "";
 }
 
 function visibleIntermediateUpdate(text: string): string {
