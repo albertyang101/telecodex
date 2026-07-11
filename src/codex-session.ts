@@ -604,6 +604,9 @@ export class CodexSessionService {
     const configOverrides: CodexConfigObject = {
       approval_policy: this.currentLaunchProfile.approvalPolicy,
       features: { unified_exec: false },
+      hide_agent_reasoning: true,
+      model_reasoning_summary: "none",
+      show_raw_agent_reasoning: false,
     };
     const mcpServers: CodexConfigObject = {};
     const telegramTransportMcp = buildTelegramTransportMcpConfig(this.config);
