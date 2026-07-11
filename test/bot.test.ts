@@ -1808,6 +1808,32 @@ describe("createBot response delivery", () => {
     const session = createSession(async (callbacks) => {
       callbacks.onTextDelta("我先去读文件、跑命令。");
       callbacks.onAgentMessage?.("我先去读文件、跑命令。");
+      callbacks.onTextDelta("我先去做两件事：读文件、跑测试。");
+      callbacks.onAgentMessage?.("我先去做两件事：读文件、跑测试。");
+      callbacks.onTextDelta("我先去检查已有测试。");
+      callbacks.onAgentMessage?.("我先去检查已有测试。");
+      callbacks.onTextDelta("我先去看看有没有问题。");
+      callbacks.onAgentMessage?.("我先去看看有没有问题。");
+      for (const narration of [
+        "我先看一下。",
+        "我先查一下。",
+        "收到。我先去查。",
+        "收到，我先查一下。",
+        "“我先去查一下。”",
+        "• 我先去查一下。",
+        "我先去查一下：配置文件。",
+        "Let me inspect the logs.",
+        "I’ll look into it.",
+        "I’m going to run tests.",
+        "I am checking now.",
+        "Next, I’ll run tests.",
+        "Let me run tests: npm test.",
+      ]) {
+        callbacks.onTextDelta(narration);
+        callbacks.onAgentMessage?.(narration);
+      }
+      callbacks.onTextDelta("我先去查一下。\n关键发现：旧版本仍在。");
+      callbacks.onAgentMessage?.("我先去查一下。\n关键发现：旧版本仍在。");
       callbacks.onTextDelta("Let me run tests.");
       callbacks.onAgentMessage?.("Let me run tests.");
       callbacks.onTextDelta("关键发现：消息过密来自进度策略。");
@@ -1828,6 +1854,20 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("现在就修复完成，可以验收。");
       callbacks.onTextDelta("我现在就查明了根因：旧版本仍在运行。");
       callbacks.onAgentMessage?.("我现在就查明了根因：旧版本仍在运行。");
+      callbacks.onTextDelta("我先把旧 poller 状态摸清了，两个都活着。");
+      callbacks.onAgentMessage?.("我先把旧 poller 状态摸清了，两个都活着。");
+      callbacks.onTextDelta("我现在就看到了旧 poller 还活着。");
+      callbacks.onAgentMessage?.("我现在就看到了旧 poller 还活着。");
+      for (const result of [
+        "我先把服务停了。",
+        "我先把证据补齐了。",
+        "我先去核实了一遍，情况属实。",
+        "我先把线上影响止住了。",
+        "我先把 Ada 那边对齐了。",
+      ]) {
+        callbacks.onTextDelta(result);
+        callbacks.onAgentMessage?.(result);
+      }
       callbacks.onTextDelta("已经按新口径收紧。");
       callbacks.onAgentMessage?.("已经按新口径收紧。");
       callbacks.onAgentEnd();
@@ -1846,6 +1886,28 @@ describe("createBot response delivery", () => {
 
     const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
     expect(visible).not.toContain("我先去读文件、跑命令。");
+    expect(visible).not.toContain("我先去做两件事：读文件、跑测试。");
+    expect(visible).not.toContain("我先去检查已有测试。");
+    expect(visible).not.toContain("我先去看看有没有问题。");
+    for (const narration of [
+      "我先看一下。",
+      "我先查一下。",
+      "收到。我先去查。",
+      "收到，我先查一下。",
+      "“我先去查一下。”",
+      "• 我先去查一下。",
+      "我先去查一下：配置文件。",
+      "Let me inspect the logs.",
+      "I’ll look into it.",
+      "I’m going to run tests.",
+      "I am checking now.",
+      "Next, I’ll run tests.",
+      "Let me run tests: npm test.",
+    ]) {
+      expect(visible).not.toContain(narration);
+    }
+    expect(visible).not.toContain("我先去查一下。");
+    expect(visible).toContain("关键发现：旧版本仍在。");
     expect(visible).not.toContain("Let me run tests.");
     expect(visible).toContain("关键发现：消息过密来自进度策略。");
     expect(visible).toContain("我先确认一下：你要不要保留这条提醒？");
@@ -1856,6 +1918,17 @@ describe("createBot response delivery", () => {
     expect(visible).toContain("我现在就部署失败，需要回滚。");
     expect(visible).toContain("现在就修复完成，可以验收。");
     expect(visible).toContain("我现在就查明了根因：旧版本仍在运行。");
+    expect(visible).toContain("我先把旧 poller 状态摸清了，两个都活着。");
+    expect(visible).toContain("我现在就看到了旧 poller 还活着。");
+    for (const result of [
+      "我先把服务停了。",
+      "我先把证据补齐了。",
+      "我先去核实了一遍，情况属实。",
+      "我先把线上影响止住了。",
+      "我先把 Ada 那边对齐了。",
+    ]) {
+      expect(visible).toContain(result);
+    }
     expect(visible).toContain("已经按新口径收紧。");
   });
 

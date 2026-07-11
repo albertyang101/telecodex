@@ -1144,7 +1144,7 @@ export function createBot(
 
     const visibleCompletedAgentMessage = (text: string): string => {
       const visibleText = stripVisibleSourceFooter(userVisibleText, stripVisiblePromptGuardEcho(text.trim()));
-      return isObviousProcessNarration(visibleText) ? "" : visibleText;
+      return stripObviousProcessNarration(visibleText);
     };
 
     const deliverCompletedStreamMessage = async (visibleText: string): Promise<void> => {
@@ -3079,30 +3079,52 @@ function renderSessionInfoPlain(info: CodexSessionInfo): string {
     .join("\n");
 }
 
-const PROCESS_NARRATION_PATTERNS = [
-  /^(?:收到[，,]?\s*)?(?:我)?先(?:把|去|来|开始|准备)/i,
-  /^(?:我)?现在(?:去|来|开始|准备|就(?:去|来|开始|准备|做|改|跑|加|写|装|测|看|查|合并|部署|修|派|启动|触发))/i,
-  /^(?:Now|Let me|I['’]?ll|I will|I am|I['’]?m|Going to|Next[,:]?)\s+(?:update|fix|add|write|run|merge|deploy|test|check|read|build)\b/i,
+const PROCESS_NARRATION_LINE_PATTERNS = [
+  /^(?:我)?先(?:去|来)?(?:把)?(?:做|改|跑|加|写|装|测|看|查|搜|找|确认|检查|研究|整理|读|部署|合并|修|派|启动|触发|停|补|止|对齐|核实)/i,
+  /^(?:我)?(?:现在|接下来)(?:就)?(?:去|来|开始|准备|打算|要|将)?(?:把)?(?:做|改|跑|加|写|装|测|看|查|搜|找|确认|检查|研究|整理|读|部署|合并|修|派|启动|触发|停|补|止|对齐|核实)/i,
+  /^(?:Let me|I['’]?ll|I will|I am going to|I['’]?m going to|Going to)\s+(?:inspect|look|update|fix|add|write|run|merge|deploy|test|check|read|build|review|research)\b/i,
+  /^(?:Next|Now)[,:]?\s+(?:(?:I['’]?ll|I will|I am going to|I['’]?m going to)\s+)?(?:inspect|look|update|fix|add|write|run|merge|deploy|test|check|read|build|review|research)\b/i,
+  /^(?:I am|I['’]?m)\s+(?:inspecting|looking|updating|fixing|adding|writing|running|merging|deploying|testing|checking|reading|building|reviewing|researching)\b/i,
 ];
 
-function isObviousProcessNarration(text: string): boolean {
-  const candidate = text.trim();
-  if (!candidate || candidate.length > 200 || candidate.includes("\n")) {
+function normalizeProcessNarrationLine(text: string): string {
+  return text
+    .trim()
+    .replace(/^[\s"'“”‘’•*+\-–—]+/, "")
+    .replace(/[\s"'“”‘’]+$/, "")
+    .replace(/^(?:OK|收到|明白了?|懂了?)[。.!！,，:：\s]*/i, "")
+    .trim();
+}
+
+function isObviousProcessNarrationLine(text: string): boolean {
+  const candidate = normalizeProcessNarrationLine(text);
+  if (!candidate) {
+    return true;
+  }
+  if (candidate.length > 200) {
     return false;
   }
   if (/[？?]/.test(candidate) || /(需要你|需要确认|请确认|你要不要)/.test(candidate)) {
     return false;
   }
+  if (/^(?:关键发现|阶段结果|进度|结果|阻塞|需要确认|已完成|已验证|Status|Progress|Result|Blocked|Need confirmation)[：:]/i.test(candidate)) {
+    return false;
+  }
   if (
-    /[：:]/.test(candidate) ||
-    /(?:失败|完成|查明|确认(?:清楚|过)|发现|根因|仍在|已经|已|成功|通过|回滚|验收|没有|没|未|异常|阻塞|结论|结果|修好|解决|生效|\b(?:failed|completed?|done|found|root cause|rolled back|ready)\b)/i.test(candidate)
+    /[，；;]/.test(candidate) ||
+    /[。.!！？?].+/.test(candidate) ||
+    /了(?!解)|着(?!手)|过了/.test(candidate) ||
+    /\b(?:failed|completed?|done|found|rolled back|ready)\b/i.test(candidate)
   ) {
     return false;
   }
-  if (/^(?:关键发现|阶段结果|进度|结果|阻塞|需要确认|已完成|已验证)[：:]/i.test(candidate)) {
-    return false;
-  }
-  return PROCESS_NARRATION_PATTERNS.some((pattern) => pattern.test(candidate));
+  return PROCESS_NARRATION_LINE_PATTERNS.some((pattern) => pattern.test(candidate));
+}
+
+function stripObviousProcessNarration(text: string): string {
+  const lines = text.split("\n");
+  const kept = lines.filter((line) => !line.trim() || !isObviousProcessNarrationLine(line));
+  return kept.join("\n").trim();
 }
 
 function renderSessionInfoHTML(info: CodexSessionInfo): string {
