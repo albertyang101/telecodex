@@ -216,6 +216,20 @@ def payload_locations(payload: dict) -> tuple[list[str], list[str]]:
                 expanded = os.path.expanduser(token)
                 if os.path.isabs(expanded):
                     explicit.append(os.path.realpath(expanded))
+                elif "/" in expanded and "\n" not in expanded:
+                    explicit.append(os.path.realpath(os.path.join(base, expanded)))
+
+            patch_target = re.compile(
+                r"^[*]{3} (?:Add|Update|Delete) File: (.+)$"
+            )
+            for line in command.splitlines():
+                match = patch_target.fullmatch(line.strip())
+                if not match:
+                    continue
+                expanded = os.path.expanduser(match.group(1).strip())
+                if not os.path.isabs(expanded):
+                    expanded = os.path.join(base, expanded)
+                explicit.append(os.path.realpath(expanded))
 
     return explicit, contextual
 
@@ -383,17 +397,14 @@ def mark_graphify_query(
         return False
     cleanup_stale_markers(state_dir)
 
-    previous_kind = None
+    previous = {}
     try:
         with open(marker, encoding="utf-8") as handle:
-            previous_kind = json.load(handle).get("query_kind")
+            loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                previous = loaded
     except (OSError, ValueError):
         pass
-    query_ranks = {"query": 0, "explain": 1, "affected": 2}
-    effective_kind = max(
-        (kind for kind in (previous_kind, query_kind) if kind in query_ranks),
-        key=query_ranks.get,
-    )
 
     temporary = marker + f".{os.getpid()}.tmp"
     with open(temporary, "w", encoding="utf-8") as handle:
@@ -402,7 +413,9 @@ def mark_graphify_query(
                 "graph_name": graph_name,
                 "session_id": payload["session_id"],
                 "turn_id": payload["turn_id"],
-                "query_kind": effective_kind,
+                "queried": bool(previous.get("queried") or query_kind == "query"),
+                "explained": bool(previous.get("explained") or query_kind == "explain"),
+                "affected": bool(previous.get("affected") or query_kind == "affected"),
                 "created_at": time.time(),
             },
             handle,
@@ -435,11 +448,8 @@ def graphify_query_recorded(
         saved.get("graph_name") == graph_name
         and saved.get("session_id") == payload.get("session_id")
         and saved.get("turn_id") == payload.get("turn_id")
-        and (
-            saved.get("query_kind") == "affected"
-            if require_affected
-            else saved.get("query_kind") in {"explain", "affected"}
-        )
+        and saved.get("explained") is True
+        and (not require_affected or saved.get("affected") is True)
     )
 
 def shell_tokens(command: str) -> Optional[list[str]]:
@@ -578,6 +588,15 @@ def payload_is_docs_only(payload: dict) -> bool:
     return bool(explicit) and all(kind == "docs" for kind in explicit)
 
 
+
+def filesystem_tool_requires_affected(tool_name: str) -> bool:
+    normalized = tool_name.lower()
+    write_markers = (
+        "write", "edit", "create", "delete", "remove", "move", "rename",
+        "copy", "patch", "mkdir", "touch",
+    )
+    return any(marker in normalized for marker in write_markers)
+
 def mentions_graphify_executable(command: str) -> bool:
     return re.search(
         r"(?:^|[\s;&|()])(?:~|/)?[^\s;&|()]*/?graphify(?=\s|$)",
@@ -665,6 +684,31 @@ def graphify_rewrite(
     return shlex.join(wrapper), None
 
 
+
+def graphify_result_is_meaningful(
+    subcommand: str,
+    stdout: str,
+    stderr: str,
+) -> bool:
+    output = "\n".join(part for part in (stdout, stderr) if part).strip()
+    if not output:
+        return False
+    if subcommand == "query":
+        return "Traversal:" in output and "No matching nodes found." not in output
+    if subcommand == "explain":
+        return (
+            ("Node:" in output or "NODE:" in output)
+            and "No node matching" not in output
+        )
+    if subcommand == "affected":
+        return (
+            "Affected nodes for" in output
+            and "No unique node match" not in output
+            and "No affected nodes found." not in output
+            and any(line.startswith("- ") for line in output.splitlines())
+        )
+    return False
+
 def run_graphify_wrapper(args: list[str]) -> int:
     if len(args) < 5:
         print("Invalid graphify wrapper arguments", file=sys.stderr)
@@ -677,12 +721,28 @@ def run_graphify_wrapper(args: list[str]) -> int:
         return 2
 
     try:
-        result = subprocess.run(parsed_argv, check=False)
+        result = subprocess.run(
+            parsed_argv,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
     except OSError as exc:
         print(f"graphify execution failed: {exc}", file=sys.stderr)
         return 2
+
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
     if result.returncode != 0:
         return result.returncode
+    if not graphify_result_is_meaningful(
+        parsed_argv[1], result.stdout, result.stderr
+    ):
+        print("graphify query produced no usable result", file=sys.stderr)
+        return 2
 
     payload = {"session_id": session_id, "turn_id": turn_id}
     if not mark_graphify_query(payload, graph_name, parsed_argv[1]):
@@ -744,7 +804,7 @@ def main() -> int:
             and not graphify_query_recorded(
                 payload,
                 repository["graph"],
-                require_affected=not payload_is_docs_only(payload),
+                require_affected=filesystem_tool_requires_affected(tool_name),
             )
         ):
             return reject(
@@ -807,8 +867,8 @@ def main() -> int:
 
     return reject(
         "Blocked Codex code command: query the canonical shared graph first "
-        "and complete explain after any broad query, then retry this command "
-        "in the same turn."
+        f"({repository['graph']}) and complete explain after any broad query, "
+        "then retry this command in the same turn."
     )
 
 

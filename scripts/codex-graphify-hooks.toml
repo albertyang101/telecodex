@@ -1,4 +1,4 @@
-# Source fragment for isolated validation. Deployment must replace <ABSOLUTE_HOOK_SCRIPT> with the reviewed workspace hook copy.
+# Reference fragment for tests. The installer renders equivalent entries into the dedicated CODEX_HOME/hooks.json and points them at CODEX_HOME hook copies.
 
 [[hooks.PreToolUse]]
 matcher = "^Bash$"

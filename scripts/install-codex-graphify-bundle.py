@@ -139,12 +139,12 @@ def main() -> int:
             "codex_home": codex_home,
             "workspace": workspace,
         }
-        policy = workspace / ".codex/hooks/codex-pre-tool-use-policy.py"
-        turn_context = workspace / ".codex/hooks/codex-graphify-turn-context.py"
-        hooks_path = workspace / ".codex/hooks.json"
+        policy = codex_home / "hooks/graphify/codex-pre-tool-use-policy.py"
+        turn_context = codex_home / "hooks/graphify/codex-graphify-turn-context.py"
+        hooks_path = codex_home / "hooks.json"
         rendered_hooks = hooks_document(policy, turn_context)
         if hooks_path.exists() and hooks_path.read_bytes() != rendered_hooks:
-            raise ValueError("target .codex/hooks.json already contains unmanaged hooks")
+            raise ValueError("target CODEX_HOME/hooks.json already contains unmanaged hooks")
 
         installed = {}
         for entry in manifest["files"]:

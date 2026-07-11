@@ -67,14 +67,15 @@ describe("Codex graphify builder bundle installer", () => {
       expect(result.status).toBe(0);
       expect(existsSync(join(codexHome, "skills/graphify/SKILL.md"))).toBe(true);
       expect(existsSync(join(codexHome, "skills/graphify/references/repo-map.json"))).toBe(true);
-      expect(existsSync(join(workspace, ".codex/hooks/codex-pre-tool-use-policy.py"))).toBe(true);
-      expect(existsSync(join(workspace, ".codex/hooks/codex-graphify-turn-context.py"))).toBe(true);
-      expect(existsSync(join(workspace, ".codex/hooks.json"))).toBe(true);
+      expect(existsSync(join(codexHome, "hooks/graphify/codex-pre-tool-use-policy.py"))).toBe(true);
+      expect(existsSync(join(codexHome, "hooks/graphify/codex-graphify-turn-context.py"))).toBe(true);
+      expect(existsSync(join(codexHome, "hooks.json"))).toBe(true);
+      expect(existsSync(join(workspace, ".codex/hooks.json"))).toBe(false);
       expect(existsSync(join(workspace, ".codex/graphify-install.json"))).toBe(true);
 
-      const hooks = readFileSync(join(workspace, ".codex/hooks.json"), "utf8");
-      expect(hooks).toContain(join(workspace, ".codex/hooks/codex-pre-tool-use-policy.py"));
-      expect(hooks).toContain(join(workspace, ".codex/hooks/codex-graphify-turn-context.py"));
+      const hooks = readFileSync(join(codexHome, "hooks.json"), "utf8");
+      expect(hooks).toContain(join(codexHome, "hooks/graphify/codex-pre-tool-use-policy.py"));
+      expect(hooks).toContain(join(codexHome, "hooks/graphify/codex-graphify-turn-context.py"));
       expect(hooks).toContain("UserPromptSubmit");
       expect(hooks).toContain("PreToolUse");
       expect(result.stdout).toContain("installed Codex Developer graphify bundle");
@@ -141,8 +142,8 @@ describe("Codex graphify builder bundle installer", () => {
     const fixture = mkdtempSync(join(tmpdir(), "codex-graphify-collision-"));
     const codexHome = join(fixture, "codex-home");
     const workspace = join(fixture, "workspace");
-    const hooksPath = join(workspace, ".codex/hooks.json");
-    mkdirSync(join(workspace, ".codex"), { recursive: true });
+    const hooksPath = join(codexHome, "hooks.json");
+    mkdirSync(codexHome, { recursive: true });
     writeFileSync(hooksPath, "{\"hooks\":{\"Stop\":[]}}\n");
 
     try {
@@ -152,7 +153,7 @@ describe("Codex graphify builder bundle installer", () => {
       expect(result.stderr).toContain("already contains unmanaged hooks");
       expect(readFileSync(hooksPath, "utf8")).toBe("{\"hooks\":{\"Stop\":[]}}\n");
       expect(existsSync(join(codexHome, "skills/graphify/SKILL.md"))).toBe(false);
-      expect(existsSync(join(workspace, ".codex/hooks/codex-pre-tool-use-policy.py"))).toBe(false);
+      expect(existsSync(join(codexHome, "hooks/graphify/codex-pre-tool-use-policy.py"))).toBe(false);
     } finally {
       rmSync(fixture, { recursive: true, force: true });
     }

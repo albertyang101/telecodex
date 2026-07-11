@@ -139,6 +139,169 @@ describe("codex PreToolUse policy hook", () => {
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+
+  it("does not unlock source when graphify reports a missing explain node", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "codex-graphify-missing-explain-"));
+    const options = {
+      sessionId: "session-missing-explain",
+      turnId: "turn-missing-explain",
+      cwd: "/Users/albertyang0888/code/codex-telegram-research/telecodex",
+      stateDir,
+    };
+    try {
+      const missing = executeGraphify(
+        "~/.local/bin/graphify explain __definitely_missing_review_node__ --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      );
+      expect(missing.status).not.toBe(0);
+      expect(missing.stdout).toContain("No node matching");
+      expect(runHook("sed -n 1,40p src/bot.ts", options).status).not.toBe(0);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("requires separate successful explain and affected receipts before edits", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "codex-graphify-independent-receipts-"));
+    const options = {
+      sessionId: "session-independent-receipts",
+      turnId: "turn-independent-receipts",
+      cwd: "/Users/albertyang0888/code/codex-telegram-research/telecodex",
+      stateDir,
+    };
+    try {
+      expect(executeGraphify(
+        "~/.local/bin/graphify affected LEGACY_PROMPT_GUARD_LINES --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      ).status).toBe(0);
+      expect(runHook("sed -n 1,40p src/prompt-guard.ts", options).status).not.toBe(0);
+      expect(runHook("", {
+        ...options,
+        toolName: "apply_patch",
+        toolInput: { file_path: "src/prompt-guard.ts", patch: "*** Begin Patch" },
+      }).status).not.toBe(0);
+
+      expect(executeGraphify(
+        "~/.local/bin/graphify explain LEGACY_PROMPT_GUARD_LINES --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      ).status).toBe(0);
+      expect(runHook("sed -n 1,40p src/prompt-guard.ts", options).status).toBe(0);
+      expect(runHook("", {
+        ...options,
+        toolName: "apply_patch",
+        toolInput: { file_path: "src/prompt-guard.ts", patch: "*** Begin Patch" },
+      }).status).toBe(0);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not record affected when graphify cannot resolve a unique node", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "codex-graphify-missing-affected-"));
+    const options = {
+      sessionId: "session-missing-affected",
+      turnId: "turn-missing-affected",
+      cwd: "/Users/albertyang0888/code/codex-telegram-research/telecodex",
+      stateDir,
+    };
+    try {
+      expect(executeGraphify(
+        "~/.local/bin/graphify explain LEGACY_PROMPT_GUARD_LINES --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      ).status).toBe(0);
+      const missing = executeGraphify(
+        "~/.local/bin/graphify affected __definitely_missing_review_node__ --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      );
+      expect(missing.status).not.toBe(0);
+      expect(missing.stdout).toContain("No unique node match");
+      expect(runHook("", {
+        ...options,
+        toolName: "apply_patch",
+        toolInput: { file_path: "src/prompt-guard.ts", patch: "*** Begin Patch" },
+      }).status).not.toBe(0);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("binds shell relative paths and real apply_patch bodies to the target repository", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "codex-graphify-relative-cross-repo-"));
+    const options = {
+      sessionId: "session-relative-cross-repo",
+      turnId: "turn-relative-cross-repo",
+      cwd: "/Users/albertyang0888/code/codex-telegram-research/telecodex",
+      stateDir,
+    };
+    try {
+      expect(executeGraphify(
+        "~/.local/bin/graphify explain createBot --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      ).status).toBe(0);
+      expect(executeGraphify(
+        "~/.local/bin/graphify affected createBot --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      ).status).toBe(0);
+
+      const relative = runHook(
+        "sed -n 1,20p ../../claude/app/telegram_bot.py",
+        options,
+      );
+      expect(relative.status).not.toBe(0);
+      expect(relative.stderr).toContain("claude-canonical");
+
+      const patchBody = runHook("", {
+        ...options,
+        toolName: "apply_patch",
+        toolInput: {
+          command: "*** Begin Patch\n*** Update File: /Users/albertyang0888/code/claude/app/telegram_bot.py\n@@\n-old\n+new\n*** End Patch",
+        },
+      });
+      expect(patchBody.status).not.toBe(0);
+      expect(patchBody.stderr).toContain("claude-canonical");
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("allows filesystem reads after explain but requires affected for filesystem writes", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "codex-graphify-filesystem-"));
+    const options = {
+      sessionId: "session-filesystem",
+      turnId: "turn-filesystem",
+      cwd: "/Users/albertyang0888/code/codex-telegram-research/telecodex",
+      stateDir,
+    };
+    try {
+      expect(executeGraphify(
+        "~/.local/bin/graphify explain createBot --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      ).status).toBe(0);
+      expect(runHook("", {
+        ...options,
+        toolName: "mcp__filesystem__read_text_file",
+        toolInput: { path: "src/bot.ts" },
+      }).status).toBe(0);
+      expect(runHook("", {
+        ...options,
+        toolName: "mcp__filesystem__write_file",
+        toolInput: { path: "src/bot.ts", content: "x" },
+      }).status).not.toBe(0);
+
+      expect(executeGraphify(
+        "~/.local/bin/graphify affected createBot --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      ).status).toBe(0);
+      expect(runHook("", {
+        ...options,
+        toolName: "mcp__filesystem__write_file",
+        toolInput: { path: "src/bot.ts", content: "x" },
+      }).status).toBe(0);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
   it("does not accept a graphify-looking string that was not executed", () => {
     const stateDir = mkdtempSync(join(tmpdir(), "codex-graphify-gate-test-"));
     const options = {
@@ -460,6 +623,10 @@ describe("codex PreToolUse policy hook", () => {
         toolInput: { file_path: "src/bot.ts", patch: "*** Begin Patch" },
       }).status).not.toBe(0);
       expect(executeGraphify(
+        "~/.local/bin/graphify explain createBot --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        common,
+      ).status).toBe(0);
+      expect(executeGraphify(
         "~/.local/bin/graphify affected createBot --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
         common,
       ).status).toBe(0);
@@ -488,6 +655,10 @@ describe("codex PreToolUse policy hook", () => {
         common,
       ).status).toBe(0);
       expect(runHook(writeCommand, common).status).not.toBe(0);
+      expect(executeGraphify(
+        "~/.local/bin/graphify explain createBot --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        common,
+      ).status).toBe(0);
       expect(executeGraphify(
         "~/.local/bin/graphify affected createBot --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
         common,

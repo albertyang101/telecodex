@@ -77,7 +77,7 @@
 
 - [ ] Install the bundle into a temporary dedicated `CODEX_HOME` and temporary Developer Bot workspace.
 - [ ] Run a direct UserPromptSubmit hook probe and capture the injected context.
-- [ ] Run official `codex exec` on a code-reading prompt with the reviewed project hooks trusted in the isolated workspace.
+- [ ] Run official `codex exec` on a code-reading prompt with the reviewed global `CODEX_HOME/hooks.json` trusted in the isolated runtime.
 - [ ] Confirm the first attempted standard source-read/edit path is denied before graphify.
 - [ ] Confirm the canonical graphify command is rewritten once, exits 0, and creates a receipt bound to the same session+turn+repo.
 - [ ] Confirm source read succeeds after graphify and edit remains denied until `affected` succeeds.

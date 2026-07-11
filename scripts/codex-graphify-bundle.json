@@ -3,15 +3,15 @@
   "files": [
     {
       "source": "scripts/codex-pre-tool-use-policy.py",
-      "root": "workspace",
-      "target": ".codex/hooks/codex-pre-tool-use-policy.py",
+      "root": "codex_home",
+      "target": "hooks/graphify/codex-pre-tool-use-policy.py",
       "mode": "0755",
-      "sha256": "cfd475668bee18c2220f19b52982ff4f15e59f7a3aca1364e7d8a1fdc21ddf6c"
+      "sha256": "3bddd00ce0864bbf8e6408feea6a8295fc30bf56930106dd31d64f7ad05a9f36"
     },
     {
       "source": "scripts/codex-graphify-turn-context.py",
-      "root": "workspace",
-      "target": ".codex/hooks/codex-graphify-turn-context.py",
+      "root": "codex_home",
+      "target": "hooks/graphify/codex-graphify-turn-context.py",
       "mode": "0755",
       "sha256": "68d3bf8ff88659bd1d3469a2f8583b03dfa66e1c2b63c39889e94e3c5694fd0c"
     },

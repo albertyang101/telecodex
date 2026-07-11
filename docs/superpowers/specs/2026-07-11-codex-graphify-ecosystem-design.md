@@ -7,7 +7,7 @@
 ## 已有基础
 
 - 共享图按仓库分开保存，并由另一条控制线自动刷新。
-- Codex runtime 已有项目级 hook 和 dedicated CODEX_HOME。
+- Codex runtime 使用 dedicated CODEX_HOME；生命周期 hook 必须装入该 CODEX_HOME 的全局 hooks.json，repo-local 配置不能作为出厂生效证据。
 - 现有隔离候选已实现显式 repo→graph 映射、共享图只读 Skill、PreToolUse 门闸、成功后 session+turn receipt，并覆盖错图、伪命令、跨仓路径和 affected-before-edit。
 - AGENTS.md 已有“碰代码先问图”文字纪律，但它只在 Codex run/session 启动时加载，不能替代每轮提醒。
 
@@ -34,7 +34,7 @@
 - graphify overlay Skill 和 repo map；
 - UserPromptSubmit hook；
 - PreToolUse hook；
-- hooks 配置片段；
+- dedicated CODEX_HOME 的全局 hooks.json；
 - 安装后自检。
 
 安装器只写目标 Bot 的隔离 CODEX_HOME/workspace，不写共享图、不启动 Bot、不 reload、不部署。Personal Assistant 角色默认不装这一开发门闸；Developer Bot 默认必装。
@@ -49,4 +49,4 @@
 
 ## 回滚
 
-候选全部留在隔离 worktree。未部署前回滚就是丢弃该分支。部署后回滚为撤下 hooks 配置片段和 graphify overlay Skill，并恢复部署前备份；共享图和生产仓库不被改写。
+候选全部留在隔离 worktree。未部署前回滚就是丢弃该分支。部署后回滚为恢复 CODEX_HOME/hooks.json 备份并撤下 graphify overlay Skill，并恢复部署前备份；共享图和生产仓库不被改写。
