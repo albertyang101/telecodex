@@ -6,7 +6,7 @@
       "root": "workspace",
       "target": ".codex/hooks/codex-pre-tool-use-policy.py",
       "mode": "0755",
-      "sha256": "1c6ab36ccb573d1e9bc7dfc0766663d9e0597c2bee5200e3e15451bef04e7b04"
+      "sha256": "cfd475668bee18c2220f19b52982ff4f15e59f7a3aca1364e7d8a1fdc21ddf6c"
     },
     {
       "source": "scripts/codex-graphify-turn-context.py",

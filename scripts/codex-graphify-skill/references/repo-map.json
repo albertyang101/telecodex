@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "repositories": [
+    {
+      "graph": "telecodex",
+      "path_prefixes": [
+        "/Users/albertyang0888/code/codex-telegram-research/telecodex"
+      ],
+      "git_common_dirs": [
+        "/Users/albertyang0888/code/codex-telegram-research/telecodex/.git"
+      ]
+    },
+    {
+      "graph": "claude-canonical",
+      "path_prefixes": [
+        "/Users/albertyang0888/code/claude"
+      ],
+      "git_common_dirs": [
+        "/Users/albertyang0888/code/claude/.git"
+      ]
+    },
+    {
+      "graph": "claude-deploy",
+      "path_prefixes": [
+        "/Users/albertyang0888/code/claude-deploy"
+      ],
+      "git_common_dirs": [
+        "/Users/albertyang0888/code/claude-deploy/.git"
+      ]
+    },
+    {
+      "graph": "claude-supervisor-2279d811",
+      "path_prefixes": [
+        "/Users/albertyang0888/code/claude-supervisor-2279d811"
+      ],
+      "git_common_dirs": [
+        "/Users/albertyang0888/code/claude-supervisor-2279d811/.git"
+      ]
+    },
+    {
+      "graph": "claude-recall-falkor",
+      "path_prefixes": [
+        "/Users/albertyang0888/code/claude-recall-falkor"
+      ],
+      "git_common_dirs": [
+        "/Users/albertyang0888/code/claude-recall-falkor/.git"
+      ]
+    }
+  ]
+}
