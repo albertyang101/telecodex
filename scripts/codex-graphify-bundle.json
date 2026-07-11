@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "files": [
+    {
+      "source": "scripts/codex-pre-tool-use-policy.py",
+      "root": "workspace",
+      "target": ".codex/hooks/codex-pre-tool-use-policy.py",
+      "mode": "0755",
+      "sha256": "1c6ab36ccb573d1e9bc7dfc0766663d9e0597c2bee5200e3e15451bef04e7b04"
+    },
+    {
+      "source": "scripts/codex-graphify-turn-context.py",
+      "root": "workspace",
+      "target": ".codex/hooks/codex-graphify-turn-context.py",
+      "mode": "0755",
+      "sha256": "68d3bf8ff88659bd1d3469a2f8583b03dfa66e1c2b63c39889e94e3c5694fd0c"
+    },
+    {
+      "source": "scripts/codex-graphify-skill/SKILL.md",
+      "root": "codex_home",
+      "target": "skills/graphify/SKILL.md",
+      "mode": "0644",
+      "sha256": "41d409d48093b2ffb39846339d458c527ad8cc9f102c0f88a16f57af8804c3aa"
+    },
+    {
+      "source": "scripts/codex-graphify-skill/references/repo-map.json",
+      "root": "codex_home",
+      "target": "skills/graphify/references/repo-map.json",
+      "mode": "0644",
+      "sha256": "c2ee300c57a27aaf30b4c2845f94a45f19eae86526e6be6c458499b3c347c86a"
+    }
+  ]
+}
