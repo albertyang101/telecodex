@@ -627,6 +627,25 @@ describe("CodexSessionService", () => {
     ]);
   });
 
+  it("marks a pending agent message as intermediate when the turn fails", async () => {
+    const service = await CodexSessionService.create(createConfig());
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+
+    thread.runStreamed.mockResolvedValueOnce({
+      events: streamEvents([
+        { type: "item.completed", item: { id: "msg-1", type: "agent_message", text: "阶段结果：已完成第一阶段。" } },
+        { type: "turn.failed", error: { message: "provider failed" } },
+      ]),
+    });
+
+    await expect(service.prompt("hello", callbacks)).rejects.toThrow("provider failed");
+    expect(callbacks.onAgentMessage).toHaveBeenCalledWith("阶段结果：已完成第一阶段。", {
+      isFinal: false,
+      followedByTool: false,
+    });
+  });
+
   it("continues consuming Codex events when an agent-message delivery callback throws", async () => {
     const service = await CodexSessionService.create(createConfig());
     const thread = mockState.createdThreads[0];

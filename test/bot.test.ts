@@ -824,8 +824,11 @@ describe("createBot response delivery", () => {
     tempDirs.push(root);
     const sessionsRoot = path.join(root, "Sessions");
     const session = createSession(async (callbacks) => {
-      callbacks.onTextDelta("已完成的阶段进度。");
-      callbacks.onAgentMessage?.("已完成的阶段进度。");
+      callbacks.onTextDelta("阶段结果：已完成第一阶段。");
+      callbacks.onAgentMessage?.("阶段结果：已完成第一阶段。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       throw new Error("provider failed");
     });
     const registry = createRegistry(session);
@@ -848,11 +851,11 @@ describe("createBot response delivery", () => {
     const visibleReplyTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
     const visibleReplies = visibleReplyTexts.join("\n");
 
-    expect(visibleReplyTexts.filter((text: string) => text.includes("已完成的阶段进度。"))).toHaveLength(1);
-    expect(visibleReplies).toContain("已完成的阶段进度。");
+    expect(visibleReplyTexts.filter((text: string) => text.includes("阶段结果：已完成第一阶段。"))).toHaveLength(1);
+    expect(visibleReplies).toContain("阶段结果：已完成第一阶段。");
     expect(visibleReplies).toContain("provider failed");
     expect(transcript).toContain("[bot-raw]");
-    expect(transcript).toContain("已完成的阶段进度。");
+    expect(transcript).toContain("阶段结果：已完成第一阶段。");
     expect(transcript).toContain("provider failed");
   });
 
@@ -1776,12 +1779,15 @@ describe("createBot response delivery", () => {
 
   it("sends completed streaming agent messages as separate Telegram bubbles", async () => {
     const session = createSession(async (callbacks) => {
-      callbacks.onTextDelta("第一段进度。");
-      await callbacks.onAgentMessage?.("第一段进度。");
+      callbacks.onTextDelta("阶段结果：第一段进度。");
+      await callbacks.onAgentMessage?.("阶段结果：第一段进度。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       await Promise.resolve();
 
       callbacks.onTextDelta("第二段结果。");
-      await callbacks.onAgentMessage?.("第二段结果。");
+      await callbacks.onAgentMessage?.("第二段结果。", { isFinal: true, followedByTool: false });
       callbacks.onAgentEnd();
     });
     const registry = createRegistry(session);
@@ -1798,10 +1804,10 @@ describe("createBot response delivery", () => {
 
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
     expect(bot.api.editMessageText).not.toHaveBeenCalled();
-    expect(bot.api.sendMessage.mock.calls[0][1]).toContain("第一段进度。");
+    expect(bot.api.sendMessage.mock.calls[0][1]).toContain("阶段结果：第一段进度。");
     expect(bot.api.sendMessage.mock.calls[0][1]).not.toContain("第二段结果。");
     expect(bot.api.sendMessage.mock.calls[1][1]).toContain("第二段结果。");
-    expect(bot.api.sendMessage.mock.calls[1][1]).not.toContain("第一段进度。");
+    expect(bot.api.sendMessage.mock.calls[1][1]).not.toContain("阶段结果：第一段进度。");
   });
 
   it("drops obvious process narration but keeps useful milestone and final bubbles", async () => {
@@ -1992,8 +1998,11 @@ describe("createBot response delivery", () => {
   it("waits for queued streaming delivery before finishing a failed turn", async () => {
     const releaseDelivery = deferred<void>();
     const session = createSession(async (callbacks) => {
-      callbacks.onTextDelta("已完成的阶段进度。");
-      callbacks.onAgentMessage?.("已完成的阶段进度。");
+      callbacks.onTextDelta("阶段结果：已完成第一阶段。");
+      callbacks.onAgentMessage?.("阶段结果：已完成第一阶段。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       throw new Error("provider failed");
     });
     const registry = createRegistry(session);
@@ -2030,8 +2039,11 @@ describe("createBot response delivery", () => {
       let actionsAfterWorking = -1;
       let botInstance: any;
       const session = createSession(async (callbacks) => {
-        callbacks.onTextDelta("阶段进度。");
-        callbacks.onAgentMessage?.("阶段进度。");
+        callbacks.onTextDelta("阶段结果：第一阶段仍在处理。");
+        callbacks.onAgentMessage?.("阶段结果：第一阶段仍在处理。", {
+          isFinal: false,
+          followedByTool: true,
+        });
         await Promise.resolve();
         await Promise.resolve();
         messagesAfterProgress = botInstance.api.sendMessage.mock.calls.length;
