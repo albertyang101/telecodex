@@ -3125,10 +3125,14 @@ function recoverableIntermediateUpdate(text: string): string {
     }
 
     const resultClause = head.match(
-      /(?:关键发现|阶段结果|结果(?:是|为)?|发现|查明|已完成|成功|失败|通过|根因|已经|仍在)[：:]?/,
+      /(?:^|[，,；;。.!]\s*)((?:关键发现|阶段结果|结果(?:是|为)?|发现|查明|已完成|成功|失败|通过|根因|已经|仍在)[：:]?)/,
     );
-    if (resultClause?.index !== undefined) {
-      return [head.slice(resultClause.index), ...lines.slice(index + 1)].join("\n").trim();
+    if (resultClause?.index !== undefined && resultClause[1]) {
+      const markerOffset = resultClause[0].lastIndexOf(resultClause[1]);
+      return [
+        head.slice(resultClause.index + markerOffset),
+        ...lines.slice(index + 1),
+      ].join("\n").trim();
     }
 
     if (/了[。！？!?]?$/.test(head) && !/一下[。！？!?]?$/.test(head)) {
