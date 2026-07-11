@@ -1557,11 +1557,14 @@ export function createBot(
         finalized = true;
 
         const failureSourceText = streamAgentResponses ? accumulatedText : completedAgentText;
-        const combinedText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
-        const chunks = splitMarkdownForTelegram(combinedText);
+        const failureReplyText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
+        const transcriptFailureText = [...completedStreamMessages, failureReplyText]
+          .filter((text) => Boolean(text))
+          .join("\n\n");
+        const chunks = splitMarkdownForTelegram(failureReplyText);
         try {
           await deliverRenderedChunks(chunks);
-          await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "bot-raw", combinedText).catch(
+          await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "bot-raw", transcriptFailureText).catch(
             (appendError) => {
               console.error(
                 "Failed to append memory bot turn:",

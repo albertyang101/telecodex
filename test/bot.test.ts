@@ -819,6 +819,43 @@ describe("createBot response delivery", () => {
     expect(transcript).not.toContain("中间草稿，不进最终记忆。");
   });
 
+  it("records completed streaming progress before a later prompt failure", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-stream-failure-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("已完成的阶段进度。");
+      callbacks.onAgentMessage?.("已完成的阶段进度。");
+      throw new Error("provider failed");
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(
+      createConfig({ memoryTranscriptRoot: sessionsRoot, streamAgentResponses: true }),
+      registry as any,
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 98, text: "阶段后失败" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    const visibleReplyTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+    const visibleReplies = visibleReplyTexts.join("\n");
+
+    expect(visibleReplyTexts.filter((text: string) => text.includes("已完成的阶段进度。"))).toHaveLength(1);
+    expect(visibleReplies).toContain("已完成的阶段进度。");
+    expect(visibleReplies).toContain("provider failed");
+    expect(transcript).toContain("[bot-raw]");
+    expect(transcript).toContain("已完成的阶段进度。");
+    expect(transcript).toContain("provider failed");
+  });
+
   it("records prompt failure replies as bot turns without leaking raw provider URLs", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-prompt-failure-"));
     tempDirs.push(root);
@@ -1231,6 +1268,38 @@ describe("createBot response delivery", () => {
     expect(firstVisible).toContain("巴黎下周会比墨尔本热很多");
     expect(firstVisible).not.toContain("来源");
     expect(firstVisible).not.toContain("https://");
+  });
+
+  it("strips source and discipline-only completed messages without blocking later bubbles", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("第一段安全结论。");
+      callbacks.onAgentMessage?.("第一段安全结论。");
+      callbacks.onTextDelta(["来源：", "https://example.com/internal"].join("\n"));
+      callbacks.onAgentMessage?.(["来源：", "https://example.com/internal"].join("\n"));
+      callbacks.onTextDelta(["[DEVELOPER DISCIPLINE]", "discipline_version=ALB-714-hard-discipline-v1"].join("\n"));
+      callbacks.onAgentMessage?.(["[DEVELOPER DISCIPLINE]", "discipline_version=ALB-714-hard-discipline-v1"].join("\n"));
+      callbacks.onTextDelta("最后一段安全结论。");
+      callbacks.onAgentMessage?.("最后一段安全结论。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 75, text: "这个问题怎么回事" },
+      api: bot.api,
+    });
+
+    const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(visible).toContain("第一段安全结论。");
+    expect(visible).toContain("最后一段安全结论。");
+    expect(visible).not.toContain("https://");
+    expect(visible).not.toContain("[DEVELOPER DISCIPLINE]");
+    expect(visible).not.toContain("discipline_version=");
   });
 
   it("keeps substantive source wording that is not a citation footer", async () => {
@@ -1763,6 +1832,35 @@ describe("createBot response delivery", () => {
     expect(sentTexts[2]).toBe(sentTexts[1]);
     expect(sentTexts.filter((text: string) => text.includes("最终结果。"))).toHaveLength(1);
   });
+  it("continues with later streaming messages after both delivery attempts fail", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("第一段永久失败。");
+      callbacks.onAgentMessage?.("第一段永久失败。");
+      callbacks.onTextDelta("后续结果仍要送达。");
+      callbacks.onAgentMessage?.("后续结果仍要送达。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig({ streamAgentResponses: true }), registry as any) as any;
+    bot.api.sendMessage
+      .mockRejectedValueOnce(new Error("first attempt failed"))
+      .mockRejectedValueOnce(new Error("retry failed"));
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 12, text: "继续处理" },
+      api: bot.api,
+    });
+
+    const sentTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+    expect(sentTexts.filter((text: string) => text.includes("第一段永久失败。"))).toHaveLength(2);
+    expect(sentTexts.some((text: string) => text.includes("有一段回复发送失败"))).toBe(true);
+    expect(sentTexts.filter((text: string) => text.includes("后续结果仍要送达。"))).toHaveLength(1);
+  });
+
   it("waits for queued streaming delivery before finishing a failed turn", async () => {
     const releaseDelivery = deferred<void>();
     const session = createSession(async (callbacks) => {
