@@ -93,7 +93,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `QWEN_ASR_LANGUAGE` | — | Optional Qwen3-ASR language hint |
    | `QWEN_ASR_TIMEOUT_MS` | — | Qwen3-ASR socket timeout in milliseconds (default `270000`) |
    | `TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS` | — | Telegram media download timeout in milliseconds (default `60000`) |
-   | `MAILBOX_PROMPT_TIMEOUT_MS` | — | Optional mailbox Codex turn lease in milliseconds; on timeout the bridge aborts the turn, keeps the inbox file unread for inspection, marks it `failed_prompt_timeout`, and escalates to fatal recovery if the aborted turn remains active after the abort grace |
+   | `MAILBOX_PROMPT_TIMEOUT_MS` | `120000` | Mailbox Codex turn lease in milliseconds; on timeout the bridge aborts the turn, keeps the inbox file unread for inspection, marks it `failed_prompt_timeout`, and escalates to fatal recovery if the aborted turn remains active after the abort grace |
    | `OPENAI_API_KEY` | — | Enables OpenAI voice transcription |
    | `OPENAI_TRANSCRIPTION_MODEL` | — | OpenAI transcription model (default `gpt-4o-transcribe`) |
    | `OPENAI_TRANSCRIPTION_TIMEOUT_MS` | — | OpenAI transcription request timeout in milliseconds (default `120000`) |

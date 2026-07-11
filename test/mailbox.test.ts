@@ -551,6 +551,110 @@ describe("mailbox bridge", () => {
     expect(receipt.status).toBe("failed_unexpected");
   });
 
+  it("persists the unexpected failure reason in the quarantine receipt", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "auditable-failure",
+      subject: "Audit failure",
+      body: "Preserve the failure reason.",
+    });
+
+    const session = createSession(async () => {
+      throw new Error("codex turn.failed: provider unavailable");
+    });
+
+    await runMailboxDeliveryOnce(
+      createConfig({ personasRoot, workspace }),
+      createRegistry(session) as never,
+    );
+
+    const receipt = JSON.parse(
+      readFileSync(
+        path.join(
+          personasRoot,
+          "_shared",
+          "memory",
+          "mailbox",
+          "_receipts",
+          "albert-v3",
+          "auditable-failure.json",
+        ),
+        "utf8",
+      ),
+    );
+    expect(receipt.failure_reason).toBe("codex turn.failed: provider unavailable");
+  });
+
+  it("finalizes a stale processing claim as interrupted without rerunning the Codex turn", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const messagePath = writeMailboxMessage({
+      personasRoot,
+      sender: "cody",
+      recipient: "albert-v3",
+      msgId: "stale-processing",
+      subject: "Stale processing",
+      body: "Do not rerun after a process crash.",
+    });
+    const stateDir = path.join(workspace, ".telecodex");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      path.join(stateDir, "mailbox_seen_albert-v3.json"),
+      JSON.stringify({
+        messages: {
+          "stale-processing": {
+            processedAt: "2026-06-21T00:00:00.000Z",
+            from: "cody",
+            path: messagePath,
+            status: "processing",
+          },
+        },
+      }),
+      "utf8",
+    );
+    const session = createSession(async () => {
+      throw new Error("stale claim must not rerun");
+    });
+
+    expect(
+      await runMailboxDeliveryOnce(
+        createConfig({ personasRoot, workspace }),
+        createRegistry(session) as never,
+      ),
+    ).toEqual({ processed: 0, replied: 0, skipped: 1 });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+    const seen = JSON.parse(
+      readFileSync(path.join(stateDir, "mailbox_seen_albert-v3.json"), "utf8"),
+    );
+    expect(seen.messages["stale-processing"]).toMatchObject({
+      status: "failed_unexpected",
+      failureReason: "interrupted_before_terminal_state",
+    });
+    const receipt = JSON.parse(
+      readFileSync(
+        path.join(
+          personasRoot,
+          "_shared",
+          "memory",
+          "mailbox",
+          "_receipts",
+          "albert-v3",
+          "stale-processing.json",
+        ),
+        "utf8",
+      ),
+    );
+    expect(receipt).toMatchObject({
+      status: "failed_unexpected",
+      failure_reason: "interrupted_before_terminal_state",
+    });
+  });
+
   it("claims a message before reply side effects so finalization failure cannot rerun the Codex turn", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");

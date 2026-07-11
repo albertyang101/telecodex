@@ -42,8 +42,16 @@ interface DeliveryEvent {
   path: string;
 }
 
+interface SeenMessageState {
+  processedAt: string;
+  from: string;
+  path: string;
+  status?: string;
+  failureReason?: string;
+}
+
 interface SeenState {
-  messages: Record<string, { processedAt: string; from: string; path: string; status?: string }>;
+  messages: Record<string, SeenMessageState>;
 }
 
 export interface MailboxDeliveryResult {
@@ -78,9 +86,17 @@ export async function runMailboxDeliveryOnce(
   const seen = await loadSeenState(statePath);
   const events = await listDeliveryEvents(settings);
   const eventMsgIds = new Set(events.map((event) => event.msgId));
-  const unseenMessages = (await listInboxMessages(settings)).filter((msg) => !seen.messages[msg.msgId]);
+  const inboxMessages = await listInboxMessages(settings);
+  const staleClaimsQuarantined = await quarantineStaleMailboxClaims(
+    settings,
+    statePath,
+    seen,
+    inboxMessages,
+  );
+  const unseenMessages = inboxMessages.filter((msg) => !seen.messages[msg.msgId]);
   const historicalMessages = unseenMessages.filter((msg) => !isAfterMinSentAt(settings, msg));
   const historicalSkipped = await markHistoricalSkipped(settings, statePath, seen, historicalMessages);
+  const skippedBeforeDelivery = historicalSkipped + staleClaimsQuarantined;
   const unreadMessages = unseenMessages.filter((msg) => isAfterMinSentAt(settings, msg));
   const eventBackedMessages = eventMsgIds.size > 0
     ? unreadMessages.filter((msg) => eventMsgIds.has(msg.msgId))
@@ -90,7 +106,7 @@ export async function runMailboxDeliveryOnce(
 
   if (messages.length === 0) {
     await ackSeenEvents(settings, events, seen);
-    return { processed: 0, replied: 0, skipped: historicalSkipped };
+    return { processed: 0, replied: 0, skipped: skippedBeforeDelivery };
   }
 
   const session = settings.launchProfileId
@@ -99,7 +115,7 @@ export async function runMailboxDeliveryOnce(
   ensureMailboxSessionLaunchProfile(session, settings.allowUnsafeLaunchProfile);
   let processed = 0;
   let replied = 0;
-  let skipped = historicalSkipped;
+  let skipped = skippedBeforeDelivery;
 
   // Auto-rotation for the mailbox thread (ALB-1205). Worker bots (Theo/Ada) run
   // most of their turns through this bridge on a thread that persists across
@@ -673,6 +689,46 @@ class MailboxPromptAbortGraceError extends Error {
   }
 }
 
+async function quarantineStaleMailboxClaims(
+  settings: MailboxBridgeConfig,
+  statePath: string,
+  seen: SeenState,
+  inboxMessages: MailboxMessage[],
+): Promise<number> {
+  const staleMessages = inboxMessages.filter(
+    (message) => seen.messages[message.msgId]?.status === MAILBOX_PROCESSING_STATUS,
+  );
+  if (staleMessages.length === 0) {
+    return 0;
+  }
+
+  const failureReason = "interrupted_before_terminal_state";
+  for (const message of staleMessages) {
+    seen.messages[message.msgId] = {
+      processedAt: new Date().toISOString(),
+      from: message.from,
+      path: message.path,
+      status: MAILBOX_UNEXPECTED_FAILURE_STATUS,
+      failureReason,
+    };
+    await recordDeliveryReceipt(
+      settings,
+      message,
+      MAILBOX_UNEXPECTED_FAILURE_STATUS,
+      message.path,
+      failureReason,
+    );
+  }
+  await saveSeenState(statePath, seen);
+  for (const message of staleMessages) {
+    await ackDeliveryEvents(settings, message.msgId);
+    console.error(
+      "mailbox message " + message.msgId + " quarantined from stale processing claim after restart",
+    );
+  }
+  return staleMessages.length;
+}
+
 async function claimMailboxMessage(
   statePath: string,
   seen: SeenState,
@@ -709,11 +765,18 @@ async function quarantineUnexpectedMailboxMessage(
     from: message.from,
     path: message.path,
     status: MAILBOX_UNEXPECTED_FAILURE_STATUS,
+    failureReason: errorText,
   };
 
   const persistenceErrors: string[] = [];
   try {
-    await recordDeliveryReceipt(settings, message, MAILBOX_UNEXPECTED_FAILURE_STATUS, message.path);
+    await recordDeliveryReceipt(
+      settings,
+      message,
+      MAILBOX_UNEXPECTED_FAILURE_STATUS,
+      message.path,
+      errorText,
+    );
   } catch (receiptError) {
     persistenceErrors.push(
       `receipt: ${receiptError instanceof Error ? receiptError.message : String(receiptError)}`,
@@ -970,6 +1033,7 @@ async function recordDeliveryReceipt(
   message: MailboxMessage,
   status: string,
   messagePath: string,
+  failureReason?: string,
 ): Promise<void> {
   const dir = receiptsDir(settings, message.to);
   await mkdir(dir, { recursive: true });
@@ -983,6 +1047,7 @@ async function recordDeliveryReceipt(
     delivered_by: BRIDGE_DELIVERED_BY,
     recorded_at: new Date().toISOString(),
     message_path: messagePath,
+    failure_reason: failureReason,
   });
 }
 
