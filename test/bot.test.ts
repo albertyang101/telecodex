@@ -1859,6 +1859,8 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("我先去看看有没有问题。", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先看看有没有问题？");
       callbacks.onAgentMessage?.("我先看看有没有问题？", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("我先看看这样可以吗？");
+      callbacks.onAgentMessage?.("我先看看这样可以吗？", { isFinal: false, followedByTool: true });
       for (const narration of [
         "我先看一下。",
         "我先查一下。",
@@ -1889,6 +1891,10 @@ describe("createBot response delivery", () => {
       callbacks.onAgentMessage?.("这样可以吗？", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("Should I continue?");
       callbacks.onAgentMessage?.("Should I continue?", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("“这样可以吗？”");
+      callbacks.onAgentMessage?.("“这样可以吗？”", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("**这样可以吗？**");
+      callbacks.onAgentMessage?.("**这样可以吗？**", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先确认过了：生产仍在跑旧版本。");
       callbacks.onAgentMessage?.("我先确认过了：生产仍在跑旧版本。");
       callbacks.onTextDelta("我现在部署失败，需要回滚。");
@@ -1939,6 +1945,7 @@ describe("createBot response delivery", () => {
     expect(visible).not.toContain("我先去检查已有测试。");
     expect(visible).not.toContain("我先去看看有没有问题。");
     expect(visible).not.toContain("我先看看有没有问题？");
+    expect(visible).not.toContain("我先看看这样可以吗？");
     for (const narration of [
       "我先看一下。",
       "我先查一下。",
@@ -1963,6 +1970,8 @@ describe("createBot response delivery", () => {
     expect(visible).toContain("我先确认一下：你要不要保留这条提醒？");
     expect(visible).toContain("这样可以吗？");
     expect(visible).toContain("Should I continue?");
+    expect(visible).toContain("“这样可以吗？”");
+    expect(visible).toContain("<b>这样可以吗？</b>");
     expect(visible).toContain("我先确认过了：生产仍在跑旧版本。");
     expect(visible).toContain("我现在部署失败，需要回滚。");
     expect(visible).toContain("现在修复完成，可以验收。");

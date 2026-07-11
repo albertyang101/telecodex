@@ -3098,6 +3098,7 @@ function normalizeIntermediateUpdateHead(text: string): string {
   return text
     .trim()
     .replace(/^[\s>*_#"'“”‘’•+\-–—]+/, "")
+    .replace(/[\s>*_#"'“”‘’]+$/, "")
     .trim();
 }
 
@@ -3105,11 +3106,13 @@ function visibleIntermediateUpdate(text: string): string {
   const lines = text.trim().split("\n");
   const firstVisibleLine = lines.findIndex((line) => {
     const head = normalizeIntermediateUpdateHead(line);
+    const processNarration = /^(?:我先(?:去|来|看|看看|确认|检查|查)|收到[，。]?\s*我先)/.test(head);
     return (
       STRUCTURED_INTERMEDIATE_UPDATE_RE.test(head) ||
       /(需要你|需要确认|请确认|你要不要|你是否|您是否)/.test(head) ||
-      /(?:要保留|要删除|要继续|可以|行|好|对|确定|怎么办|怎么处理|选哪个|哪一个|哪种)(?:吗|呢)?[？?]$/.test(head) ||
-      /^(?:should|shall|would|could|can|do|does|did|is|are|will)\b.*\?[”"]?$/i.test(head)
+      (!processNarration &&
+        (/(?:要保留|要删除|要继续|可以|行|好|对|确定|怎么办|怎么处理|选哪个|哪一个|哪种)(?:吗|呢)?[？?]$/.test(head) ||
+          /^(?:should|shall|would|could|can|do|does|did|is|are|will)\b.*\?$/i.test(head)))
     );
   });
   return firstVisibleLine >= 0 ? lines.slice(firstVisibleLine).join("\n").trim() : "";
