@@ -22,6 +22,7 @@ import {
   renderWelcomeReturning,
 } from "./bot-ui.js";
 import {
+  type AgentMessageDeliveryMetadata,
   type CodexPromptInput,
   type CodexSessionCallbacks,
   type CodexSessionInfo,
@@ -1142,9 +1143,12 @@ export function createBot(
       }
     };
 
-    const visibleCompletedAgentMessage = (text: string): string => {
+    const visibleCompletedAgentMessage = (
+      text: string,
+      metadata?: AgentMessageDeliveryMetadata,
+    ): string => {
       const visibleText = stripVisibleSourceFooter(userVisibleText, stripVisiblePromptGuardEcho(text.trim()));
-      return stripObviousProcessNarration(visibleText);
+      return metadata?.isFinal === false ? visibleIntermediateUpdate(visibleText) : visibleText;
     };
 
     const deliverCompletedStreamMessage = async (visibleText: string): Promise<void> => {
@@ -1172,8 +1176,8 @@ export function createBot(
       }
     };
 
-    const enqueueCompletedStreamMessage = (text: string): void => {
-      const visibleText = visibleCompletedAgentMessage(text);
+    const enqueueCompletedStreamMessage = (text: string, metadata?: AgentMessageDeliveryMetadata): void => {
+      const visibleText = visibleCompletedAgentMessage(text, metadata);
       accumulatedText = "";
       if (!visibleText) {
         return;
@@ -1249,11 +1253,11 @@ export function createBot(
       onTextDelta: (delta: string) => {
         accumulatedText += delta;
       },
-      onAgentMessage: (text: string) => {
+      onAgentMessage: (text: string, metadata: AgentMessageDeliveryMetadata) => {
         completedAgentText = text;
         hasCompletedAgentText = true;
         if (streamAgentResponses) {
-          enqueueCompletedStreamMessage(text);
+          enqueueCompletedStreamMessage(text, metadata);
         }
       },
       onToolStart: (toolName: string, toolCallId: string) => {
@@ -3079,52 +3083,27 @@ function renderSessionInfoPlain(info: CodexSessionInfo): string {
     .join("\n");
 }
 
-const PROCESS_NARRATION_LINE_PATTERNS = [
-  /^(?:我)?先(?:去|来)?(?:把)?(?:做|改|跑|加|写|装|测|看|查|搜|找|确认|检查|研究|整理|读|部署|合并|修|派|启动|触发|停|补|止|对齐|核实)/i,
-  /^(?:我)?(?:现在|接下来)(?:就)?(?:去|来|开始|准备|打算|要|将)?(?:把)?(?:做|改|跑|加|写|装|测|看|查|搜|找|确认|检查|研究|整理|读|部署|合并|修|派|启动|触发|停|补|止|对齐|核实)/i,
-  /^(?:Let me|I['’]?ll|I will|I am going to|I['’]?m going to|Going to)\s+(?:inspect|look|update|fix|add|write|run|merge|deploy|test|check|read|build|review|research)\b/i,
-  /^(?:Next|Now)[,:]?\s+(?:(?:I['’]?ll|I will|I am going to|I['’]?m going to)\s+)?(?:inspect|look|update|fix|add|write|run|merge|deploy|test|check|read|build|review|research)\b/i,
-  /^(?:I am|I['’]?m)\s+(?:inspecting|looking|updating|fixing|adding|writing|running|merging|deploying|testing|checking|reading|building|reviewing|researching)\b/i,
-];
+const STRUCTURED_INTERMEDIATE_UPDATE_RE =
+  /^(?:关键发现|阶段结果|阻塞|需要确认|Progress|Result|Blocked|Need confirmation)[：:]/i;
 
-function normalizeProcessNarrationLine(text: string): string {
+function normalizeIntermediateUpdateHead(text: string): string {
   return text
     .trim()
-    .replace(/^[\s"'“”‘’•*+\-–—]+/, "")
-    .replace(/[\s"'“”‘’]+$/, "")
-    .replace(/^(?:OK|收到|明白了?|懂了?)[。.!！,，:：\s]*/i, "")
+    .replace(/^[\s>*_#"'“”‘’•+\-–—]+/, "")
     .trim();
 }
 
-function isObviousProcessNarrationLine(text: string): boolean {
-  const candidate = normalizeProcessNarrationLine(text);
-  if (!candidate) {
-    return true;
-  }
-  if (candidate.length > 200) {
-    return false;
-  }
-  if (/[？?]/.test(candidate) || /(需要你|需要确认|请确认|你要不要)/.test(candidate)) {
-    return false;
-  }
-  if (/^(?:关键发现|阶段结果|进度|结果|阻塞|需要确认|已完成|已验证|Status|Progress|Result|Blocked|Need confirmation)[：:]/i.test(candidate)) {
-    return false;
-  }
-  if (
-    /[，；;]/.test(candidate) ||
-    /[。.!！？?].+/.test(candidate) ||
-    /了(?!解)|着(?!手)|过了/.test(candidate) ||
-    /\b(?:failed|completed?|done|found|rolled back|ready)\b/i.test(candidate)
-  ) {
-    return false;
-  }
-  return PROCESS_NARRATION_LINE_PATTERNS.some((pattern) => pattern.test(candidate));
-}
-
-function stripObviousProcessNarration(text: string): string {
-  const lines = text.split("\n");
-  const kept = lines.filter((line) => !line.trim() || !isObviousProcessNarrationLine(line));
-  return kept.join("\n").trim();
+function visibleIntermediateUpdate(text: string): string {
+  const lines = text.trim().split("\n");
+  const firstVisibleLine = lines.findIndex((line) => {
+    const head = normalizeIntermediateUpdateHead(line);
+    return (
+      STRUCTURED_INTERMEDIATE_UPDATE_RE.test(head) ||
+      /[？?]/.test(head) ||
+      /(需要你|需要确认|请确认|你要不要)/.test(head)
+    );
+  });
+  return firstVisibleLine >= 0 ? lines.slice(firstVisibleLine).join("\n").trim() : "";
 }
 
 function renderSessionInfoHTML(info: CodexSessionInfo): string {

@@ -1807,13 +1807,13 @@ describe("createBot response delivery", () => {
   it("drops obvious process narration but keeps useful milestone and final bubbles", async () => {
     const session = createSession(async (callbacks) => {
       callbacks.onTextDelta("我先去读文件、跑命令。");
-      callbacks.onAgentMessage?.("我先去读文件、跑命令。");
+      callbacks.onAgentMessage?.("我先去读文件、跑命令。", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先去做两件事：读文件、跑测试。");
-      callbacks.onAgentMessage?.("我先去做两件事：读文件、跑测试。");
+      callbacks.onAgentMessage?.("我先去做两件事：读文件、跑测试。", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先去检查已有测试。");
-      callbacks.onAgentMessage?.("我先去检查已有测试。");
+      callbacks.onAgentMessage?.("我先去检查已有测试。", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先去看看有没有问题。");
-      callbacks.onAgentMessage?.("我先去看看有没有问题。");
+      callbacks.onAgentMessage?.("我先去看看有没有问题。", { isFinal: false, followedByTool: true });
       for (const narration of [
         "我先看一下。",
         "我先查一下。",
@@ -1830,16 +1830,16 @@ describe("createBot response delivery", () => {
         "Let me run tests: npm test.",
       ]) {
         callbacks.onTextDelta(narration);
-        callbacks.onAgentMessage?.(narration);
+        callbacks.onAgentMessage?.(narration, { isFinal: false, followedByTool: true });
       }
       callbacks.onTextDelta("我先去查一下。\n关键发现：旧版本仍在。");
-      callbacks.onAgentMessage?.("我先去查一下。\n关键发现：旧版本仍在。");
+      callbacks.onAgentMessage?.("我先去查一下。\n关键发现：旧版本仍在。", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("Let me run tests.");
-      callbacks.onAgentMessage?.("Let me run tests.");
+      callbacks.onAgentMessage?.("Let me run tests.", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("关键发现：消息过密来自进度策略。");
-      callbacks.onAgentMessage?.("关键发现：消息过密来自进度策略。");
+      callbacks.onAgentMessage?.("关键发现：消息过密来自进度策略。", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先确认一下：你要不要保留这条提醒？");
-      callbacks.onAgentMessage?.("我先确认一下：你要不要保留这条提醒？");
+      callbacks.onAgentMessage?.("我先确认一下：你要不要保留这条提醒？", { isFinal: false, followedByTool: true });
       callbacks.onTextDelta("我先确认过了：生产仍在跑旧版本。");
       callbacks.onAgentMessage?.("我先确认过了：生产仍在跑旧版本。");
       callbacks.onTextDelta("我现在部署失败，需要回滚。");

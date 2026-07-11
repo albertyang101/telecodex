@@ -555,7 +555,7 @@ describe("CodexSessionService", () => {
     await service.prompt("hello", callbacks);
 
     expect(callbacks.onTextDelta.mock.calls.map(([delta]) => delta)).toEqual(["Hel", "lo", " world"]);
-    expect(callbacks.onAgentMessage).toHaveBeenCalledWith("Hello world");
+    expect(callbacks.onAgentMessage).toHaveBeenCalledWith("Hello world", { isFinal: true, followedByTool: false });
     expect(callbacks.onAgentEnd).toHaveBeenCalledTimes(1);
     expect(service.getInfo().threadId).toBe("thread-123");
   });
@@ -578,6 +578,52 @@ describe("CodexSessionService", () => {
     expect(callbacks.onAgentMessage.mock.calls.map(([text]) => text)).toEqual([
       "中间草稿",
       "最终回复",
+    ]);
+    expect(callbacks.onAgentMessage.mock.calls.map(([, metadata]) => metadata)).toEqual([
+      { isFinal: false, followedByTool: false },
+      { isFinal: true, followedByTool: false },
+    ]);
+  });
+
+  it("marks a completed agent message as intermediate when a tool follows it", async () => {
+    const service = await CodexSessionService.create(createConfig());
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+
+    thread.runStreamed.mockResolvedValueOnce({
+      events: streamEvents([
+        { type: "item.completed", item: { id: "msg-1", type: "agent_message", text: "Let me run tests." } },
+        {
+          type: "item.started",
+          item: {
+            id: "cmd-1",
+            type: "command_execution",
+            command: "npm test",
+            aggregated_output: "",
+            status: "in_progress",
+          },
+        },
+        {
+          type: "item.completed",
+          item: {
+            id: "cmd-1",
+            type: "command_execution",
+            command: "npm test",
+            aggregated_output: "passed",
+            exit_code: 0,
+            status: "completed",
+          },
+        },
+        { type: "item.completed", item: { id: "msg-2", type: "agent_message", text: "Tests passed." } },
+        { type: "turn.completed", usage },
+      ]),
+    });
+
+    await service.prompt("hello", callbacks);
+
+    expect(callbacks.onAgentMessage.mock.calls).toEqual([
+      ["Let me run tests.", { isFinal: false, followedByTool: true }],
+      ["Tests passed.", { isFinal: true, followedByTool: false }],
     ]);
   });
 

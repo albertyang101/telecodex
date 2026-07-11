@@ -25,12 +25,17 @@ import {
   type CodexLaunchProfile,
 } from "./codex-launch.js";
 
+export interface AgentMessageDeliveryMetadata {
+  isFinal: boolean;
+  followedByTool: boolean;
+}
+
 export interface CodexSessionCallbacks {
   onTextDelta: (delta: string) => void;
   onToolStart: (toolName: string, toolCallId: string) => void;
   onToolUpdate: (toolCallId: string, partialResult: string) => void;
   onToolEnd: (toolCallId: string, isError: boolean) => void;
-  onAgentMessage?: (text: string) => void;
+  onAgentMessage?: (text: string, metadata: AgentMessageDeliveryMetadata) => void;
   onAgentEnd: () => void;
   onTodoUpdate?: (items: Array<{ text: string; completed: boolean }>) => void;
   onTurnComplete?: (usage: {
@@ -216,6 +221,19 @@ export class CodexSessionService {
     const controller = new AbortController();
     this.abortController = controller;
     let lastAgentText = "";
+    let pendingAgentMessage: string | null = null;
+    const deliverPendingAgentMessage = (metadata: AgentMessageDeliveryMetadata): void => {
+      if (pendingAgentMessage === null) {
+        return;
+      }
+      const text = pendingAgentMessage;
+      pendingAgentMessage = null;
+      try {
+        callbacks.onAgentMessage?.(text, metadata);
+      } catch (error) {
+        console.error("Agent message callback failed; continuing Codex event consumption:", error);
+      }
+    };
 
     // Track cumulative aggregated_output per command item to compute deltas.
     const lastCommandOutput = new Map<string, string>();
@@ -230,6 +248,12 @@ export class CodexSessionService {
           case "item.started":
           case "item.updated": {
             const item = event.item;
+            if (event.type === "item.started" && pendingAgentMessage !== null) {
+              deliverPendingAgentMessage({
+                isFinal: false,
+                followedByTool: item.type !== "agent_message",
+              });
+            }
             if (item.type === "agent_message") {
               const delta = computeTextDelta(lastAgentText, item.text);
               if (delta) {
@@ -266,17 +290,20 @@ export class CodexSessionService {
           case "item.completed": {
             const item = event.item;
             if (item.type === "agent_message") {
+              if (pendingAgentMessage !== null) {
+                deliverPendingAgentMessage({ isFinal: false, followedByTool: false });
+              }
               const delta = computeTextDelta(lastAgentText, item.text);
               if (delta) {
                 callbacks.onTextDelta(delta);
               }
               lastAgentText = item.text;
-              try {
-                callbacks.onAgentMessage?.(item.text);
-              } catch (error) {
-                console.error("Agent message callback failed; continuing Codex event consumption:", error);
+              pendingAgentMessage = item.text;
+            } else {
+              if (pendingAgentMessage !== null) {
+                deliverPendingAgentMessage({ isFinal: false, followedByTool: true });
               }
-            } else if (item.type === "command_execution") {
+              if (item.type === "command_execution") {
               // Pass any output that arrived only in the completion event (e.g. fast
               // commands that never fired item.updated).
               const prev = lastCommandOutput.get(item.id) ?? "";
@@ -303,12 +330,14 @@ export class CodexSessionService {
               callbacks.onToolStart("⚠️ error", item.id);
               callbacks.onToolUpdate(item.id, item.message);
               callbacks.onToolEnd(item.id, true);
-            } else if (item.type === "todo_list") {
-              callbacks.onTodoUpdate?.(item.items);
+              } else if (item.type === "todo_list") {
+                callbacks.onTodoUpdate?.(item.items);
+              }
             }
             break;
           }
           case "turn.completed": {
+            deliverPendingAgentMessage({ isFinal: true, followedByTool: false });
             // Accumulate and deliver usage BEFORE onAgentEnd so that
             // finalizeResponse() can read lastTurnUsage when building the
             // final message text.
@@ -325,8 +354,10 @@ export class CodexSessionService {
             break;
           }
           case "turn.failed":
+            deliverPendingAgentMessage({ isFinal: false, followedByTool: false });
             throw new Error(event.error.message);
           case "error":
+            deliverPendingAgentMessage({ isFinal: false, followedByTool: false });
             throw new Error(event.message);
           default:
             break;

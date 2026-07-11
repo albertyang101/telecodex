@@ -27,6 +27,7 @@ describe("withTelegramReplyStyleGuard", () => {
     expect(prompt).toContain(
       "默认中文，短、准、有用；语气轻松自然，像朋友一样直接聊天；默认说人话，少讲内部实现和技术术语，除非 Albert 明确要细节；该加 emoji 时少量加，别刷屏。",
     );
+    expect(prompt).toContain("任何中间更新必须以「关键发现：」「阶段结果：」「阻塞：」或「需要确认：」开头；最终答案不用标签。");
   });
 
   it("injects auditable lifecycle discipline into every Telegram turn", () => {
