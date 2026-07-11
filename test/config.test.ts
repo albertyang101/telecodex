@@ -147,7 +147,7 @@ describe("loadConfig", () => {
       defaultLaunchProfileId: "default",
       enableUnsafeLaunchProfiles: false,
       toolVerbosity: "all",
-      streamAgentResponses: true,
+      streamAgentResponses: false,
       showTurnTokenUsage: false,
       enableTelegramLogin: true,
       enableTelegramReactions: false,
@@ -292,7 +292,7 @@ describe("loadConfig", () => {
     expect(config.defaultLaunchProfileId).toBe("default");
     expect(config.enableUnsafeLaunchProfiles).toBe(false);
     expect(config.toolVerbosity).toBe("none");
-    expect(config.streamAgentResponses).toBe(true);
+    expect(config.streamAgentResponses).toBe(false);
     expect(config.showTurnTokenUsage).toBe(false);
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
@@ -774,7 +774,7 @@ describe("loadConfig", () => {
 
     delete process.env.STREAM_AGENT_RESPONSES;
     const config = loadConfig();
-    expect(config.streamAgentResponses).toBe(true);
+    expect(config.streamAgentResponses).toBe(false);
   });
 
   it("falls back to defaults for invalid optional enum values", () => {

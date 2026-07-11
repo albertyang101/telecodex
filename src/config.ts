@@ -128,7 +128,7 @@ export function loadConfig(): TeleCodexConfig {
     launchProfiles,
   );
   const toolVerbosity = parseToolVerbosity(optionalString(process.env.TOOL_VERBOSITY));
-  const streamAgentResponses = parseBooleanEnv(optionalString(process.env.STREAM_AGENT_RESPONSES), true);
+  const streamAgentResponses = parseBooleanEnv(optionalString(process.env.STREAM_AGENT_RESPONSES), false);
   const showTurnTokenUsage = parseBooleanEnv(optionalString(process.env.SHOW_TURN_TOKEN_USAGE), false);
   const enableTelegramLogin = parseBooleanEnv(optionalString(process.env.ENABLE_TELEGRAM_LOGIN), true);
   const enableTelegramReactions = parseBooleanEnv(
