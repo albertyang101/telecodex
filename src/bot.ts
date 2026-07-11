@@ -3125,7 +3125,7 @@ function recoverableIntermediateUpdate(text: string): string {
     }
 
     const resultClause = head.match(
-      /(?:^|[，,；;。.!]\s*)((?:关键发现|阶段结果|结果(?:是|为)?|发现|查明|已完成|成功|失败|通过|根因|已经|仍在)[：:]?)/,
+      /(?:^|[，,；;。.!：:]\s*)((?:关键发现|阶段结果|结果(?:是|为)?|发现|查明|已完成|成功|失败|通过|根因|已经|仍在)[：:]?)/,
     );
     if (resultClause?.index !== undefined && resultClause[1]) {
       const markerOffset = resultClause[0].lastIndexOf(resultClause[1]);

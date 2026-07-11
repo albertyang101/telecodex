@@ -894,6 +894,11 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
+      callbacks.onTextDelta("我先检查完了: 发现配置没有生效。");
+      callbacks.onAgentMessage?.("我先检查完了: 发现配置没有生效。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       callbacks.onTextDelta("已完成第二阶段，这条也没有进度标签。");
       callbacks.onAgentMessage?.("已完成第二阶段，这条也没有进度标签。", {
         isFinal: false,
@@ -928,6 +933,7 @@ describe("createBot response delivery", () => {
     expect(visibleReplyTexts.join("\n")).not.toContain("我先把文件检查一下。");
     expect(visibleReplyTexts.join("\n")).not.toContain("失败日志。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("结果是生产仍在旧版本。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("发现配置没有生效。"))).toHaveLength(1);
     expect(visibleReplyTexts.join("\n")).toContain("第三阶段刚开始。");
     expect(visibleReplyTexts.join("\n")).toContain("provider failed");
     expect(transcript).toContain("已完成第一阶段，但这条没有进度标签。");
@@ -937,6 +943,7 @@ describe("createBot response delivery", () => {
     expect(transcript).not.toContain("我先把文件检查一下。");
     expect(transcript).not.toContain("失败日志。");
     expect(transcript).toContain("结果是生产仍在旧版本。");
+    expect(transcript).toContain("发现配置没有生效。");
     expect(transcript).toContain("第三阶段刚开始。");
     expect(transcript).toContain("provider failed");
   });
