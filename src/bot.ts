@@ -1182,12 +1182,13 @@ export function createBot(
       const visibleText = visibleCompletedAgentMessage(text, metadata);
       accumulatedText = "";
       if (!visibleText) {
+        const recoverableText = recoverableIntermediateUpdate(completedText);
         if (
-          completedText &&
+          recoverableText &&
           metadata?.isFinal === false &&
           metadata.followedByTool === false
         ) {
-          undeliveredCompletedMessages.push(completedText);
+          undeliveredCompletedMessages.push(recoverableText);
         }
         return;
       }
@@ -3108,16 +3109,37 @@ function normalizeIntermediateUpdateHead(text: string): string {
     .trim();
 }
 
+const PROCESS_NARRATION_HEAD_RE =
+  /^(?:我先(?:去|来)?(?:看|看看|查看|查|检查|确认一下|跑|读|做|处理|准备)|我准备(?:去|先)?(?:看|查看|查|检查|确认|跑|读|做|处理)|我接下来|我现在(?:要|去|来|先)|下一步|接下来|然后|收到[，。]?\s*我先|let me\b|going to\b|now(?:\s+|,\s*)(?:i(?:['’]ll|\s+will|\s+am|['’]m)|going to)\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i;
+
+function isProcessNarrationHead(head: string): boolean {
+  return PROCESS_NARRATION_HEAD_RE.test(head);
+}
+
+function recoverableIntermediateUpdate(text: string): string {
+  const lines = text.trim().split("\n");
+  let firstRecoverableLine = 0;
+  while (
+    firstRecoverableLine < lines.length &&
+    isProcessNarrationHead(normalizeIntermediateUpdateHead(lines[firstRecoverableLine] ?? ""))
+  ) {
+    firstRecoverableLine += 1;
+  }
+  return lines.slice(firstRecoverableLine).join("\n").trim();
+}
+
 function visibleIntermediateUpdate(text: string): string {
   const lines = text.trim().split("\n");
   const firstVisibleLine = lines.findIndex((line) => {
     const head = normalizeIntermediateUpdateHead(line);
-    const processNarration =
-      /^(?:我(?:先|准备|接下来|现在(?:要|去|来)?)|下一步|接下来|然后|收到[，。]?\s*我先|let me\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i.test(head);
+    const processNarration = isProcessNarrationHead(head);
+    const directQuestionAfterNarration =
+      processNarration &&
+      /[：:]\s*(?:你要不要|你是否|您是否|需要你|请确认).*[？?]$/.test(head);
     return (
       STRUCTURED_INTERMEDIATE_UPDATE_RE.test(head) ||
-      (!processNarration && /(需要你|请确认)/.test(head)) ||
-      ((!processNarration || /[：:]/.test(head)) && /[？?]$/.test(head))
+      directQuestionAfterNarration ||
+      (!processNarration && (/(需要你|请确认)/.test(head) || /[？?]$/.test(head)))
     );
   });
   return firstVisibleLine >= 0 ? lines.slice(firstVisibleLine).join("\n").trim() : "";
