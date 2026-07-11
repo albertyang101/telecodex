@@ -65,6 +65,11 @@ def main() -> int:
             isinstance(bundle, str) for bundle in bundles
         ):
             raise ValueError(f"invalid bundle contract for role: {args.role}")
+        unsupported = sorted(set(bundles) - {"graphify"})
+        if unsupported:
+            raise ValueError(
+                "unsupported default bundle(s): " + ", ".join(unsupported)
+            )
 
         codex_home = Path(args.codex_home).expanduser().resolve()
         workspace = Path(args.workspace).expanduser().resolve()

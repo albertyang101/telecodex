@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +77,61 @@ describe("Codex Bot builder role bundles", () => {
       }
     },
   );
+
+  it("fails closed when the shared role manifest names an unsupported bundle", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "codex-role-unknown-bundle-"));
+    const copiedInstaller = join(fixture, "install-codex-role-bundles.py");
+    const copiedManifest = join(fixture, "codex-bot-role-bundles.json");
+    copyFileSync(installerPath, copiedInstaller);
+    writeFileSync(copiedManifest, JSON.stringify({
+      version: 1,
+      roles: {
+        developer: { default_bundles: ["graphfiy"] },
+      },
+    }));
+    try {
+      const result = spawnSync("/usr/bin/python3", [
+        copiedInstaller,
+        "--codex-home",
+        join(fixture, "codex-home"),
+        "--workspace",
+        join(fixture, "workspace"),
+        "--role",
+        "developer",
+      ], { encoding: "utf8" });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("unsupported default bundle");
+      expect(existsSync(join(fixture, "codex-home"))).toBe(false);
+      expect(existsSync(join(fixture, "workspace"))).toBe(false);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("is byte-idempotent when the developer role is installed twice", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "codex-role-idempotent-"));
+    const codexHome = join(fixture, "codex-home");
+    const workspace = join(fixture, "workspace");
+    try {
+      expect(runInstaller("developer", codexHome, workspace).status).toBe(0);
+      const first = [
+        readFileSync(join(codexHome, "hooks.json"), "utf8"),
+        readFileSync(join(workspace, ".codex/graphify-install.json"), "utf8"),
+        readFileSync(join(workspace, ".codex/role-bundles.json"), "utf8"),
+      ];
+      expect(runInstaller("developer", codexHome, workspace).status).toBe(0);
+      const second = [
+        readFileSync(join(codexHome, "hooks.json"), "utf8"),
+        readFileSync(join(workspace, ".codex/graphify-install.json"), "utf8"),
+        readFileSync(join(workspace, ".codex/role-bundles.json"), "utf8"),
+      ];
+
+      expect(second).toEqual(first);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
 
   it("rejects an unknown builder role without writing targets", () => {
     const fixture = mkdtempSync(join(tmpdir(), "codex-role-invalid-"));
