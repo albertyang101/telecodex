@@ -98,12 +98,14 @@ describe("handoff-store", () => {
           pendingRotation: true,
           pendingMandatory: true,
           interruptedTurn: "这条被打断了",
+          interruptedAttempts: 1,
           lastKnownRatio: 0.62,
         };
         saveChatState(dir, "6872058088", state);
         const loaded = loadChatState(dir, "6872058088");
         expect(loaded.pendingMandatory).toBe(true);
         expect(loaded.interruptedTurn).toBe("这条被打断了");
+        expect(loaded.interruptedAttempts).toBe(1);
         expect(loaded.lastKnownRatio).toBeCloseTo(0.62, 5);
         expect(loaded.buffer).toEqual(state.buffer);
         expect(loaded.pendingRotation).toBe(true);
@@ -124,6 +126,7 @@ describe("handoff-store", () => {
         expect(loaded.pendingRotation).toBe(true);
         expect(loaded.pendingMandatory).toBeFalsy();
         expect(loaded.interruptedTurn).toBeUndefined();
+        expect(loaded.interruptedAttempts).toBeUndefined();
         expect(loaded.lastKnownRatio).toBeUndefined();
       } finally {
         rmSync(dir, { recursive: true, force: true });
@@ -140,6 +143,7 @@ describe("handoff-store", () => {
             pendingRotation: false,
             pendingMandatory: "yes",
             interruptedTurn: 42,
+            interruptedAttempts: "one",
             lastKnownRatio: "0.62",
           }),
           "utf8",
@@ -147,6 +151,7 @@ describe("handoff-store", () => {
         const loaded = loadChatState(dir, "bad");
         expect(loaded.pendingMandatory).toBeFalsy();
         expect(loaded.interruptedTurn).toBeUndefined();
+        expect(loaded.interruptedAttempts).toBeUndefined();
         expect(loaded.lastKnownRatio).toBeUndefined();
       } finally {
         rmSync(dir, { recursive: true, force: true });

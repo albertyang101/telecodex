@@ -201,6 +201,21 @@ describe("thread-rotation", () => {
       expect(disabled.interruptedTurn).toBeUndefined();
     });
 
+    it("tracks one bounded retry across handoff consumption and clears it after success", () => {
+      const heavy = recordTurn(emptyChatState(), { userText: "heavy", assistantText: "ok", lastInputTokens: HEAVY }, cfg);
+      const base = takeRotationHandoff(heavy, cfg).state;
+      const first = recordInterruptedTurn(base, "retry-me", cfg);
+      expect(first.interruptedAttempts).toBe(1);
+      const taken = takeRotationHandoff(first, cfg);
+      expect(taken.state.interruptedTurn).toBeUndefined();
+      expect(taken.state.interruptedAttempts).toBe(1);
+      const second = recordInterruptedTurn(taken.state, "retry-me", cfg);
+      expect(second.interruptedAttempts).toBe(2);
+      const recovered = recordTurn(taken.state, { userText: "retry-me", assistantText: "done", lastInputTokens: LIGHT }, cfg);
+      expect(recovered.interruptedTurn).toBeUndefined();
+      expect(recovered.interruptedAttempts).toBeUndefined();
+    });
+
     it("carries the interrupted turn into the handoff and clears it on consumption", () => {
       const s = recordTurn(emptyChatState(), { userText: "重活", assistantText: "ok", lastInputTokens: HEAVY }, cfg);
       const interrupted = recordInterruptedTurn(takeRotationHandoff(s, cfg).state, "把设计稿写完", cfg);

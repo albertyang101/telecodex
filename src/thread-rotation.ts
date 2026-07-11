@@ -35,6 +35,8 @@ export interface ChatRotationState {
   pendingMandatory?: boolean;
   /** User text of a turn that was aborted mid-answer (ALB-1205); absent = none. */
   interruptedTurn?: string;
+  /** Number of consecutive context-pressure timeout attempts for the active breakpoint. */
+  interruptedAttempts?: number;
   /** Fill ratio of the last turn that reported usage (ALB-1205); absent = unknown. */
   lastKnownRatio?: number;
 }
@@ -105,9 +107,6 @@ export function recordTurn(
   if (state.pendingMandatory || mandatory) {
     next.pendingMandatory = true;
   }
-  if (state.interruptedTurn !== undefined) {
-    next.interruptedTurn = state.interruptedTurn;
-  }
   const lastKnownRatio = ratio > 0 ? ratio : state.lastKnownRatio;
   if (lastKnownRatio !== undefined) {
     next.lastKnownRatio = lastKnownRatio;
@@ -143,6 +142,7 @@ export function recordInterruptedTurn(
   const text = typeof userText === "string" ? userText.trim() : "";
   if (text) {
     next.interruptedTurn = text;
+    next.interruptedAttempts = (state.interruptedAttempts ?? 0) + 1;
   }
   const cap = resolveHardCap(cfg.hardCap, cfg.threshold);
   if (cap !== undefined && ratio >= cap) {
@@ -221,6 +221,9 @@ export function takeRotationHandoff(
   };
   const handoff = renderHandoff(state.buffer, context);
   const nextState: ChatRotationState = { buffer: state.buffer, pendingRotation: false };
+  if (state.interruptedAttempts !== undefined) {
+    nextState.interruptedAttempts = state.interruptedAttempts;
+  }
   if (state.lastKnownRatio !== undefined) {
     nextState.lastKnownRatio = state.lastKnownRatio;
   }

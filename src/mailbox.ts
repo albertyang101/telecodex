@@ -209,11 +209,15 @@ export async function runMailboxDeliveryOnce(
       }
       // A turn cut short by the timeout on an already-heavy thread becomes a
       // rotation breakpoint: the next thread's HANDOFF resumes it (ALB-1205).
+      let retryInterruptedMessage = false;
       if (rotationCfg.enabled) {
         rotationState = recordInterruptedTurn(rotationState, mailboxTurnDescriptor(message), rotationCfg);
+        retryInterruptedMessage = rotationState.interruptedAttempts === 1;
         persistRotationState();
       }
-      await quarantineTimedOutMailboxMessage(settings, statePath, seen, message);
+      if (!retryInterruptedMessage) {
+        await quarantineTimedOutMailboxMessage(settings, statePath, seen, message);
+      }
       error.startAbortGrace(onFatalRecovery);
       registry.updateMetadata(contextKey, session);
       skipped += 1;

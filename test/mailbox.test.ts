@@ -1270,13 +1270,16 @@ describe("mailbox bridge", () => {
 
     // Tick 2: message B rotates onto a fresh thread, then times out mid-answer.
     // Body differs from subject so the breakpoint fidelity (§A.4) is observable.
-    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-2", subject: "会超时的二", body: "会超时的二的正文：先把 rotation 设计稿补完" });
+    const interruptedPath = writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-2", subject: "会超时的二", body: "会超时的二的正文：先把 rotation 设计稿补完" });
     await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
     expect(session.abort).toHaveBeenCalled();
 
-    // Tick 3: message C rotates again and its HANDOFF carries the interrupted turn.
-    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "mbx-3", subject: "续上的三", body: "续上的三" });
-    await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    expect(existsSync(interruptedPath)).toBe(true);
+
+    // Tick 3: the same unread message B is retried automatically on a fresh thread.
+    const recovered = await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    expect(recovered).toEqual({ processed: 1, replied: 1, skipped: 0 });
+    expect(existsSync(interruptedPath)).toBe(false);
 
     const lastPrompt = JSON.stringify(session.prompt.mock.calls.at(-1)![0]);
     expect(lastPrompt).toContain(HANDOFF_MARKER);
@@ -1285,6 +1288,38 @@ describe("mailbox bridge", () => {
     // §A.4: the interrupted breakpoint keeps the letter's body excerpt — a
     // subject-only breakpoint loses what the interrupted letter was asking for.
     expect(lastPrompt).toContain("正文摘录: 会超时的二的正文：先把 rotation 设计稿补完");
+  });
+
+  it("quarantines the same heavy mailbox message after its one automatic resume also times out", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    const rotateCfg = {
+      personasRoot, workspace, promptTimeoutMs: 20,
+      autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 } as never,
+    };
+    let turn = 0;
+    const session = createSession(async (_input, callbacks) => {
+      turn += 1;
+      if (turn >= 2) { await new Promise(() => {}); return; }
+      callbacks.onAgentMessage?.("heavy-ok");
+      callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "retry-a", subject: "heavy", body: "heavy" });
+    await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    const retryPath = writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId: "retry-b", subject: "retry", body: "retry" });
+    await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    expect(existsSync(retryPath)).toBe(true);
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    expect(session.prompt).toHaveBeenCalledTimes(3);
+    expect(session.abort).toHaveBeenCalledTimes(2);
+    const receipt = JSON.parse(readFileSync(path.join(personasRoot, "_shared", "memory", "mailbox", "_receipts", "albert-v3", "retry-b.json"), "utf8"));
+    expect(receipt.status).toBe("failed_prompt_timeout");
+    const fourth = await runMailboxDeliveryOnce(createConfig(rotateCfg), registry as never);
+    expect(fourth.processed).toBe(0);
   });
 
   it("refuses a mandatory (hard-cap) mailbox rotation on the over-cap thread when newThread fails, deferring the message (ALB-1205)", async () => {

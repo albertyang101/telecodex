@@ -44,6 +44,7 @@ export function loadChatState(stateDir: string, contextKey: string): ChatRotatio
       pendingRotation?: unknown;
       pendingMandatory?: unknown;
       interruptedTurn?: unknown;
+      interruptedAttempts?: unknown;
       lastKnownRatio?: unknown;
     };
     const buffer = Array.isArray(obj.buffer) ? obj.buffer.filter(isHandoffEntry) : [];
@@ -56,6 +57,9 @@ export function loadChatState(stateDir: string, contextKey: string): ChatRotatio
     }
     if (typeof obj.interruptedTurn === "string" && obj.interruptedTurn.trim()) {
       state.interruptedTurn = obj.interruptedTurn;
+    }
+    if (typeof obj.interruptedAttempts === "number" && Number.isInteger(obj.interruptedAttempts) && obj.interruptedAttempts > 0) {
+      state.interruptedAttempts = obj.interruptedAttempts;
     }
     if (typeof obj.lastKnownRatio === "number" && Number.isFinite(obj.lastKnownRatio) && obj.lastKnownRatio > 0) {
       state.lastKnownRatio = obj.lastKnownRatio;
@@ -81,6 +85,7 @@ export function saveChatState(stateDir: string, contextKey: string, state: ChatR
     // never used them round-trips to the same shape it started with.
     pendingMandatory: state.pendingMandatory === true,
     interruptedTurn: state.interruptedTurn,
+    interruptedAttempts: state.interruptedAttempts,
     lastKnownRatio: state.lastKnownRatio,
   });
   writeFileSync(tmp, payload, "utf8");
