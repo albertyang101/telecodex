@@ -280,6 +280,7 @@ describe("CodexSessionService", () => {
       expect.objectContaining({
         config: expect.objectContaining({
           approval_policy: "never",
+          features: { unified_exec: false },
           mcp_servers: {
             telegram_transport: {
               command: process.execPath,
@@ -492,6 +493,10 @@ describe("CodexSessionService", () => {
     const profile = service.setLaunchProfile("readonly");
     expect(profile.label).toBe("Read Only");
     expect(firstThread.options.sandboxMode).toBe("workspace-write");
+    expect(mockState.createdCodexOptions.at(-1)?.config).toMatchObject({
+      approval_policy: "never",
+      features: { unified_exec: false },
+    });
 
     await service.newThread();
 
