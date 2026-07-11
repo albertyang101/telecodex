@@ -3116,7 +3116,7 @@ function normalizeIntermediateUpdateHead(text: string): string {
 }
 
 const PROCESS_NARRATION_HEAD_RE =
-  /^(?:我先(?:把|将)|我先(?:去|来)?(?:看|看看|查看|查|检查|确认一下|跑|读|做|处理|准备)|我准备(?:把|将)|我准备(?:去|先)?(?:看|查看|查|检查|确认|跑|读|做|处理)|我接下来|我现在(?:要|去|来|先)|下一步|接下来|然后|收到[，。]?\s*我先|let me\b|going to\b|now(?:\s+|,\s*)(?:i(?:['’]ll|\s+will|\s+am|['’]m)|going to)\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i;
+  /^(?:我先(?:把|将)|我先(?:去|来)?(?:看|看看|查看|查|检查|确认一下|跑|读|做|处理|准备)|我准备(?:把|将)|我准备(?:去|先)?(?:看|查看|查|检查|确认|跑|读|做|处理)|我接下来|我现在(?:要|去|来|先)|下一步|接下来|然后|再(?:继续)?|接着|随后|准备|收到[，。]?\s*我先|let me\b|going to\b|now(?:\s+|,\s*)(?:i(?:['’]ll|\s+will|\s+am|['’]m)|going to)\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i;
 
 function isProcessNarrationHead(head: string): boolean {
   return PROCESS_NARRATION_HEAD_RE.test(head);
