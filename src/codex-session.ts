@@ -75,7 +75,7 @@ export interface CreateOptions {
   resumeThreadId?: string;
 }
 
-export type CodexPromptInput = string | { text?: string; imagePaths?: string[]; stagedFileInstructions?: string };
+export type CodexPromptInput = string | { text?: string; visibleText?: string; imagePaths?: string[]; stagedFileInstructions?: string };
 type CodexConfigValue = string | number | boolean | CodexConfigValue[] | CodexConfigObject;
 type CodexConfigObject = { [key: string]: CodexConfigValue };
 

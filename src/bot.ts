@@ -208,7 +208,30 @@ function visibleUserText(input: CodexPromptInput): string {
     return input;
   }
 
-  return input.text ?? "";
+  return input.visibleText ?? input.text ?? "";
+}
+
+function withTelegramReplyContext(ctx: Context, currentText: string): CodexPromptInput {
+  const replied = ctx.message?.reply_to_message as { text?: string; caption?: string } | undefined;
+  if (!replied) {
+    return currentText;
+  }
+
+  const sourceText = replied.text?.trim() || replied.caption?.trim();
+  if (!sourceText) {
+    return currentText;
+  }
+
+  return {
+    text: [
+      "[TELEGRAM REPLY CONTEXT]",
+      sourceText,
+      "",
+      "[CURRENT MESSAGE]",
+      currentText,
+    ].join("\n"),
+    visibleText: currentText,
+  };
 }
 
 function padTwoDigits(value: number): string {
@@ -530,7 +553,10 @@ export function createBot(
     }
 
     if (input.text) {
-      lastPromptInput.set(contextKey, { input: input.text, msgId });
+      lastPromptInput.set(contextKey, {
+        input: input.visibleText ? { text: input.text, visibleText: input.visibleText } : input.text,
+        msgId,
+      });
     }
   };
 
@@ -2783,7 +2809,7 @@ export function createBot(
     const endInFlight = trackedByMiddleware ? undefined : beginInFlight();
     try {
       const session = await registry.getOrCreate(contextKey);
-      await runOrQueuePrompt(ctx, contextKey, ctx.chat.id, session, userText);
+      await runOrQueuePrompt(ctx, contextKey, ctx.chat.id, session, withTelegramReplyContext(ctx, userText));
     } finally {
       endInFlight?.();
     }
@@ -2824,7 +2850,7 @@ export function createBot(
         return;
       }
       queuedPrompt.status = "ready";
-      queuedPrompt.input = transcript;
+      queuedPrompt.input = withTelegramReplyContext(ctx, transcript);
     } catch (error) {
       queuedPrompt.status = "skipped";
       const note = "Note: voice transcription is separate from CODEX_API_KEY.";

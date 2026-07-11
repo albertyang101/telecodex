@@ -1359,15 +1359,23 @@ describe("createBot response delivery", () => {
     await voiceHandler({
       chat: { id: 42 },
       from: { id: 123 },
-      message: { message_id: 76, voice: { file_id: "voice-private" } },
+      message: {
+        message_id: 76,
+        voice: { file_id: "voice-private" },
+        reply_to_message: { message_id: 75, text: "这是语音 Reply 的原消息" },
+      },
       api: bot.api,
     });
 
-    const codexInput = String(session.prompt.mock.calls[0][0]);
+    const voiceInput = session.prompt.mock.calls[0][0] as { text?: string; visibleText?: string };
+    const codexInput = voiceInput.text ?? String(voiceInput);
+    expect(voiceInput.visibleText).toBe("这段转写只应该进 Codex");
     expect(codexInput).toContain("[DEVELOPER DISCIPLINE]");
     expect(codexInput).toContain("discipline_version=ALB-714-hard-discipline-v1");
     expect(codexInput).toContain("fix at the earliest reliable boundary");
     expect(codexInput).toContain("这段转写只应该进 Codex");
+    expect(codexInput).toContain("[TELEGRAM REPLY CONTEXT]");
+    expect(codexInput).toContain("这是语音 Reply 的原消息");
     const visibleReplies = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
     expect(visibleReplies).toContain("我听到了。");
     expect(visibleReplies).not.toContain("Transcribed");
@@ -1862,6 +1870,95 @@ describe("createBot response delivery", () => {
     expect(visible).not.toContain("[DEVELOPER DISCIPLINE]");
     expect(visible).not.toContain("discipline_version=ALB-714-hard-discipline-v1");
     expect(visible).not.toContain("Fix root cause");
+  });
+
+  it("passes Telegram Reply source text together with the new message", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("看到了引用。");
+      callbacks.onAgentMessage?.("看到了引用。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 899,
+        text: "这是我现在的新问题",
+        reply_to_message: {
+          message_id: 898,
+          text: "这是我长按 Reply 的原消息",
+          from: { id: 321, first_name: "Ada" },
+        },
+      },
+      api: bot.api,
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const replyInput = session.prompt.mock.calls[0][0] as { text?: string; visibleText?: string };
+    expect(replyInput.visibleText).toBe("这是我现在的新问题");
+    const input = replyInput.text ?? String(replyInput);
+    expect(input).toContain("[TELEGRAM REPLY CONTEXT]");
+    expect(input).toContain("这是我长按 Reply 的原消息");
+    expect(input).toContain("[CURRENT MESSAGE]");
+    expect(input).toContain("这是我现在的新问题");
+    expect(input).not.toContain("Replied sender");
+    expect(input).not.toContain("Replied message id");
+    expect(input).not.toContain("Ada");
+  });
+
+  it("keeps current-message source preferences separate from replied text", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("结论。\n\n来源：\nhttps://example.com/old");
+      callbacks.onAgentMessage?.("结论。\n\n来源：\nhttps://example.com/old");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: {
+        message_id: 897,
+        text: "这次不要来源",
+        reply_to_message: { message_id: 896, text: "请给我来源" },
+      },
+      api: bot.api,
+    });
+
+    const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    expect(visible).toContain("结论。");
+    expect(visible).not.toContain("https://example.com/old");
+
+    const retryHandler = bot.__handlers.commands.get("retry");
+    await retryHandler({
+      chat: { id: 42 }, from: { id: 123 },
+      message: { message_id: 898, text: "/retry" },
+      api: bot.api,
+    });
+    const retried = session.prompt.mock.calls[1][0] as { text?: string; visibleText?: string };
+    expect(retried.visibleText).toBe("这次不要来源");
+    expect(retried.text).toContain("请给我来源");
+  });
+
+  it("passes replied captions as Reply context", async () => {
+    const session = createSession(async (callbacks) => { callbacks.onAgentEnd(); });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    await textHandler({
+      chat: { id: 42 }, from: { id: 123 },
+      message: { message_id: 895, text: "看这条", reply_to_message: { message_id: 894, caption: "原图说明" } },
+      api: bot.api,
+    });
+    const replyInput = session.prompt.mock.calls[0][0] as { text?: string };
+    expect(replyInput.text).toContain("原图说明");
   });
 
   it("thin bridge sends each text message immediately without dispatcher coalescing", async () => {
