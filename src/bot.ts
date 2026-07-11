@@ -1276,6 +1276,16 @@ export function createBot(
         hasCompletedAgentText = true;
         if (streamAgentResponses) {
           enqueueCompletedStreamMessage(text, metadata);
+        } else {
+          accumulatedText = "";
+          const recoverableText = recoverableIntermediateUpdate(visibleCompletedAgentMessage(text));
+          if (
+            recoverableText &&
+            metadata?.isFinal === false &&
+            metadata.followedByTool === false
+          ) {
+            undeliveredCompletedMessages.push(recoverableText);
+          }
         }
       },
       onToolStart: (toolName: string, toolCallId: string) => {
@@ -1600,6 +1610,7 @@ export function createBot(
           const key = text
             .replace(/\s+([，,；;。.!：:！？?])/g, (_match, punctuation) => punctuation)
             .replace(/\s+/g, " ")
+            .replace(/[。.!！？?]+$/g, "")
             .trim();
           if (seenRecoveredFailureParts.has(key)) {
             return false;
@@ -1607,9 +1618,7 @@ export function createBot(
           seenRecoveredFailureParts.add(key);
           return true;
         });
-        const failureSourceText = streamAgentResponses
-          ? uniqueRecoveredFailureParts.join("\n\n")
-          : completedAgentText;
+        const failureSourceText = uniqueRecoveredFailureParts.join("\n\n");
         const failureReplyText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
         const transcriptFailureText = [...completedStreamMessages, failureReplyText]
           .filter((text) => Boolean(text))
@@ -3144,7 +3153,13 @@ function normalizeIntermediateUpdateHead(text: string): string {
 const PROCESS_NARRATION_HEAD_RE =
   /^(?:我先(?:把|将)|我先(?:去|来)?(?:看|看看|查看|查|检查|确认(?:一下|完了)?|跑|读|做|处理|准备)|我准备(?:把|将)|我准备(?:去|先)?(?:看|查看|查|检查|确认|跑|读|做|处理)|我接下来|我现在(?:要|去|来|先)|下一步|接下来|然后|再(?:继续|去|检查(?!结果|报告|任务)|查看(?!结果)|查(?!看?结果)|跑|读|做|处理|测试(?!结果|报告|任务))|(?:接着|随后|准备)(?:继续|去|检查(?!结果|报告|任务)|查看(?!结果)|查(?!看?结果)|跑|读|做|处理|测试(?!结果|报告|任务))|收到[，。]?\s*我先|let me\b|going to\b|now(?:\s+|,\s*)(?:i(?:['’]ll|\s+will|\s+am|['’]m)|going to)\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i;
 
+const RESULT_NOUN_COMPOUND_RE =
+  /^(?:再|接着|随后|准备)(?:检查|查看|查询|查阅|核查|测试)(?:结果|报告|任务)(?=(?:显示|表明|说明|证明|已|为|是|未|仍|依然|成功|失败|完成|[：:]))/;
+
 function isProcessNarrationHead(head: string): boolean {
+  if (RESULT_NOUN_COMPOUND_RE.test(head)) {
+    return false;
+  }
   return PROCESS_NARRATION_HEAD_RE.test(head);
 }
 
@@ -3157,7 +3172,7 @@ function recoverableIntermediateUpdate(text: string): string {
     }
 
     const resultClause = head.match(
-      /(?:^|[，,；;。.!：:]\s*)((?:关键发现|阶段结果|结果(?:是|为)?|发现(?!\s*(?:还|尚)?(?:没有|未)(?:继续|去)?(?:跑|检查|查看|测试|读|做|处理))(?=[^，,；;。.!：:]{0,40}(?:没有|未|仍|依然|已经|是|为|成功|失败|生效|运行|完成))|查明|已完成|成功(?=了|是|为|[：:]|[。！？!?]|$)|失败(?=了|是|为|[：:]|[。！？!?]|$)|通过(?=了|是|为|[：:]|[。！？!?]|$)|根因(?=是|为|[：:])|已经|仍在)[：:]?)/,
+      /(?:^|[，,；;。.!：:]\s*)((?:关键发现|阶段结果|结果(?:是|为)?|发现(?!\s*(?:还|尚|仍)?(?:没有|未)(?:继续|去)?(?:跑|检查|查看|测试|读|做|处理))(?=[^，,；;。.!：:]{0,40}(?:没有|未|仍|依然|已经|是|为|成功|失败|生效|运行|完成))|查明|已完成|成功(?=了|是|为|[：:]|[。！？!?]|$)|失败(?=了|是|为|[：:]|[。！？!?]|$)|通过(?=了|是|为|[：:]|[。！？!?]|$)|根因(?=是|为|[：:])|已经|仍在)[：:]?)/,
     );
     if (resultClause?.index !== undefined && resultClause[1]) {
       const markerOffset = resultClause[0].lastIndexOf(resultClause[1]);

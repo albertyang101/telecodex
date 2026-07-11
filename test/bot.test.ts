@@ -942,6 +942,11 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
+      callbacks.onTextDelta("我先检查日志，发现仍未跑测试。");
+      callbacks.onAgentMessage?.("我先检查日志，发现仍未跑测试。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       callbacks.onTextDelta("我先检查了配置，生产服务依然运行旧版本。");
       callbacks.onAgentMessage?.("我先检查了配置，生产服务依然运行旧版本。", {
         isFinal: false,
@@ -969,6 +974,16 @@ describe("createBot response delivery", () => {
       });
       callbacks.onTextDelta("随后查看结果显示服务仍在旧版本。");
       callbacks.onAgentMessage?.("随后查看结果显示服务仍在旧版本。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("随后查看报告显示服务仍在旧版本。");
+      callbacks.onAgentMessage?.("随后查看报告显示服务仍在旧版本。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("随后查询结果显示服务仍在旧版本。");
+      callbacks.onAgentMessage?.("随后查询结果显示服务仍在旧版本。", {
         isFinal: false,
         followedByTool: false,
       });
@@ -1046,12 +1061,15 @@ describe("createBot response delivery", () => {
     expect(visibleReplyTexts.join("\n")).not.toContain("发现尚未跑测试。");
     expect(visibleReplyTexts.join("\n")).not.toContain("发现还未跑测试。");
     expect(visibleReplyTexts.join("\n")).not.toContain("发现没有继续跑测试。");
+    expect(visibleReplyTexts.join("\n")).not.toContain("发现仍未跑测试。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("生产服务依然运行旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.join("\n")).not.toContain("再继续跑测试。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后发现服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试结果显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后检查结果显示配置未生效。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后查看结果显示服务仍在旧版本。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查看报告显示服务仍在旧版本。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查询结果显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.join("\n")).not.toContain("随后查看配置是否生效。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试报告显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试任务已完成。"))).toHaveLength(1);
@@ -1074,12 +1092,15 @@ describe("createBot response delivery", () => {
     expect(transcript).not.toContain("发现尚未跑测试。");
     expect(transcript).not.toContain("发现还未跑测试。");
     expect(transcript).not.toContain("发现没有继续跑测试。");
+    expect(transcript).not.toContain("发现仍未跑测试。");
     expect(transcript).toContain("生产服务依然运行旧版本。");
     expect(transcript).not.toContain("再继续跑测试。");
     expect(transcript).toContain("随后发现服务仍在旧版本。");
     expect(transcript).toContain("随后测试结果显示服务仍在旧版本。");
     expect(transcript).toContain("随后检查结果显示配置未生效。");
     expect(transcript).toContain("随后查看结果显示服务仍在旧版本。");
+    expect(transcript).toContain("随后查看报告显示服务仍在旧版本。");
+    expect(transcript).toContain("随后查询结果显示服务仍在旧版本。");
     expect(transcript).not.toContain("随后查看配置是否生效。");
     expect(transcript).toContain("随后测试报告显示服务仍在旧版本。");
     expect(transcript).toContain("随后测试任务已完成。");
@@ -1102,7 +1123,7 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
-      callbacks.onTextDelta("我先确认完了，生产服务依然运行旧版本 。");
+      callbacks.onTextDelta("我先确认完了，生产服务依然运行旧版本！");
       throw new Error("provider failed");
     });
     const registry = createRegistry(session);
@@ -1125,9 +1146,48 @@ describe("createBot response delivery", () => {
     const visibleReply = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
     const result = "生产服务依然运行旧版本。";
 
-    const normalizeSpacing = (text: string) => text.replace(/\s+([，,；;。.!：:！？?])/g, (_match, punctuation) => punctuation);
+    const normalizeSpacing = (text: string) =>
+      text
+        .replace(/\s+([，,；;。.!：:！？?])/g, (_match, punctuation) => punctuation)
+        .replace(/[！!]/g, "。");
     expect(normalizeSpacing(visibleReply).split(result)).toHaveLength(2);
     expect(normalizeSpacing(transcript).split(result)).toHaveLength(2);
+  });
+
+  it("recovers every useful completed partial on the quiet-default failure path", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-quiet-failure-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("第一项已经完成。");
+      callbacks.onAgentMessage?.("第一项已经完成。", { isFinal: false, followedByTool: false });
+      callbacks.onTextDelta("我先检查配置。");
+      callbacks.onAgentMessage?.("我先检查配置。", { isFinal: false, followedByTool: false });
+      callbacks.onTextDelta("第二项也已经完成。");
+      callbacks.onAgentMessage?.("第二项也已经完成。", { isFinal: false, followedByTool: false });
+      callbacks.onTextDelta("第三项仍在旧版本。");
+      throw new Error("provider failed");
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 992, text: "安静模式失败恢复" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    const visibleReply = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    for (const result of ["第一项已经完成。", "第二项也已经完成。", "第三项仍在旧版本。"]) {
+      expect(visibleReply).toContain(result);
+      expect(transcript).toContain(result);
+    }
+    expect(visibleReply).not.toContain("我先检查配置。");
+    expect(transcript).not.toContain("我先检查配置。");
   });
 
   it("records prompt failure replies as bot turns without leaking raw provider URLs", async () => {
