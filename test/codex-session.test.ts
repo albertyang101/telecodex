@@ -5,18 +5,22 @@ import type { TeleCodexConfig } from "../src/config.js";
 
 const mockCodexState = vi.hoisted(() => {
   const getThread = vi.fn();
+  const getThreadContextUsage = vi.fn().mockReturnValue(null);
   const listThreads = vi.fn().mockReturnValue([]);
   const listWorkspaces = vi.fn().mockReturnValue([]);
   const listModels = vi.fn().mockReturnValue([]);
 
   return {
     getThread,
+    getThreadContextUsage,
     listThreads,
     listWorkspaces,
     listModels,
     reset: () => {
       getThread.mockReset();
       getThread.mockReturnValue(null);
+      getThreadContextUsage.mockReset();
+      getThreadContextUsage.mockReturnValue(null);
       listThreads.mockReset();
       listThreads.mockReturnValue([]);
       listWorkspaces.mockReset();
@@ -81,6 +85,7 @@ vi.mock("@openai/codex-sdk", () => ({
 
 vi.mock("../src/codex-state.js", () => ({
   getThread: mockCodexState.getThread,
+  getThreadContextUsage: mockCodexState.getThreadContextUsage,
   listThreads: mockCodexState.listThreads,
   listWorkspaces: mockCodexState.listWorkspaces,
   listModels: mockCodexState.listModels,
@@ -952,6 +957,32 @@ describe("CodexSessionService", () => {
     expect(callbacks.onAgentEnd).toHaveBeenCalledTimes(1);
   });
 
+  it("reports the latest request context separately from aggregate tool-heavy usage", async () => {
+    const service = await CodexSessionService.create(createConfig());
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+    mockCodexState.getThreadContextUsage.mockReturnValue({ contextTokens: 119_555, contextWindow: 353_400 });
+    thread.runStreamed.mockResolvedValueOnce({
+      events: streamEvents([
+        { type: "thread.started", thread_id: "thread-live" },
+        {
+          type: "turn.completed",
+          usage: { input_tokens: 1_696_715, cached_input_tokens: 1_576_960, output_tokens: 401 },
+        },
+      ]),
+    });
+
+    await service.prompt("tool-heavy", callbacks);
+
+    expect(mockCodexState.getThreadContextUsage).toHaveBeenCalledWith("thread-live");
+    expect(callbacks.onTurnComplete).toHaveBeenCalledWith({
+      inputTokens: 1_696_715,
+      cachedInputTokens: 1_576_960,
+      outputTokens: 401,
+      lastContextTokens: 119_555,
+      liveContextWindow: 353_400,
+    });
+  });
   it("reports per-turn token usage and accumulates session totals", async () => {
     const service = await CodexSessionService.create(createConfig());
     const thread = mockState.createdThreads[0];

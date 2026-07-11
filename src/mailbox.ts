@@ -220,7 +220,13 @@ export async function runMailboxDeliveryOnce(
       if (rotationCfg.enabled) {
         rotationState = recordTurn(
           rotationState,
-          { userText: mailboxTurnDescriptor(message), assistantText: finalText, lastInputTokens: turnUsage?.inputTokens },
+          {
+            userText: mailboxTurnDescriptor(message),
+            assistantText: finalText,
+            lastInputTokens: turnUsage?.inputTokens,
+            lastContextTokens: turnUsage?.lastContextTokens,
+            liveContextWindow: turnUsage?.liveContextWindow,
+          },
           rotationCfg,
         );
         persistRotationState();
@@ -543,10 +549,13 @@ async function promptMailboxMessage(
   timeoutMs?: number,
   abortGraceMs?: number,
   rotationHandoff?: string | null,
-): Promise<{ text: string; usage?: { inputTokens: number } }> {
+): Promise<{
+  text: string;
+  usage?: { inputTokens: number; lastContextTokens?: number; liveContextWindow?: number };
+}> {
   let accumulatedText = "";
   let completedAgentText = "";
-  let lastUsage: { inputTokens: number } | undefined;
+  let lastUsage: { inputTokens: number; lastContextTokens?: number; liveContextWindow?: number } | undefined;
   const callbacks: CodexSessionCallbacks = {
     onTextDelta: (delta) => {
       accumulatedText += delta;

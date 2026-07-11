@@ -924,7 +924,15 @@ export function createBot(
     let planMessageId: number | undefined;
     let lastRenderedPlan = "";
     let planMessageSending = false;
-    let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
+    let lastTurnUsage:
+      | {
+          inputTokens: number;
+          cachedInputTokens: number;
+          outputTokens: number;
+          lastContextTokens?: number;
+          liveContextWindow?: number;
+        }
+      | undefined;
     let finalizePromise: Promise<string> | undefined;
     const userVisibleText = visibleUserText(userInput);
 
@@ -1521,7 +1529,13 @@ export function createBot(
           contextKey,
           recordTurn(
             rotationStateAfterSuccessfulHandoff ?? getRotationState(contextKey),
-            { userText: userVisibleText, assistantText: finalVisibleText, lastInputTokens: lastTurnUsage?.inputTokens },
+            {
+              userText: userVisibleText,
+              assistantText: finalVisibleText,
+              lastInputTokens: lastTurnUsage?.inputTokens,
+              lastContextTokens: lastTurnUsage?.lastContextTokens,
+              liveContextWindow: lastTurnUsage?.liveContextWindow,
+            },
             rotationCfg,
           ),
         );

@@ -62,6 +62,10 @@ export interface CompletedTurn {
   assistantText?: string;
   /** Input tokens of the just-completed turn (≈ current context fill). */
   lastInputTokens?: number;
+  /** Tokens in the latest model request context from rollout token_count.last_token_usage. */
+  lastContextTokens?: number;
+  /** Live model context window reported beside lastContextTokens. */
+  liveContextWindow?: number;
 }
 
 export function emptyChatState(): ChatRotationState {
@@ -83,25 +87,34 @@ export function recordTurn(
     buffer = appendEntry(buffer, { role: "assistant", text: turn.assistantText }, cfg.maxEntries);
   }
 
-  const sawUsage = typeof turn.lastInputTokens === "number";
+  const hasValidContextSnapshot =
+    typeof turn.lastContextTokens === "number" &&
+    Number.isFinite(turn.lastContextTokens) &&
+    turn.lastContextTokens > 0 &&
+    typeof turn.liveContextWindow === "number" &&
+    Number.isFinite(turn.liveContextWindow) &&
+    turn.liveContextWindow > 0;
+  const effectiveInputTokens = hasValidContextSnapshot ? turn.lastContextTokens! : turn.lastInputTokens;
+  const effectiveContextWindow = hasValidContextSnapshot ? turn.liveContextWindow! : cfg.contextWindow;
+  const sawUsage = typeof effectiveInputTokens === "number";
   const heavy =
     cfg.enabled && sawUsage
       ? shouldRotate({
-          lastInputTokens: turn.lastInputTokens!,
-          contextWindow: cfg.contextWindow,
+          lastInputTokens: effectiveInputTokens!,
+          contextWindow: effectiveContextWindow,
           threshold: cfg.threshold,
         })
       : false;
   const mandatory =
     cfg.enabled && sawUsage
       ? shouldForceRotate({
-          lastInputTokens: turn.lastInputTokens!,
-          contextWindow: cfg.contextWindow,
+          lastInputTokens: effectiveInputTokens!,
+          contextWindow: effectiveContextWindow,
           threshold: cfg.threshold,
           hardCap: cfg.hardCap,
         })
       : false;
-  const ratio = sawUsage ? contextFillRatio(turn.lastInputTokens!, cfg.contextWindow) : 0;
+  const ratio = sawUsage ? contextFillRatio(effectiveInputTokens!, effectiveContextWindow) : 0;
 
   const next: ChatRotationState = { buffer, pendingRotation: state.pendingRotation || heavy || mandatory };
   if (state.pendingMandatory || mandatory) {

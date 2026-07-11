@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import type { TeleCodexConfig } from "./config.js";
 import {
   getThread,
+  getThreadContextUsage,
   listModels,
   listThreads,
   listWorkspaces,
@@ -42,6 +43,8 @@ export interface CodexSessionCallbacks {
     inputTokens: number;
     cachedInputTokens: number;
     outputTokens: number;
+    lastContextTokens?: number;
+    liveContextWindow?: number;
   }) => void;
 }
 
@@ -345,10 +348,18 @@ export class CodexSessionService {
             this.sessionTokens.input += u.input_tokens;
             this.sessionTokens.cached += u.cached_input_tokens;
             this.sessionTokens.output += u.output_tokens;
+            const threadId = this.thread?.id ?? this.currentThreadId;
+            const contextUsage = threadId ? getThreadContextUsage(threadId) : null;
             callbacks.onTurnComplete?.({
               inputTokens: u.input_tokens,
               cachedInputTokens: u.cached_input_tokens,
               outputTokens: u.output_tokens,
+              ...(contextUsage
+                ? {
+                    lastContextTokens: contextUsage.contextTokens,
+                    liveContextWindow: contextUsage.contextWindow,
+                  }
+                : {}),
             });
             callbacks.onAgentEnd();
             break;

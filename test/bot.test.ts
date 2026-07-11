@@ -279,6 +279,29 @@ describe("createBot response delivery", () => {
     expect(secondInput).toContain("第二条：继续修");
   });
 
+  it("does not re-rotate a fresh thread from aggregate tool-heavy usage alone (ALB-1350)", async () => {
+    const session = createSession(async (callbacks) => {
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onTurnComplete?.({
+        inputTokens: 1_696_715,
+        cachedInputTokens: 1_576_960,
+        outputTokens: 401,
+        lastContextTokens: 119_555,
+        liveContextWindow: 353_400,
+      });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-aggregate-");
+    const bot = createBot(createConfig({ workspace, autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 } } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({ chat: { id: 7474 }, from: { id: 123 }, message: { message_id: 1, text: "tool-heavy-1" }, api: bot.api });
+    await textHandler({ chat: { id: 7474 }, from: { id: 123 }, message: { message_id: 2, text: "tool-heavy-2" }, api: bot.api });
+
+    expect(session.newThread).not.toHaveBeenCalled();
+    expect(JSON.stringify(session.prompt.mock.calls[1][0])).not.toContain(HANDOFF_MARKER);
+  });
   it("does not rotate while turns stay light (ALB-1011)", async () => {
     const session = createSession(async (callbacks) => {
       callbacks.onAgentMessage?.("ok");

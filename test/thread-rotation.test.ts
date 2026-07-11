@@ -44,6 +44,41 @@ describe("thread-rotation", () => {
       expect(s.pendingRotation).toBe(false);
     });
 
+    it("uses the latest request context instead of aggregate tool-heavy turn usage", () => {
+      const s = recordTurn(
+        emptyChatState(),
+        {
+          userText: "tool-heavy",
+          assistantText: "done",
+          lastInputTokens: 1_696_715,
+          lastContextTokens: 119_555,
+          liveContextWindow: 353_400,
+        },
+        cfg,
+      );
+
+      expect(s.pendingRotation).toBe(false);
+      expect(s.pendingMandatory).toBeFalsy();
+      expect(s.lastKnownRatio).toBeCloseTo(119_555 / 353_400, 5);
+      expect(takeRotationHandoff(s, cfg).handoff).toBeNull();
+    });
+
+    it("falls back to aggregate usage when the context snapshot is invalid", () => {
+      const s = recordTurn(
+        emptyChatState(),
+        {
+          userText: "bad-snapshot",
+          assistantText: "done",
+          lastInputTokens: OVER_CAP,
+          lastContextTokens: -1,
+          liveContextWindow: 353_400,
+        },
+        cappedCfg,
+      );
+
+      expect(s.pendingRotation).toBe(true);
+      expect(s.pendingMandatory).toBe(true);
+    });
     it("never flags rotation when the feature is disabled", () => {
       const s = recordTurn(emptyChatState(), { userText: "x", assistantText: "y", lastInputTokens: HEAVY }, {
         ...cfg,

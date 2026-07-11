@@ -104,7 +104,7 @@ function reasonLine(context: HandoffContext): string {
         : "上下文占用达到常规阈值，自动翻页";
   const ratio =
     typeof context.ratio === "number" && Number.isFinite(context.ratio) && context.ratio > 0
-      ? `（上下文占用约 ${Math.round(context.ratio * 100)}%）`
+      ? `（上下文占用约 ${Math.round(Math.min(context.ratio, 1) * 100)}%）`
       : "";
   return `【翻页原因】${label}${ratio}`;
 }

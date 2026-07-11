@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
 export interface CodexThreadRecord {
@@ -11,6 +11,14 @@ export interface CodexThreadRecord {
   updatedAt: Date;
   firstUserMessage: string;
 }
+
+export interface ThreadContextUsage {
+  contextTokens: number;
+  contextWindow: number;
+}
+
+type RolloutPathRow = { rollout_path: unknown };
+const MAX_ROLLOUT_TAIL_BYTES = 1024 * 1024;
 
 export interface CodexModelRecord {
   slug: string;
@@ -132,6 +140,84 @@ export function getThread(id: string): CodexThreadRecord | null {
     `)?.[0];
 
   return row ? mapThreadRow(row) : null;
+}
+
+/**
+ * Read the latest model-request context snapshot from the durable Codex rollout.
+ * turn.completed usage is aggregate across every model call in a tool-heavy turn,
+ * so it cannot be divided by a per-request context window. The SDK does not
+ * currently expose the CLI-equivalent context fill directly.
+ * Source: https://github.com/openai/codex/issues/21295
+ */
+export function getThreadContextUsage(id: string): ThreadContextUsage | null {
+  if (!id) {
+    return null;
+  }
+  const databaseRow = withDatabase((db) => {
+    const query = db.prepare("SELECT rollout_path FROM threads WHERE id = ? LIMIT 1");
+    return query.get(id) as RolloutPathRow | undefined;
+  });
+  const row = databaseRow.ok
+    ? databaseRow.value
+    : querySqliteCli<RolloutPathRow>(
+        "SELECT rollout_path FROM threads WHERE id = " + quoteSqlString(id) + " LIMIT 1",
+      )?.[0];
+  const rolloutPath = typeof row?.rollout_path === "string" ? row.rollout_path : "";
+  if (!rolloutPath || !existsSync(rolloutPath)) {
+    return null;
+  }
+  try {
+    return parseLatestThreadContextUsage(readRolloutTail(rolloutPath));
+  } catch {
+    return null;
+  }
+}
+
+function readRolloutTail(rolloutPath: string): string {
+  const fd = openSync(rolloutPath, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - MAX_ROLLOUT_TAIL_BYTES);
+    const buffer = Buffer.alloc(size - start);
+    readSync(fd, buffer, 0, buffer.length, start);
+    return buffer.toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function parseLatestThreadContextUsage(jsonl: string): ThreadContextUsage | null {
+  const lines = jsonl.trim().split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    try {
+      const entry = JSON.parse(lines[index]!) as {
+        payload?: {
+          type?: unknown;
+          info?: {
+            last_token_usage?: { total_tokens?: unknown; input_tokens?: unknown } | null;
+            model_context_window?: unknown;
+          } | null;
+        };
+      };
+      const info = entry.payload?.type === "token_count" ? entry.payload.info : undefined;
+      const last = info?.last_token_usage;
+      const rawTokens = last?.total_tokens ?? last?.input_tokens;
+      const rawWindow = info?.model_context_window;
+      if (
+        typeof rawTokens === "number" &&
+        Number.isFinite(rawTokens) &&
+        rawTokens > 0 &&
+        typeof rawWindow === "number" &&
+        Number.isFinite(rawWindow) &&
+        rawWindow > 0
+      ) {
+        return { contextTokens: rawTokens, contextWindow: rawWindow };
+      }
+    } catch {
+      // Ignore partial/corrupt lines and keep scanning backward.
+    }
+  }
+  return null;
 }
 
 export function listWorkspaces(): string[] {

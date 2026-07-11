@@ -1631,6 +1631,38 @@ describe("mailbox bridge", () => {
     expect(replies).toHaveLength(1);
   });
 
+  it("does not chain mailbox rotations from aggregate tool-heavy usage alone (ALB-1350)", async () => {
+    const personasRoot = path.join(tempDir, "personas");
+    const workspace = path.join(tempDir, "workspace");
+    for (const [msgId, subject] of [["ratio-a", "A"], ["ratio-b", "B"], ["ratio-c", "C"]] as const) {
+      writeMailboxMessage({ personasRoot, sender: "cody", recipient: "albert-v3", msgId, subject, body: subject });
+    }
+    const session = createSession(async (_input, callbacks) => {
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onTurnComplete?.({
+        inputTokens: 1_696_715,
+        cachedInputTokens: 1_576_960,
+        outputTokens: 401,
+        lastContextTokens: 119_555,
+        liveContextWindow: 353_400,
+      });
+      callbacks.onAgentEnd();
+    });
+
+    const result = await runMailboxDeliveryOnce(
+      createConfig({
+        personasRoot,
+        workspace,
+        maxMessagesPerTick: 3,
+        autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 } as never,
+      }),
+      createRegistry(session) as never,
+    );
+
+    expect(result.processed).toBe(3);
+    expect(session.newThread).not.toHaveBeenCalled();
+    expect(session.prompt.mock.calls.every((call) => !JSON.stringify(call[0]).includes(HANDOFF_MARKER))).toBe(true);
+  });
   it("rotates the mailbox thread when a turn goes heavy and snapshots the still-queued messages (ALB-1205)", async () => {
     const personasRoot = path.join(tempDir, "personas");
     const workspace = path.join(tempDir, "workspace");

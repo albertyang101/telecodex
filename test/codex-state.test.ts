@@ -15,6 +15,7 @@ type ThreadFixture = {
   created_at: number;
   updated_at: number;
   first_user_message: string;
+  rollout_path?: string;
   archived?: number;
 };
 
@@ -25,6 +26,7 @@ type LoadOptions = {
   stats?: Record<string, number>;
   threads?: ThreadFixture[];
   modelsJson?: string;
+  rollouts?: Record<string, string>;
   betterSqliteAvailable?: boolean;
   openThrows?: boolean;
   sqliteCliOutput?: string;
@@ -86,6 +88,9 @@ async function loadCodexState(options: LoadOptions = {}) {
       if (targetPath === modelsPath) {
         return options.modelsJson !== undefined;
       }
+      if (options.rollouts?.[targetPath] !== undefined) {
+        return true;
+      }
       return files.includes(path.basename(targetPath));
     }),
     readdirSync: vi.fn((targetPath: string) => {
@@ -98,11 +103,21 @@ async function loadCodexState(options: LoadOptions = {}) {
       mtimeMs: stats[targetPath] ?? 0,
     })),
     readFileSync: vi.fn((targetPath: string) => {
-      if (targetPath !== modelsPath || options.modelsJson === undefined) {
-        throw new Error(`ENOENT: ${targetPath}`);
+      if (targetPath === modelsPath && options.modelsJson !== undefined) {
+        return options.modelsJson;
       }
-      return options.modelsJson;
+      if (options.rollouts?.[targetPath] !== undefined) {
+        return options.rollouts[targetPath];
+      }
+      throw new Error(`ENOENT: ${targetPath}`);
     }),
+    openSync: vi.fn((targetPath: string) => targetPath),
+    fstatSync: vi.fn((fd: string) => ({ size: Buffer.byteLength(options.rollouts?.[fd] ?? "", "utf8") })),
+    readSync: vi.fn((fd: string, buffer: Buffer, offset: number, length: number, position: number) => {
+      const source = Buffer.from(options.rollouts?.[fd] ?? "", "utf8");
+      return source.copy(buffer, offset, position, position + length);
+    }),
+    closeSync: vi.fn(),
   }));
 
   if (options.betterSqliteAvailable === false) {
@@ -152,6 +167,12 @@ function runAllQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
 }
 
 function runGetQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
+  if (sql.includes("SELECT rollout_path FROM threads WHERE id = ?")) {
+    const id = String(args[0] ?? "");
+    const thread = threads.find((candidate) => candidate.id === id);
+    return thread?.rollout_path ? { rollout_path: thread.rollout_path } : undefined;
+  }
+
   if (sql.includes("WHERE archived = 0 AND id = ?")) {
     const id = String(args[0] ?? "");
     return threads.find((thread) => thread.archived !== 1 && thread.id === id);
@@ -460,6 +481,38 @@ describe("codex-state", () => {
     expect(invalidState.listModels()).toEqual(invalidState.FALLBACK_MODELS);
   });
 
+  it("reads the latest request context snapshot instead of aggregate token totals", async () => {
+    const rolloutPath = "/runtime/sessions/rollout-thread.jsonl";
+    const tokenCount = JSON.stringify({
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: { input_tokens: 1_696_715, total_tokens: 1_700_694 },
+          last_token_usage: { input_tokens: 119_154, total_tokens: 119_555 },
+          model_context_window: 353_400,
+        },
+      },
+    });
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      rollouts: { [rolloutPath]: tokenCount + "\n{partial" },
+      threads: [{
+        id: "thread-context",
+        title: "Context",
+        cwd: "/workspace",
+        model: "gpt-5.6",
+        created_at: 1,
+        updated_at: 2,
+        first_user_message: "go",
+        rollout_path: rolloutPath,
+      }],
+    });
+
+    expect(state.getThreadContextUsage("thread-context")).toEqual({
+      contextTokens: 119_555,
+      contextWindow: 353_400,
+    });
+  });
   it("getThread returns null when not found", async () => {
     const state = await loadCodexState({ files: ["state_main.sqlite"], threads: [] });
 

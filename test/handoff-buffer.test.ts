@@ -147,6 +147,12 @@ describe("handoff-buffer", () => {
       expect(out).toContain("63%");
     });
 
+    it("never renders an impossible percentage from stale persisted ratio data", () => {
+      const out = renderHandoff(sample, { reason: "hard-cap", ratio: 9.48 });
+      expect(out).toContain("100%");
+      expect(out).not.toContain("948%");
+    });
+
     it("omits the ratio number when it is not provided", () => {
       const out = renderHandoff(sample, { reason: "threshold" });
       expect(out).not.toContain("%");
