@@ -29,7 +29,7 @@
 
 ### 3. 出厂配方
 
-提供一个可在临时目录运行的安装器/manifest，把以下资产装入目标 Codex Developer Bot：
+提供一份共享 role manifest 和薄 orchestrator：Developer 默认选择 graphify bundle，Albert Personal／Family Personal 默认不选择；orchestrator 再调用可在临时目录运行的安装器，把以下资产装入目标 Codex Developer Bot：
 
 - graphify overlay Skill 和 repo map；
 - UserPromptSubmit hook；

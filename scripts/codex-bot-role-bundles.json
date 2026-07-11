@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "roles": {
+    "developer": {
+      "default_bundles": [
+        "graphify"
+      ]
+    },
+    "albert-personal": {
+      "default_bundles": []
+    },
+    "family-personal": {
+      "default_bundles": []
+    }
+  }
+}

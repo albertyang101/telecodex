@@ -101,6 +101,7 @@
 - Integrate the reviewed bundle into the ALB-1208 Codex Bot builder role manifest when that builder implementation point is available.
 
 - [ ] Add a builder contract test proving Developer Bot defaults to the graphify bundle and Personal Assistant roles do not inherit the developer gate unless explicitly selected.
+  - Contract seam: `scripts/codex-bot-role-bundles.json` + `scripts/install-codex-role-bundles.py`; the full three-entry builder remains ALB-1208 work.
 - [ ] Build a fresh isolated Codex Developer testbot from the builder and repeat Task 5.
 - [ ] Send Cody the exact candidate, tests, rollback, and required Theo/Ada live-proof sequence.
 - [ ] Do not merge, reload, restart, or deploy until Cody explicitly opens the gate.
