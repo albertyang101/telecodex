@@ -26,11 +26,13 @@ describe("Codex graphify UserPromptSubmit context hook", () => {
     }));
 
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain("canonical shared graph");
-    expect(result.stdout).toContain("repo map");
-    expect(result.stdout).toContain("affected");
-    expect(result.stdout).toContain("private graph");
-    expect(result.stdout).toContain("verify");
+    const output = JSON.parse(result.stdout);
+    expect(output.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
+    expect(output.hookSpecificOutput.additionalContext).toContain("canonical shared graph");
+    expect(output.hookSpecificOutput.additionalContext).toContain("repo map");
+    expect(output.hookSpecificOutput.additionalContext).toContain("affected");
+    expect(output.hookSpecificOutput.additionalContext).toContain("private graph");
+    expect(output.hookSpecificOutput.additionalContext).toContain("verify");
     expect(result.stderr).toBe("");
   });
 

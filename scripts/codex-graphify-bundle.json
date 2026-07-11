@@ -13,7 +13,7 @@
       "root": "codex_home",
       "target": "hooks/graphify/codex-graphify-turn-context.py",
       "mode": "0755",
-      "sha256": "68d3bf8ff88659bd1d3469a2f8583b03dfa66e1c2b63c39889e94e3c5694fd0c"
+      "sha256": "1e3a64dd3de7d299d3c8036395611f78677286ec5a29356c9dd9e247d10e0ccc"
     },
     {
       "source": "scripts/codex-graphify-skill/SKILL.md",

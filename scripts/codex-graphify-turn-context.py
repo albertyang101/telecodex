@@ -28,7 +28,16 @@ def main() -> int:
         print("expected UserPromptSubmit hook event", file=sys.stderr)
         return 2
 
-    print(CONTEXT)
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": CONTEXT,
+            }
+        },
+        sys.stdout,
+    )
+    print()
     return 0
 
 
