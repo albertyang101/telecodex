@@ -947,6 +947,16 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
+      callbacks.onTextDelta("我先检查日志，发现暂未跑测试。");
+      callbacks.onAgentMessage?.("我先检查日志，发现暂未跑测试。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("我先检查日志，发现迄今未跑测试。");
+      callbacks.onAgentMessage?.("我先检查日志，发现迄今未跑测试。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       callbacks.onTextDelta("我先检查了配置，生产服务依然运行旧版本。");
       callbacks.onAgentMessage?.("我先检查了配置，生产服务依然运行旧版本。", {
         isFinal: false,
@@ -984,6 +994,16 @@ describe("createBot response delivery", () => {
       });
       callbacks.onTextDelta("随后查询结果显示服务仍在旧版本。");
       callbacks.onAgentMessage?.("随后查询结果显示服务仍在旧版本。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("随后查看测试报告显示服务仍在旧版本。");
+      callbacks.onAgentMessage?.("随后查看测试报告显示服务仍在旧版本。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("随后查询检测结果显示缓存仍未更新。");
+      callbacks.onAgentMessage?.("随后查询检测结果显示缓存仍未更新。", {
         isFinal: false,
         followedByTool: false,
       });
@@ -1062,6 +1082,8 @@ describe("createBot response delivery", () => {
     expect(visibleReplyTexts.join("\n")).not.toContain("发现还未跑测试。");
     expect(visibleReplyTexts.join("\n")).not.toContain("发现没有继续跑测试。");
     expect(visibleReplyTexts.join("\n")).not.toContain("发现仍未跑测试。");
+    expect(visibleReplyTexts.join("\n")).not.toContain("发现暂未跑测试。");
+    expect(visibleReplyTexts.join("\n")).not.toContain("发现迄今未跑测试。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("生产服务依然运行旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.join("\n")).not.toContain("再继续跑测试。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后发现服务仍在旧版本。"))).toHaveLength(1);
@@ -1070,6 +1092,8 @@ describe("createBot response delivery", () => {
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后查看结果显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后查看报告显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后查询结果显示服务仍在旧版本。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查看测试报告显示服务仍在旧版本。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查询检测结果显示缓存仍未更新。"))).toHaveLength(1);
     expect(visibleReplyTexts.join("\n")).not.toContain("随后查看配置是否生效。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试报告显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试任务已完成。"))).toHaveLength(1);
@@ -1093,6 +1117,8 @@ describe("createBot response delivery", () => {
     expect(transcript).not.toContain("发现还未跑测试。");
     expect(transcript).not.toContain("发现没有继续跑测试。");
     expect(transcript).not.toContain("发现仍未跑测试。");
+    expect(transcript).not.toContain("发现暂未跑测试。");
+    expect(transcript).not.toContain("发现迄今未跑测试。");
     expect(transcript).toContain("生产服务依然运行旧版本。");
     expect(transcript).not.toContain("再继续跑测试。");
     expect(transcript).toContain("随后发现服务仍在旧版本。");
@@ -1101,6 +1127,8 @@ describe("createBot response delivery", () => {
     expect(transcript).toContain("随后查看结果显示服务仍在旧版本。");
     expect(transcript).toContain("随后查看报告显示服务仍在旧版本。");
     expect(transcript).toContain("随后查询结果显示服务仍在旧版本。");
+    expect(transcript).toContain("随后查看测试报告显示服务仍在旧版本。");
+    expect(transcript).toContain("随后查询检测结果显示缓存仍未更新。");
     expect(transcript).not.toContain("随后查看配置是否生效。");
     expect(transcript).toContain("随后测试报告显示服务仍在旧版本。");
     expect(transcript).toContain("随后测试任务已完成。");
@@ -1123,7 +1151,7 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
-      callbacks.onTextDelta("我先确认完了，生产服务依然运行旧版本！");
+      callbacks.onTextDelta("我先确认完了，生产服务依然运行旧版本……");
       throw new Error("provider failed");
     });
     const registry = createRegistry(session);
@@ -1149,7 +1177,7 @@ describe("createBot response delivery", () => {
     const normalizeSpacing = (text: string) =>
       text
         .replace(/\s+([，,；;。.!：:！？?])/g, (_match, punctuation) => punctuation)
-        .replace(/[！!]/g, "。");
+        .replace(/[！!…]+/g, "。");
     expect(normalizeSpacing(visibleReply).split(result)).toHaveLength(2);
     expect(normalizeSpacing(transcript).split(result)).toHaveLength(2);
   });
