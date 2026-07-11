@@ -6,7 +6,7 @@
       "root": "codex_home",
       "target": "hooks/graphify/codex-pre-tool-use-policy.py",
       "mode": "0755",
-      "sha256": "3bddd00ce0864bbf8e6408feea6a8295fc30bf56930106dd31d64f7ad05a9f36"
+      "sha256": "cd2a68e49956f9dc0c158c5a0602e3de05643abac625f853175af483eb1397b6"
     },
     {
       "source": "scripts/codex-graphify-turn-context.py",

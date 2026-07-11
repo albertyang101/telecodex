@@ -162,6 +162,56 @@ describe("codex PreToolUse policy hook", () => {
     }
   });
 
+  it("rejects a fuzzy explain result that is not the exact requested node", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "codex-graphify-fuzzy-explain-"));
+    const options = {
+      sessionId: "session-fuzzy-explain",
+      turnId: "turn-fuzzy-explain",
+      cwd: "/Users/albertyang0888/code/codex-telegram-research/telecodex",
+      stateDir,
+    };
+    try {
+      const fuzzy = executeGraphify(
+        "~/.local/bin/graphify explain LEGACY_PROMPT_GUARD --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      );
+      expect(fuzzy.status).not.toBe(0);
+      expect(fuzzy.stdout).toContain("Node: LEGACY_PROMPT_GUARD_LINES");
+      expect(runHook("sed -n 1,40p src/prompt-guard.ts", options).status).not.toBe(0);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a uniquely resolved affected node with no downstream impact", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "codex-graphify-empty-affected-"));
+    const options = {
+      sessionId: "session-empty-affected",
+      turnId: "turn-empty-affected",
+      cwd: "/Users/albertyang0888/code/codex-telegram-research/telecodex",
+      stateDir,
+    };
+    try {
+      expect(executeGraphify(
+        "~/.local/bin/graphify explain launchd_start --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      ).status).toBe(0);
+      const affected = executeGraphify(
+        "~/.local/bin/graphify affected launchd_start --graph ~/personas/_shared/graphify/graphs/telecodex/graph.json",
+        options,
+      );
+      expect(affected.status).toBe(0);
+      expect(affected.stdout).toContain("No affected nodes found.");
+      expect(runHook("", {
+        ...options,
+        toolName: "apply_patch",
+        toolInput: { file_path: "scripts/start.sh", patch: "*** Begin Patch" },
+      }).status).toBe(0);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("requires separate successful explain and affected receipts before edits", () => {
     const stateDir = mkdtempSync(join(tmpdir(), "codex-graphify-independent-receipts-"));
     const options = {

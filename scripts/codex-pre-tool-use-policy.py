@@ -573,21 +573,6 @@ def is_docs_or_logs_read(command: str) -> bool:
         return bool(kinds) and all(kind == "docs" for kind in kinds)
     return bool(explicit) and all(kind == "docs" for kind in explicit)
 
-def payload_is_docs_only(payload: dict) -> bool:
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return False
-    paths = [
-        value
-        for key, value in tool_input.items()
-        if key in {"path", "file_path", "cwd", "workdir"}
-        and isinstance(value, str)
-    ]
-    kinds = [path_kind(value) for value in paths]
-    explicit = [kind for kind in kinds if kind is not None]
-    return bool(explicit) and all(kind == "docs" for kind in explicit)
-
-
 
 def filesystem_tool_requires_affected(tool_name: str) -> bool:
     normalized = tool_name.lower()
@@ -685,8 +670,25 @@ def graphify_rewrite(
 
 
 
+def normalized_node_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def explain_matches_target(output: str, requested_target: str) -> bool:
+    requested = normalized_node_key(requested_target)
+    if not requested:
+        return False
+    returned = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("Node:", "NODE:", "ID:")):
+            returned.append(stripped.split(":", 1)[1].strip())
+    return requested in {normalized_node_key(value) for value in returned}
+
+
 def graphify_result_is_meaningful(
     subcommand: str,
+    requested_target: str,
     stdout: str,
     stderr: str,
 ) -> bool:
@@ -699,13 +701,16 @@ def graphify_result_is_meaningful(
         return (
             ("Node:" in output or "NODE:" in output)
             and "No node matching" not in output
+            and explain_matches_target(output, requested_target)
         )
     if subcommand == "affected":
         return (
             "Affected nodes for" in output
             and "No unique node match" not in output
-            and "No affected nodes found." not in output
-            and any(line.startswith("- ") for line in output.splitlines())
+            and (
+                "No affected nodes found." in output
+                or any(line.startswith("- ") for line in output.splitlines())
+            )
         )
     return False
 
@@ -738,8 +743,9 @@ def run_graphify_wrapper(args: list[str]) -> int:
         sys.stderr.write(result.stderr)
     if result.returncode != 0:
         return result.returncode
+    requested_target = parsed_argv[2] if len(parsed_argv) > 2 else ""
     if not graphify_result_is_meaningful(
-        parsed_argv[1], result.stdout, result.stderr
+        parsed_argv[1], requested_target, result.stdout, result.stderr
     ):
         print("graphify query produced no usable result", file=sys.stderr)
         return 2
