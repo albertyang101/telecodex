@@ -1574,15 +1574,27 @@ export function createBot(
       } else {
         finalized = true;
 
+        const recoveredFailureParts = [
+          ...undeliveredCompletedMessages,
+          recoverableIntermediateUpdate(accumulatedText),
+        ];
+        const seenRecoveredFailureParts = new Set<string>();
+        const uniqueRecoveredFailureParts = recoveredFailureParts.filter((text) => {
+          if (!text) {
+            return false;
+          }
+          const key = text
+            .replace(/\s+([，,；;。.!：:！？?])/g, (_match, punctuation) => punctuation)
+            .replace(/\s+/g, " ")
+            .trim();
+          if (seenRecoveredFailureParts.has(key)) {
+            return false;
+          }
+          seenRecoveredFailureParts.add(key);
+          return true;
+        });
         const failureSourceText = streamAgentResponses
-          ? [
-              ...new Set(
-                [
-                  ...undeliveredCompletedMessages,
-                  recoverableIntermediateUpdate(accumulatedText),
-                ].filter((text) => Boolean(text)),
-              ),
-            ].join("\n\n")
+          ? uniqueRecoveredFailureParts.join("\n\n")
           : completedAgentText;
         const failureReplyText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
         const transcriptFailureText = [...completedStreamMessages, failureReplyText]
@@ -3116,7 +3128,7 @@ function normalizeIntermediateUpdateHead(text: string): string {
 }
 
 const PROCESS_NARRATION_HEAD_RE =
-  /^(?:我先(?:把|将)|我先(?:去|来)?(?:看|看看|查看|查|检查|确认(?:一下|完了)?|跑|读|做|处理|准备)|我准备(?:把|将)|我准备(?:去|先)?(?:看|查看|查|检查|确认|跑|读|做|处理)|我接下来|我现在(?:要|去|来|先)|下一步|接下来|然后|再(?:继续|去|检查(?!结果|报告|任务)|查看|查|跑|读|做|处理|测试(?!结果|报告|任务))|(?:接着|随后|准备)(?:继续|去|检查(?!结果|报告|任务)|查看|查|跑|读|做|处理|测试(?!结果|报告|任务))|收到[，。]?\s*我先|let me\b|going to\b|now(?:\s+|,\s*)(?:i(?:['’]ll|\s+will|\s+am|['’]m)|going to)\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i;
+  /^(?:我先(?:把|将)|我先(?:去|来)?(?:看|看看|查看|查|检查|确认(?:一下|完了)?|跑|读|做|处理|准备)|我准备(?:把|将)|我准备(?:去|先)?(?:看|查看|查|检查|确认|跑|读|做|处理)|我接下来|我现在(?:要|去|来|先)|下一步|接下来|然后|再(?:继续|去|检查(?!结果|报告|任务)|查看(?!结果)|查(?!看?结果)|跑|读|做|处理|测试(?!结果|报告|任务))|(?:接着|随后|准备)(?:继续|去|检查(?!结果|报告|任务)|查看(?!结果)|查(?!看?结果)|跑|读|做|处理|测试(?!结果|报告|任务))|收到[，。]?\s*我先|let me\b|going to\b|now(?:\s+|,\s*)(?:i(?:['’]ll|\s+will|\s+am|['’]m)|going to)\b|i(?:['’]ll|\s+will|\s+am|['’]m)\b|next\b)/i;
 
 function isProcessNarrationHead(head: string): boolean {
   return PROCESS_NARRATION_HEAD_RE.test(head);

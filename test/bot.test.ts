@@ -944,6 +944,16 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
+      callbacks.onTextDelta("随后查看结果显示服务仍在旧版本。");
+      callbacks.onAgentMessage?.("随后查看结果显示服务仍在旧版本。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("随后查看配置是否生效。");
+      callbacks.onAgentMessage?.("随后查看配置是否生效。", {
+        isFinal: false,
+        followedByTool: false,
+      });
       callbacks.onTextDelta("随后测试报告显示服务仍在旧版本。");
       callbacks.onAgentMessage?.("随后测试报告显示服务仍在旧版本。", {
         isFinal: false,
@@ -1018,6 +1028,8 @@ describe("createBot response delivery", () => {
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后发现服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试结果显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后检查结果显示配置未生效。"))).toHaveLength(1);
+    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查看结果显示服务仍在旧版本。"))).toHaveLength(1);
+    expect(visibleReplyTexts.join("\n")).not.toContain("随后查看配置是否生效。");
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试报告显示服务仍在旧版本。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试任务已完成。"))).toHaveLength(1);
     expect(visibleReplyTexts.filter((text: string) => text.includes("随后检查报告显示配置未生效。"))).toHaveLength(1);
@@ -1044,6 +1056,8 @@ describe("createBot response delivery", () => {
     expect(transcript).toContain("随后发现服务仍在旧版本。");
     expect(transcript).toContain("随后测试结果显示服务仍在旧版本。");
     expect(transcript).toContain("随后检查结果显示配置未生效。");
+    expect(transcript).toContain("随后查看结果显示服务仍在旧版本。");
+    expect(transcript).not.toContain("随后查看配置是否生效。");
     expect(transcript).toContain("随后测试报告显示服务仍在旧版本。");
     expect(transcript).toContain("随后测试任务已完成。");
     expect(transcript).toContain("随后检查报告显示配置未生效。");
@@ -1065,7 +1079,7 @@ describe("createBot response delivery", () => {
         isFinal: false,
         followedByTool: false,
       });
-      callbacks.onTextDelta("我先确认完了，生产服务依然运行旧版本。");
+      callbacks.onTextDelta("我先确认完了，生产服务依然运行旧版本 。");
       throw new Error("provider failed");
     });
     const registry = createRegistry(session);
@@ -1088,8 +1102,9 @@ describe("createBot response delivery", () => {
     const visibleReply = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
     const result = "生产服务依然运行旧版本。";
 
-    expect(visibleReply.split(result)).toHaveLength(2);
-    expect(transcript.split(result)).toHaveLength(2);
+    const normalizeSpacing = (text: string) => text.replace(/\s+([，,；;。.!：:！？?])/g, (_match, punctuation) => punctuation);
+    expect(normalizeSpacing(visibleReply).split(result)).toHaveLength(2);
+    expect(normalizeSpacing(transcript).split(result)).toHaveLength(2);
   });
 
   it("records prompt failure replies as bot turns without leaking raw provider URLs", async () => {
