@@ -1159,6 +1159,10 @@ export function createBot(
     };
 
     const deliverCompletedStreamMessage = async (visibleText: string): Promise<void> => {
+      // ALB-1201 (I1): the real unit of Telegram delivery is a CHUNK, so "what
+      // the user actually received" is recorded here at CHUNK granularity, in
+      // order. Earlier-delivered chunks are kept even when a later chunk fails;
+      // undelivered chunks are never recorded.
       for (const chunk of splitMarkdownForTelegram(visibleText)) {
         const options = {
           parseMode: chunk.parseMode,
@@ -1167,16 +1171,29 @@ export function createBot(
         };
         try {
           await sendTextMessage(bot.api, chatId, chunk.text, options);
+          deliveredStreamMessages.push(chunk.sourceText);
         } catch (firstError) {
           try {
             await sendTextMessage(bot.api, chatId, chunk.text, options);
+            deliveredStreamMessages.push(chunk.sourceText);
           } catch (retryError) {
+            // Both attempts failed: the user gets a delivery-failure warning in
+            // place of this chunk. Record the warning ONLY if it actually
+            // reaches them (its send result must be observed, not swallowed); if
+            // the warning itself fails, the user received nothing for this chunk
+            // and nothing is recorded. Either way the bubble aborts here, so
+            // remaining chunks are neither sent nor recorded.
             const warning = renderMarkdownChunkWithinLimit(DELIVERY_FAILURE_WARNING);
-            await sendTextMessage(bot.api, chatId, warning.text, {
-              parseMode: warning.parseMode,
-              fallbackText: warning.fallbackText,
-              messageThreadId,
-            }).catch(() => {});
+            try {
+              await sendTextMessage(bot.api, chatId, warning.text, {
+                parseMode: warning.parseMode,
+                fallbackText: warning.fallbackText,
+                messageThreadId,
+              });
+              deliveredStreamMessages.push(DELIVERY_FAILURE_WARNING);
+            } catch {
+              // Warning also failed — the user saw nothing for this chunk.
+            }
             throw retryError ?? firstError;
           }
         }
@@ -1202,15 +1219,11 @@ export function createBot(
       completedStreamMessages.push(visibleText);
       streamDeliveryPromise = streamDeliveryPromise
         .then(() => deliverCompletedStreamMessage(visibleText))
-        .then(() => {
-          // ALB-1201 (I1): the bubble reached the user — record it as received.
-          deliveredStreamMessages.push(visibleText);
-        })
         .catch((error) => {
+          // ALB-1201 (I1): per-chunk receipts are recorded inside
+          // deliverCompletedStreamMessage; here we only remember that this
+          // bubble did not fully deliver, so I1/I2/rotation see the truth.
           streamDeliveryError ??= error;
-          // The user saw the delivery-failure warning for this bubble, not its
-          // content — record what they actually received.
-          deliveredStreamMessages.push(DELIVERY_FAILURE_WARNING);
           console.error("Failed to deliver completed Telegram agent message:", formatError(error));
         });
     };
@@ -1236,10 +1249,10 @@ export function createBot(
           completedStreamMessages.push(footerText);
           try {
             await deliverCompletedStreamMessage(footerText);
-            deliveredStreamMessages.push(footerText);
+            // ALB-1201 (I1): footer receipts are recorded per-chunk inside
+            // deliverCompletedStreamMessage.
           } catch (error) {
             streamDeliveryError ??= error;
-            deliveredStreamMessages.push(DELIVERY_FAILURE_WARNING);
             console.error("Failed to deliver Telegram response footer:", formatError(error));
           }
         }
@@ -1529,12 +1542,13 @@ export function createBot(
       // by the delivery chain) is the truth of delivery once finalize resolves.
       const deliverySucceeded = streamDeliveryError === undefined;
       // The transcript must record what the user actually received, not the
-      // undelivered intended text. On full delivery the two are identical.
+      // undelivered intended text. On full delivery the two are identical; on
+      // partial delivery it is exactly the delivered chunks + delivered warnings,
+      // in order; when nothing reached the user it is empty (ALB-1201 I1) — never
+      // the undelivered intended text, and never a warning the user never saw.
       const transcriptText = deliverySucceeded
         ? finalVisibleText
-        : deliveredStreamMessages.length > 0
-          ? deliveredStreamMessages.join("\n\n")
-          : DELIVERY_FAILURE_WARNING;
+        : deliveredStreamMessages.join("\n\n");
       await appendMemoryTranscriptTurn(
         config,
         ctx,
@@ -1552,7 +1566,12 @@ export function createBot(
             rotationStateAfterSuccessfulHandoff ?? getRotationState(contextKey),
             {
               userText: userVisibleText,
-              assistantText: finalVisibleText,
+              // ALB-1201 (I3): rotation carries the DELIVERED truth, not the
+              // intended text. When nothing was delivered, transcriptText is
+              // empty and recordTurn stores no assistant entry — so a never-seen
+              // reply is not marked "already answered" and later swallowed by
+              // HANDOFF.
+              assistantText: transcriptText,
               lastInputTokens: lastTurnUsage?.inputTokens,
               lastContextTokens: lastTurnUsage?.lastContextTokens,
               liveContextWindow: lastTurnUsage?.liveContextWindow,

@@ -2464,17 +2464,32 @@ describe("createBot response delivery", () => {
     expect(sentTexts.filter((text: string) => text.includes("后续结果仍要送达。")).length).toBeGreaterThanOrEqual(1);
   });
 
-  it("does not record a permanently-undelivered completed bubble as delivered text (ALB-1201 I1)", async () => {
+  // ALB-1201 C: chunk fails x2 AND the warning also fails → the user received
+  // NOTHING, so the transcript must contain neither the intended text nor the
+  // warning, and rotation must store no assistant entry. (This test replaces the
+  // old "ALB-1201 I1" test, whose assertion that the transcript CONTAINS the
+  // warning in this all-failed case encoded the imprecise, now-corrected
+  // behavior — the user never saw that warning.)
+  it("records NEITHER the intended text nor the warning and writes no rotation assistant entry when a chunk and its warning both fail (ALB-1201 C)", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-undelivered-"));
     tempDirs.push(root);
     const sessionsRoot = path.join(root, "Sessions");
+    const workspace = await createWorkspace("telecodex-deliver-C-ws-");
+    const intended = "这段内容永久发送失败。";
     const session = createSession(async (callbacks) => {
-      callbacks.onTextDelta("这段内容永久发送失败。");
-      callbacks.onAgentMessage?.("这段内容永久发送失败。");
+      callbacks.onTextDelta(intended);
+      callbacks.onAgentMessage?.(intended);
       callbacks.onAgentEnd();
     });
     const registry = createRegistry(session);
-    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+    const bot = createBot(
+      createConfig({
+        workspace,
+        memoryTranscriptRoot: sessionsRoot,
+        autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 },
+      }),
+      registry as any,
+    ) as any;
     // Every send attempt (both tries + the warning) fails permanently.
     bot.api.sendMessage.mockRejectedValue(new Error("telegram permanently down"));
     const textHandler = bot.__handlers.on.get("message:text");
@@ -2490,11 +2505,18 @@ describe("createBot response delivery", () => {
     const files = await readdir(sessionsRoot);
     const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
 
-    expect(transcript).toContain("[bot-raw]");
     // The undelivered intended text must NOT be recorded as if the user received it.
-    expect(transcript).not.toContain("这段内容永久发送失败。");
-    // The transcript must reflect the delivery failure the user actually saw.
-    expect(transcript).toContain("有一段回复发送失败");
+    expect(transcript).not.toContain(intended);
+    // The warning never reached the user either, so it must NOT be recorded.
+    expect(transcript).not.toContain("有一段回复发送失败");
+
+    // Rotation must not store an assistant entry for a reply the user never saw.
+    const buffer = await readRotationBuffer(workspace, "42");
+    expect(buffer.some((entry) => entry.role === "assistant")).toBe(false);
+    expect(buffer.some((entry) => entry.text.includes(intended))).toBe(false);
+
+    // Drain the bounded overdue re-feed so no async work dangles into teardown.
+    await delay(400);
   });
 
   it("does not strike a permanently-undelivered message as answered and re-feeds it once (ALB-1201 I2)", async () => {
@@ -2532,6 +2554,209 @@ describe("createBot response delivery", () => {
       String(call[0]).includes("欠答自查"),
     );
     expect(repromptCalls).toHaveLength(1);
+  });
+
+  // ALB-1201 A: single chunk, intended text delivered → the transcript records
+  // the intended text (not a warning), the message is struck (no overdue
+  // re-feed), and rotation stores the intended text. Regression guard for the
+  // happy path under the new per-chunk receipt model.
+  it("records the delivered intended text, strikes, and rotation stores it when a single chunk delivers (ALB-1201 A)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-deliver-A-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const workspace = await createWorkspace("telecodex-deliver-A-ws-");
+    const intended = "这段助手回复完整送达。";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(intended);
+      callbacks.onAgentMessage?.(intended);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(
+      createConfig({
+        workspace,
+        memoryTranscriptRoot: sessionsRoot,
+        autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 },
+      }),
+      registry as any,
+    ) as any;
+    // Default sendMessage mock resolves — the single chunk delivers.
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 7001, text: "发一条会送达的" },
+      api: bot.api,
+    });
+
+    // Transcript records the intended text the user actually received, not a warning.
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    expect(transcript).toContain("[bot-raw]");
+    expect(transcript).toContain(intended);
+    expect(transcript).not.toContain("有一段回复发送失败");
+
+    // Struck: delivery succeeded, so there is no overdue re-feed (prompt runs once).
+    await delay(300);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+
+    // Rotation stored the delivered intended assistant text.
+    const buffer = await readRotationBuffer(workspace, "42");
+    expect(buffer.some((entry) => entry.role === "assistant" && entry.text.includes(intended))).toBe(true);
+  });
+
+  // ALB-1201 B: single chunk, intended text fails both attempts, but the
+  // delivery-failure warning delivers → transcript records the warning (what the
+  // user saw) NOT the intended text; the message is NOT struck and is re-fed
+  // exactly once (bounded); rotation does NOT record the intended text.
+  it("records the delivered warning (not the intended text), stays unstruck/re-fed once, and keeps the intended text out of rotation when the chunk fails but the warning delivers (ALB-1201 B)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-deliver-B-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const workspace = await createWorkspace("telecodex-deliver-B-ws-");
+    const intended = "这段助手内容永远送不出去B。";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(intended);
+      callbacks.onAgentMessage?.(intended);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(
+      createConfig({
+        workspace,
+        memoryTranscriptRoot: sessionsRoot,
+        autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 },
+      }),
+      registry as any,
+    ) as any;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // The intended chunk fails on both attempts; the delivery-failure warning delivers.
+    bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+      if (String(text).includes("有一段回复发送失败")) {
+        return { message_id: 999 };
+      }
+      throw new Error("chunk send failed");
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 8001, text: "这条内容送不出去" },
+      api: bot.api,
+    });
+
+    // Transcript: the user saw the warning, not the undelivered intended text.
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    expect(transcript).toContain("有一段回复发送失败");
+    expect(transcript).not.toContain(intended);
+
+    // Not struck → overdue leg re-feeds it exactly once (bounded).
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    const repromptText = String(session.prompt.mock.calls[1][0]);
+    expect(repromptText).toContain("欠答自查");
+    await delay(400);
+    const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("欠答自查"),
+    );
+    expect(repromptCalls).toHaveLength(1);
+
+    // Rotation never stores the undelivered intended text.
+    const buffer = await readRotationBuffer(workspace, "42");
+    expect(buffer.some((entry) => entry.text.includes(intended))).toBe(false);
+  });
+
+  // ALB-1201 D: a multi-chunk bubble where the first chunk delivers but the
+  // second chunk (and its warning) permanently fail → the transcript CONTAINS
+  // the delivered first chunk and does NOT contain the never-delivered second
+  // chunk. Proves receipts are tracked per chunk, not per whole bubble.
+  it("records the delivered chunk but not the failed chunk in a multi-chunk bubble (ALB-1201 D)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-deliver-D-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    // Force >1 chunk: total length exceeds the split threshold, with a newline
+    // boundary so the first chunk carries CHUNKONEMARKER and the second carries
+    // CHUNKTWOMARKER.
+    const chunkOne = "CHUNKONEMARKER" + "甲".repeat(2900);
+    const chunkTwo = "CHUNKTWOMARKER" + "乙".repeat(400);
+    const bubble = `${chunkOne}\n${chunkTwo}`;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(bubble);
+      callbacks.onAgentMessage?.(bubble);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // First chunk delivers; the later chunk and its warning permanently fail.
+    bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+      if (String(text).includes("CHUNKONEMARKER")) {
+        return { message_id: 1 };
+      }
+      throw new Error("later chunk down");
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 9001, text: "发一条多块消息" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    // The delivered first chunk IS recorded...
+    expect(transcript).toContain("CHUNKONEMARKER");
+    // ...the never-delivered second chunk is NOT.
+    expect(transcript).not.toContain("CHUNKTWOMARKER");
+
+    // Drain the bounded overdue re-feed so no async work dangles into teardown.
+    await delay(400);
+  });
+
+  // ALB-1201 E: permanent delivery failure with rotation enabled → recordTurn
+  // must NOT store the undelivered intended reply as assistantText (empty /
+  // omitted), so a never-seen reply is not marked "already answered" and later
+  // swallowed by HANDOFF.
+  it("does not store the undelivered intended reply as rotation assistantText on permanent failure (ALB-1201 E)", async () => {
+    const workspace = await createWorkspace("telecodex-deliver-E-ws-");
+    const intended = "这段永久失败的意图回复E。";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(intended);
+      callbacks.onAgentMessage?.(intended);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(
+      createConfig({
+        workspace,
+        autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 },
+      }),
+      registry as any,
+    ) as any;
+    // Every send attempt (both tries + the warning) fails permanently.
+    bot.api.sendMessage.mockRejectedValue(new Error("telegram down"));
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 6262, text: "这条回复永久发不出去" },
+      api: bot.api,
+    });
+
+    const buffer = await readRotationBuffer(workspace, "42");
+    // recordTurn must NOT store the undelivered intended reply as an assistant entry.
+    expect(buffer.some((entry) => entry.role === "assistant" && entry.text.includes(intended))).toBe(false);
+    expect(buffer.some((entry) => entry.role === "assistant")).toBe(false);
+
+    // Drain the bounded overdue re-feed so no async work dangles into teardown.
+    await delay(400);
   });
 
   it("waits for queued streaming delivery before finishing a failed turn", async () => {
@@ -3198,6 +3423,20 @@ function deferred<T>(): Deferred<T> {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Read the persisted per-chat rotation buffer (ALB-1011 handoff-store) so a test
+ * can assert exactly what recordTurn stored as the assistant text for a turn.
+ * The bot persists state to <workspace>/.telecodex/handoff-<contextKey>.json.
+ */
+async function readRotationBuffer(
+  workspace: string,
+  contextKey: string,
+): Promise<Array<{ role: string; text: string }>> {
+  const file = path.join(workspace, ".telecodex", `handoff-${contextKey}.json`);
+  const parsed = JSON.parse(await readFile(file, "utf8")) as { buffer?: Array<{ role: string; text: string }> };
+  return parsed.buffer ?? [];
 }
 
 function reactionEmojiFromCall(call: unknown[] | undefined): string | undefined {
