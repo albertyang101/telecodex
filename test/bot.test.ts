@@ -2453,9 +2453,85 @@ describe("createBot response delivery", () => {
     });
 
     const sentTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
-    expect(sentTexts.filter((text: string) => text.includes("第一段永久失败。"))).toHaveLength(2);
+    // Within the turn, delivery continues past the permanently-failed bubble:
+    // both attempts for the first bubble are made, the failure warning is shown,
+    // and the later bubble still reaches the user.
+    // ALB-1201 (I2): a permanently-failed delivery now also leaves the message
+    // unstruck, so the overdue leg re-feeds it once (the fixed harness callback
+    // re-runs and re-sends) — hence >= rather than exact counts here.
+    expect(sentTexts.filter((text: string) => text.includes("第一段永久失败。")).length).toBeGreaterThanOrEqual(2);
     expect(sentTexts.some((text: string) => text.includes("有一段回复发送失败"))).toBe(true);
-    expect(sentTexts.filter((text: string) => text.includes("后续结果仍要送达。"))).toHaveLength(1);
+    expect(sentTexts.filter((text: string) => text.includes("后续结果仍要送达。")).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does not record a permanently-undelivered completed bubble as delivered text (ALB-1201 I1)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-undelivered-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("这段内容永久发送失败。");
+      callbacks.onAgentMessage?.("这段内容永久发送失败。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+    // Every send attempt (both tries + the warning) fails permanently.
+    bot.api.sendMessage.mockRejectedValue(new Error("telegram permanently down"));
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 4242, text: "发一下这条" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+
+    expect(transcript).toContain("[bot-raw]");
+    // The undelivered intended text must NOT be recorded as if the user received it.
+    expect(transcript).not.toContain("这段内容永久发送失败。");
+    // The transcript must reflect the delivery failure the user actually saw.
+    expect(transcript).toContain("有一段回复发送失败");
+  });
+
+  it("does not strike a permanently-undelivered message as answered and re-feeds it once (ALB-1201 I2)", async () => {
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      callbacks.onTextDelta(`第${promptCount}段。`);
+      callbacks.onAgentMessage?.(`第${promptCount}段。`);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    // Delivery is permanently broken for this exchange.
+    bot.api.sendMessage.mockRejectedValue(new Error("telegram down"));
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 5252, text: "这条回复没送达" },
+      api: bot.api,
+    });
+
+    // Delivery failed, so the message is NOT struck as answered — the overdue
+    // leg re-feeds it exactly once so it can be re-answered.
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    const repromptText = String(session.prompt.mock.calls[1][0]);
+    expect(repromptText).toContain("欠答自查");
+    expect(repromptText).toContain("这条回复没送达");
+
+    // Bounded: exactly one re-feed across the whole exchange (no infinite loop).
+    await delay(400);
+    const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("欠答自查"),
+    );
+    expect(repromptCalls).toHaveLength(1);
   });
 
   it("waits for queued streaming delivery before finishing a failed turn", async () => {

@@ -149,6 +149,44 @@ describe("withTelegramReplyStyleGuard", () => {
   });
 });
 
+describe("ALB-1201 owner-local-time in the outbound prompt", () => {
+  const OWNER_TIME_LINE = "Current time (owner local, Europe/Rome): 2026-07-12 10:22 (Sun)";
+  const OWNER_TZ_GUARD_LINE =
+    "告诉 Albert 的任何时间都用 CURRENT CONTEXT 里标注的 owner 当地时区，绝不用机器、服务器或墨尔本时间。";
+
+  it("injects the owner-local-time line into CURRENT CONTEXT when resolved", () => {
+    const prompt = withTelegramReplyStyleGuard("hi", sessionInfo, OWNER_TIME_LINE);
+    expect(prompt).toContain("[CURRENT CONTEXT]");
+    expect(prompt).toContain(OWNER_TIME_LINE);
+  });
+
+  it("injects the owner-timezone style guard line into every Telegram turn", () => {
+    const prompt = withTelegramReplyStyleGuard("hi", sessionInfo, OWNER_TIME_LINE);
+    expect(prompt).toContain(OWNER_TZ_GUARD_LINE);
+  });
+
+  it("injects NO time line when resolution fails (no fabricated Melbourne)", () => {
+    const prompt = withTelegramReplyStyleGuard("hi", sessionInfo);
+    expect(prompt).not.toContain("Current time (owner local");
+    expect(prompt).not.toContain("Melbourne");
+  });
+
+  it("strips the echoed owner-timezone guard line", () => {
+    const reply = ["正文。", OWNER_TZ_GUARD_LINE].join("\n");
+    expect(stripVisiblePromptGuardEcho(reply)).toBe("正文。");
+  });
+
+  it("strips the echoed owner-local-time context line", () => {
+    const reply = ["正文。", OWNER_TIME_LINE].join("\n");
+    expect(stripVisiblePromptGuardEcho(reply)).toBe("正文。");
+  });
+
+  it("strips both new lines when echoed inside a [CURRENT CONTEXT] block", () => {
+    const reply = ["[CURRENT CONTEXT]", OWNER_TIME_LINE, "", "真正的回复。"].join("\n");
+    expect(stripVisiblePromptGuardEcho(reply)).toBe("真正的回复。");
+  });
+});
+
 // ALB-1349: Albert 直令把 ⌦ 打标系统从 Codex 侧整体撤出——guard 不再教打标，
 // 出口也不再认 ⌦ 记号；改教「自然过程沟通」（做到哪说到哪）。硬风格行
 // (full-width punctuation / no headings-tables-rules / no engineering jargon)

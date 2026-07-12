@@ -41,6 +41,7 @@ import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { PendingAnswerLedger, formatPendingAnswerReprompt } from "./pending-answer-guard.js";
 import { stripVisiblePromptGuardEcho, withRotationHandoff, withTelegramReplyStyleGuard } from "./prompt-guard.js";
+import { resolveOwnerLocalTimeLine } from "./owner-local-time.js";
 import { clearChatState, loadChatState, saveChatState } from "./handoff-store.js";
 import {
   type ChatRotationState,
@@ -55,6 +56,8 @@ const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
 const QUEUED_PROMPT_BUSY_RETRY_MS = 250;
+/** Shown to the user when a completed bubble fails both delivery attempts. */
+const DELIVERY_FAILURE_WARNING = "⚠️ 有一段回复发送失败，后续结果仍会继续发送。";
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
@@ -907,6 +910,11 @@ export function createBot(
     const toolCounts = new Map<string, number>();
     let accumulatedText = "";
     const completedStreamMessages: string[] = [];
+    // ALB-1201 (I1): what the user ACTUALLY received — successfully-delivered
+    // bubbles plus the delivery-failure warning for any that permanently failed.
+    // Used to record a faithful transcript when delivery does not fully succeed,
+    // instead of the intended text the user never saw.
+    const deliveredStreamMessages: string[] = [];
     const undeliveredCompletedMessages: string[] = [];
     let streamDeliveryPromise: Promise<void> = Promise.resolve();
     let streamDeliveryError: unknown;
@@ -1163,7 +1171,7 @@ export function createBot(
           try {
             await sendTextMessage(bot.api, chatId, chunk.text, options);
           } catch (retryError) {
-            const warning = renderMarkdownChunkWithinLimit("⚠️ 有一段回复发送失败，后续结果仍会继续发送。");
+            const warning = renderMarkdownChunkWithinLimit(DELIVERY_FAILURE_WARNING);
             await sendTextMessage(bot.api, chatId, warning.text, {
               parseMode: warning.parseMode,
               fallbackText: warning.fallbackText,
@@ -1194,8 +1202,15 @@ export function createBot(
       completedStreamMessages.push(visibleText);
       streamDeliveryPromise = streamDeliveryPromise
         .then(() => deliverCompletedStreamMessage(visibleText))
+        .then(() => {
+          // ALB-1201 (I1): the bubble reached the user — record it as received.
+          deliveredStreamMessages.push(visibleText);
+        })
         .catch((error) => {
           streamDeliveryError ??= error;
+          // The user saw the delivery-failure warning for this bubble, not its
+          // content — record what they actually received.
+          deliveredStreamMessages.push(DELIVERY_FAILURE_WARNING);
           console.error("Failed to deliver completed Telegram agent message:", formatError(error));
         });
     };
@@ -1221,8 +1236,10 @@ export function createBot(
           completedStreamMessages.push(footerText);
           try {
             await deliverCompletedStreamMessage(footerText);
+            deliveredStreamMessages.push(footerText);
           } catch (error) {
             streamDeliveryError ??= error;
+            deliveredStreamMessages.push(DELIVERY_FAILURE_WARNING);
             console.error("Failed to deliver Telegram response footer:", formatError(error));
           }
         }
@@ -1492,21 +1509,39 @@ export function createBot(
 
       // ALB-1205: live prod path runs prompts unbounded (no-turn-timeout, 2026-06-29
       // live decision preserved); rotation handoff still prepends on a rotated turn.
+      // ALB-1201: resolve the owner's local-time line once here (not on every
+      // getInfo()); null when it does not resolve -> no time line is injected.
+      const ownerLocalTimeLine =
+        resolveOwnerLocalTimeLine({ persona: config.mailboxBridge.persona }) ?? undefined;
       await session.prompt(
         rotationHandoff
-          ? withRotationHandoff(withTelegramReplyStyleGuard(userInput, session.getInfo()), rotationHandoff)
-          : withTelegramReplyStyleGuard(userInput, session.getInfo()),
+          ? withRotationHandoff(
+              withTelegramReplyStyleGuard(userInput, session.getInfo(), ownerLocalTimeLine),
+              rotationHandoff,
+            )
+          : withTelegramReplyStyleGuard(userInput, session.getInfo(), ownerLocalTimeLine),
         callbacks,
       );
       updateSessionMetadata(contextKey, session);
       const finalVisibleText = await ensureFinalized();
+      // ALB-1201 (I1/I2): finalize returns the INTENDED text, but a completed
+      // bubble may have permanently failed to deliver. streamDeliveryError (set
+      // by the delivery chain) is the truth of delivery once finalize resolves.
+      const deliverySucceeded = streamDeliveryError === undefined;
+      // The transcript must record what the user actually received, not the
+      // undelivered intended text. On full delivery the two are identical.
+      const transcriptText = deliverySucceeded
+        ? finalVisibleText
+        : deliveredStreamMessages.length > 0
+          ? deliveredStreamMessages.join("\n\n")
+          : DELIVERY_FAILURE_WARNING;
       await appendMemoryTranscriptTurn(
         config,
         ctx,
         contextKey,
         session,
         "bot-raw",
-        finalVisibleText,
+        transcriptText,
       ).catch((error) => {
         console.error("Failed to append memory bot turn:", error instanceof Error ? error.message : String(error));
       });
@@ -1532,7 +1567,15 @@ export function createBot(
       // never answered and is no longer queued for a turn of its own
       // (swallowed by a queue drop / abort / usage-cap). takeOverdue removes
       // what it returns, so each swallowed message is re-fed at most once.
-      strikeOwnPendingAnswer();
+      //
+      // ALB-1201 (I2): only strike when the reply GENUINELY reached the user.
+      // If delivery permanently failed, leave this turn's message unstruck so
+      // the takeOverdue leg below re-feeds it exactly once (bounded one-time
+      // retry; takeOverdue removes what it returns and the re-fed prompt is not
+      // re-recorded, so it cannot loop) rather than marking it falsely answered.
+      if (deliverySucceeded) {
+        strikeOwnPendingAnswer();
+      }
       const overdueAnswers = pendingAnswerLedger.takeOverdue(
         contextKey,
         pendingAnswerTurnSeq,
