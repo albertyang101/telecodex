@@ -918,6 +918,12 @@ export function createBot(
     const undeliveredCompletedMessages: string[] = [];
     let streamDeliveryPromise: Promise<void> = Promise.resolve();
     let streamDeliveryError: unknown;
+    // ALB-1201 (Theo Important 2): delivery truth for the SUBSTANTIVE answer is
+    // tracked separately from the appended footer (tool summary / usage line)
+    // and its delivery-failure warning. The pending-answer strike keys on this —
+    // an answer the user actually received must be struck (never re-fed) even if
+    // the footer that follows it failed to send.
+    let substantiveDeliveryError: unknown;
     let responseMessageId: number | undefined;
     let responseMessagePromise: Promise<void> | undefined;
     let lastRenderedText = "";
@@ -1223,7 +1229,11 @@ export function createBot(
           // ALB-1201 (I1): per-chunk receipts are recorded inside
           // deliverCompletedStreamMessage; here we only remember that this
           // bubble did not fully deliver, so I1/I2/rotation see the truth.
+          // This is a SUBSTANTIVE answer bubble, so it also counts against the
+          // substantive delivery truth that gates the pending-answer strike
+          // (ALB-1201 Theo Important 2) — distinct from a footer-only failure.
           streamDeliveryError ??= error;
+          substantiveDeliveryError ??= error;
           console.error("Failed to deliver completed Telegram agent message:", formatError(error));
         });
     };
@@ -1252,6 +1262,10 @@ export function createBot(
             // ALB-1201 (I1): footer receipts are recorded per-chunk inside
             // deliverCompletedStreamMessage.
           } catch (error) {
+            // ALB-1201 (Theo Important 2): the footer is metadata appended after
+            // the substantive answer. A footer-only failure taints delivery truth
+            // for the transcript, but must NOT set substantiveDeliveryError — the
+            // user still received the answer, so it stays struck (not re-fed).
             streamDeliveryError ??= error;
             console.error("Failed to deliver Telegram response footer:", formatError(error));
           }
@@ -1587,12 +1601,16 @@ export function createBot(
       // (swallowed by a queue drop / abort / usage-cap). takeOverdue removes
       // what it returns, so each swallowed message is re-fed at most once.
       //
-      // ALB-1201 (I2): only strike when the reply GENUINELY reached the user.
-      // If delivery permanently failed, leave this turn's message unstruck so
-      // the takeOverdue leg below re-feeds it exactly once (bounded one-time
-      // retry; takeOverdue removes what it returns and the re-fed prompt is not
-      // re-recorded, so it cannot loop) rather than marking it falsely answered.
-      if (deliverySucceeded) {
+      // ALB-1201 (I2 + Theo Important 2): only strike when the SUBSTANTIVE answer
+      // genuinely reached the user. Keying on substantiveDeliveryError (not the
+      // turn-wide streamDeliveryError) means a footer-only failure — the answer
+      // delivered but the trailing tool/usage line did not — still strikes the
+      // message, so the already-seen answer is never re-fed. When the answer
+      // itself permanently failed, leave the message unstruck so the takeOverdue
+      // leg below re-feeds it exactly once (bounded one-time retry; takeOverdue
+      // removes what it returns and the re-fed prompt is not re-recorded, so it
+      // cannot loop) rather than marking it falsely answered.
+      if (substantiveDeliveryError === undefined) {
         strikeOwnPendingAnswer();
       }
       const overdueAnswers = pendingAnswerLedger.takeOverdue(

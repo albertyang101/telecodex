@@ -2759,6 +2759,52 @@ describe("createBot response delivery", () => {
     await delay(400);
   });
 
+  // ALB-1201 F: the substantive answer delivers, but the APPENDED footer (tool
+  // summary / usage line) fails both attempts AND its delivery-failure warning
+  // fails too. The user DID receive the substantive answer, so the pending
+  // message must be struck and NOT re-fed — footer delivery is separate from
+  // substantive-answer delivery. Regression guard for Theo's Important 2:
+  // body delivered + footer all-fail ⇒ session.prompt runs exactly once.
+  it("strikes and does not re-feed the substantive answer when only the appended footer fails to deliver (ALB-1201 F)", async () => {
+    const body = "这段实质答复正文送达F。";
+    const session = createSession(async (callbacks) => {
+      // A tool runs (summary verbosity) so finalize appends a "Tools used:" footer.
+      callbacks.onToolStart("shell", "tool-F-1");
+      callbacks.onTextDelta(body);
+      callbacks.onAgentMessage?.(body);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig({ toolVerbosity: "summary" }), registry as any) as any;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // The substantive body delivers; the appended footer and its warning both
+    // permanently fail.
+    bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+      const t = String(text);
+      if (t.includes("Tools used:") || t.includes("有一段回复发送失败")) {
+        throw new Error("footer/warning send failed");
+      }
+      return { message_id: 1 };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 7777, text: "回我一条会送达的实质答复" },
+      api: bot.api,
+    });
+
+    // The substantive answer reached the user, so the message is struck: no
+    // overdue re-feed, session.prompt runs exactly once.
+    await delay(400);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const reprompts = session.prompt.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("欠答自查"),
+    );
+    expect(reprompts).toHaveLength(0);
+  });
+
   it("waits for queued streaming delivery before finishing a failed turn", async () => {
     const releaseDelivery = deferred<void>();
     const session = createSession(async (callbacks) => {

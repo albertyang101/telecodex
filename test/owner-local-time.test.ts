@@ -67,6 +67,28 @@ describe("resolveOwnerLocalTimeLine", () => {
     }
   });
 
+  it("maps every ALB-1201 rollout persona to the owner in the REAL canonical tenant_map (Theo Important 1: six-persona coverage)", () => {
+    // Real-data regression (no baseDir -> the live shared owner_location dir).
+    // Theo's rollout-gate RED: albert-v3/albert-codex-e2e resolved but the four
+    // codex-testbot personas returned null. Deployment is Testbot -> Theo -> Ada,
+    // so every rollout target must resolve. Compared against an already-mapped
+    // owner persona (cody) so the guard is robust to the owner's live location
+    // instead of pinning a specific timezone.
+    const rolloutPersonas = [
+      "albert-v3",
+      "albert-codex-e2e",
+      "codex-testbot",
+      "codex-testbot-2",
+      "codex-testbot-3",
+      "codex-testbot-4",
+    ];
+    const baseline = resolveOwnerLocalTimeLine({ persona: "cody", now: NOW });
+    expect(baseline, "cody baseline should resolve from real canonical data").not.toBeNull();
+    for (const persona of rolloutPersonas) {
+      expect(resolveOwnerLocalTimeLine({ persona, now: NOW }), persona).toBe(baseline);
+    }
+  });
+
   it("falls back to treating the persona itself as the tenant when the map has no entry", () => {
     const baseDir = fixtureDir({
       "tenant_map.json": JSON.stringify({ someoneElse: "other" }),
