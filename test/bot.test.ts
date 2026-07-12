@@ -2805,6 +2805,75 @@ describe("createBot response delivery", () => {
     expect(reprompts).toHaveLength(0);
   });
 
+  // ALB-1201 G: the non-stream FALLBACK path — Codex emits only onTextDelta with
+  // no completed onAgentMessage, so finalize delivers via deliverRenderedChunks.
+  // A multi-chunk final where the first chunk delivers but a later chunk fails
+  // must record ONLY the delivered chunk in transcript/rotation (never the failed
+  // chunk) and bound the pending re-feed to exactly once — the same per-chunk
+  // receipt truth as the streaming path. Regression guard for Theo's review: this
+  // fallback previously bypassed receipt truth (no receipts, threw into the
+  // already-finalized catch, no transcript/strike, retry could duplicate chunk 1).
+  it("records only the delivered chunk and bounds the re-feed when a later fallback chunk fails (onTextDelta only, ALB-1201 G)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-deliver-G-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const workspace = await createWorkspace("telecodex-deliver-G-ws-");
+    // onTextDelta only (no onAgentMessage) forces the deliverRenderedChunks
+    // fallback; >4000 chars with a newline boundary splits into two chunks.
+    const chunkOne = "CHUNKONEMARKER" + "甲".repeat(2900);
+    const chunkTwo = "CHUNKTWOMARKER" + "乙".repeat(400);
+    const finalText = `${chunkOne}\n${chunkTwo}`;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(finalText);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(
+      createConfig({
+        workspace,
+        memoryTranscriptRoot: sessionsRoot,
+        autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 },
+      }),
+      registry as any,
+    ) as any;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // First chunk delivers; the later chunk and its warning permanently fail.
+    bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+      const t = String(text);
+      if (t.includes("CHUNKTWOMARKER") || t.includes("有一段回复发送失败")) {
+        throw new Error("later fallback chunk down");
+      }
+      return { message_id: 1 };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 9797, text: "只发delta的多块回复" },
+      api: bot.api,
+    });
+
+    // Transcript records the delivered first chunk, not the never-delivered second.
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    expect(transcript).toContain("CHUNKONEMARKER");
+    expect(transcript).not.toContain("CHUNKTWOMARKER");
+
+    // Not fully delivered → the pending message is re-fed exactly once (bounded).
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    expect(String(session.prompt.mock.calls[1][0])).toContain("欠答自查");
+    await delay(400);
+    const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("欠答自查"),
+    );
+    expect(repromptCalls).toHaveLength(1);
+
+    // Rotation never stores the failed second chunk.
+    const buffer = await readRotationBuffer(workspace, "42");
+    expect(buffer.some((entry) => entry.text.includes("CHUNKTWOMARKER"))).toBe(false);
+  });
+
   it("waits for queued streaming delivery before finishing a failed turn", async () => {
     const releaseDelivery = deferred<void>();
     const session = createSession(async (callbacks) => {

@@ -1131,28 +1131,63 @@ export function createBot(
         return;
       }
 
-      const [firstChunk, ...remainingChunks] = chunks;
-      if (responseMessageId) {
-        await safeEditMessage(bot, chatId, responseMessageId, firstChunk.text, {
-          parseMode: firstChunk.parseMode,
-          fallbackText: firstChunk.fallbackText,
-        });
-        await removeAbortKeyboard();
-      } else {
-        const message = await sendTextMessage(bot.api, chatId, firstChunk.text, {
-          parseMode: firstChunk.parseMode,
-          fallbackText: firstChunk.fallbackText,
-          messageThreadId,
-        });
-        responseMessageId = message.message_id;
-      }
+      // ALB-1201 (Theo review): the non-stream fallback delivers through the SAME
+      // per-chunk receipt model as the streaming path (deliverCompletedStreamMessage).
+      // Each delivered chunk is recorded in deliveredStreamMessages; a chunk that
+      // permanently fails records its delivery-failure warning ONLY if the user
+      // actually sees it, marks substantiveDeliveryError so the pending-answer
+      // strike / transcript / rotation see the truth, and aborts the remaining
+      // chunks WITHOUT throwing — so finalize's post-delivery truth logic still
+      // runs. (Was: no receipts, and a mid-bubble failure threw into the
+      // already-finalized catch, leaving no faithful transcript/rotation and an
+      // unstruck pending answer whose retry re-sent the already-delivered chunk.)
+      // The first chunk preserves edit-or-send semantics: edit the streaming
+      // preview if one exists, else send a new message and adopt its id.
+      for (const [index, chunk] of chunks.entries()) {
+        const sendChunk = async (): Promise<void> => {
+          if (index === 0 && responseMessageId) {
+            await safeEditMessage(bot, chatId, responseMessageId, chunk.text, {
+              parseMode: chunk.parseMode,
+              fallbackText: chunk.fallbackText,
+            });
+            await removeAbortKeyboard();
+            return;
+          }
+          const message = await sendTextMessage(bot.api, chatId, chunk.text, {
+            parseMode: chunk.parseMode,
+            fallbackText: chunk.fallbackText,
+            messageThreadId,
+          });
+          if (index === 0) {
+            responseMessageId = message.message_id;
+          }
+        };
 
-      for (const chunk of remainingChunks) {
-        await sendTextMessage(bot.api, chatId, chunk.text, {
-          parseMode: chunk.parseMode,
-          fallbackText: chunk.fallbackText,
-          messageThreadId,
-        });
+        try {
+          await sendChunk();
+          deliveredStreamMessages.push(chunk.sourceText);
+        } catch (firstError) {
+          try {
+            await sendChunk();
+            deliveredStreamMessages.push(chunk.sourceText);
+          } catch (retryError) {
+            const warning = renderMarkdownChunkWithinLimit(DELIVERY_FAILURE_WARNING);
+            try {
+              await sendTextMessage(bot.api, chatId, warning.text, {
+                parseMode: warning.parseMode,
+                fallbackText: warning.fallbackText,
+                messageThreadId,
+              });
+              deliveredStreamMessages.push(DELIVERY_FAILURE_WARNING);
+            } catch {
+              // Warning also failed — the user saw nothing for this chunk.
+            }
+            const error = retryError ?? firstError;
+            streamDeliveryError ??= error;
+            substantiveDeliveryError ??= error;
+            return;
+          }
+        }
       }
     };
 
