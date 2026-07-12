@@ -977,27 +977,40 @@ export function createBot(
       return renderMarkdownChunkWithinLimit(previewText);
     };
 
-    const buildFinalResponseText = (text: string): string => {
+    // ALB-1201 (Theo review Gap 3): the SUBSTANTIVE answer body and the appended
+    // footer (tool summary / usage line) are built separately so the non-stream
+    // fallback can deliver them as distinct role-aware units — a footer failure
+    // must not taint the substantive delivery truth. buildFinalResponseText keeps
+    // its original combined output for callers that want the whole text.
+    const buildFinalResponseBody = (text: string): string => {
       const visibleText = stripVisiblePromptGuardEcho(text.trim());
-      const trimmedText = stripVisibleSourceFooter(userVisibleText, visibleText);
+      return stripVisibleSourceFooter(userVisibleText, visibleText);
+    };
+
+    const buildFinalResponseFooter = (): string => {
       const usageLine =
         config.showTurnTokenUsage && lastTurnUsage ? formatTurnUsageLine(lastTurnUsage) : "";
 
       if (toolVerbosity === "summary") {
-        const footerLines = [formatToolSummaryLine(toolCounts), usageLine].filter((line): line is string => Boolean(line));
-        if (footerLines.length === 0) {
-          return trimmedText;
-        }
-
-        const footer = footerLines.join("\n");
-        return trimmedText ? `${trimmedText}\n\n${footer}` : footer;
+        return [formatToolSummaryLine(toolCounts), usageLine]
+          .filter((line): line is string => Boolean(line))
+          .join("\n");
       }
 
       if (toolVerbosity === "all" && usageLine) {
-        return trimmedText ? `${trimmedText}\n\n${usageLine}` : usageLine;
+        return usageLine;
       }
 
-      return trimmedText;
+      return "";
+    };
+
+    const buildFinalResponseText = (text: string): string => {
+      const body = buildFinalResponseBody(text);
+      const footer = buildFinalResponseFooter();
+      if (!footer) {
+        return body;
+      }
+      return body ? `${body}\n\n${footer}` : footer;
     };
 
     const ensureResponseMessage = async (): Promise<void> => {
@@ -1323,8 +1336,9 @@ export function createBot(
         return completedStreamMessages.join("\n\n");
       }
 
-      const finalText = buildFinalResponseText(accumulatedText);
-      if (!finalText) {
+      const bodyText = buildFinalResponseBody(accumulatedText);
+      const footerText = buildFinalResponseFooter();
+      if (!bodyText && !footerText) {
         const html = "<b>✅ Done</b>";
         const plainText = "✅ Done";
 
@@ -1337,17 +1351,38 @@ export function createBot(
         return plainText;
       }
 
-      // ALB-1201 (Theo review): deliverRenderedChunks records per-chunk receipts
-      // and marks substantiveDeliveryError before it re-throws on a permanent
-      // failure. Swallow that throw here so the post-finalize transcript / strike /
-      // rotation logic runs off the recorded delivery truth (matching the streaming
-      // path) instead of the throw bypassing it into the already-finalized catch.
-      try {
-        await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
-      } catch (error) {
-        console.error("One or more final Telegram response chunks were not delivered:", formatError(error));
+      // ALB-1201 (Theo review): the non-stream fallback mirrors the streaming path —
+      // the SUBSTANTIVE body and the appended footer are delivered as separate
+      // role-aware units so a footer-only failure taints transcript truth
+      // (streamDeliveryError) but never substantiveDeliveryError (Gap 3). Both
+      // record per-chunk receipts; deliverRenderedChunks marks
+      // substantiveDeliveryError + re-throws on a body failure, and the footer's
+      // deliverCompletedStreamMessage re-throws on its own failure — each throw is
+      // swallowed here so the post-finalize transcript / strike / rotation logic
+      // still runs off the recorded delivery truth. When there is only one of the
+      // two, it takes the body's edit-first slot on its own.
+      if (bodyText) {
+        try {
+          await deliverRenderedChunks(splitMarkdownForTelegram(bodyText));
+        } catch (error) {
+          console.error("One or more final Telegram response body chunks were not delivered:", formatError(error));
+        }
+        if (footerText) {
+          try {
+            await deliverCompletedStreamMessage(footerText);
+          } catch (error) {
+            streamDeliveryError ??= error;
+            console.error("Failed to deliver Telegram response footer:", formatError(error));
+          }
+        }
+      } else if (footerText) {
+        try {
+          await deliverRenderedChunks(splitMarkdownForTelegram(footerText));
+        } catch (error) {
+          console.error("Telegram response footer was not delivered:", formatError(error));
+        }
       }
-      return finalText;
+      return [bodyText, footerText].filter((part) => Boolean(part)).join("\n\n");
     };
 
     const ensureFinalized = (): Promise<string> => {
@@ -1730,13 +1765,21 @@ export function createBot(
         });
         const failureSourceText = uniqueRecoveredFailureParts.join("\n\n");
         const failureReplyText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
-        const transcriptFailureText = [...completedStreamMessages, failureReplyText]
-          .filter((text) => Boolean(text))
-          .join("\n\n");
         const chunks = splitMarkdownForTelegram(failureReplyText);
         try {
           await deliverRenderedChunks(chunks);
-          await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "bot-raw", transcriptFailureText).catch(
+        } catch (telegramError) {
+          console.error("Failed to send error message to Telegram:", telegramError);
+        }
+        // ALB-1201 (Theo review Gap 4): the failure/error path records the
+        // transcript from what the user ACTUALLY received — the per-chunk receipts
+        // of delivered progress bubbles + delivered failure-reply chunks —
+        // unconditionally. It never records intended-but-undelivered progress, and
+        // a later failure-reply chunk's failure no longer discards the delivered
+        // earlier chunks (the throw is caught above; the receipts survive).
+        const failureTranscriptText = deliveredStreamMessages.join("\n\n");
+        if (failureTranscriptText) {
+          await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "bot-raw", failureTranscriptText).catch(
             (appendError) => {
               console.error(
                 "Failed to append memory bot turn:",
@@ -1744,8 +1787,6 @@ export function createBot(
               );
             },
           );
-        } catch (telegramError) {
-          console.error("Failed to send error message to Telegram:", telegramError);
         }
       }
     } finally {

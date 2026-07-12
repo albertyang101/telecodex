@@ -2938,6 +2938,135 @@ describe("createBot response delivery", () => {
     expect(transcript).not.toContain("PROGRESSMARK");
   });
 
+  // ALB-1201 I: the non-stream FALLBACK with a tool-summary footer. onTextDelta-only
+  // body delivers, but the appended "Tools used:" footer (its own chunk) + warning
+  // fail. The footer is metadata, not the substantive answer, so its failure must
+  // NOT set substantiveDeliveryError — the delivered body is struck, not re-fed.
+  // Regression guard for Theo's review Gap 3 (fallback did not separate body/footer
+  // role, so a footer-chunk failure re-fed an already-delivered answer).
+  it("strikes and does not re-feed when only the fallback footer fails (onTextDelta only + tool summary, ALB-1201 I)", async () => {
+    // ~3988-char single-paragraph body stays one chunk (<4000); appending the
+    // "\n\n<footer>" pushes the footer into its own chunk.
+    const body = "BODYMARK" + "文".repeat(3980);
+    const session = createSession(async (callbacks) => {
+      callbacks.onToolStart("shell", "tool-I-1");
+      callbacks.onTextDelta(body);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig({ toolVerbosity: "summary" }), registry as any) as any;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+      const t = String(text);
+      if (t.includes("Tools used:") || t.includes("有一段回复发送失败")) {
+        throw new Error("footer send failed");
+      }
+      return { message_id: 1 };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 6161, text: "只发delta长正文带工具" },
+      api: bot.api,
+    });
+
+    await delay(400);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const reprompts = session.prompt.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("欠答自查"),
+    );
+    expect(reprompts).toHaveLength(0);
+  });
+
+  // ALB-1201 J: a progress bubble (and its warning) permanently fail, then the
+  // provider throws — the failure/error path must record the transcript from what
+  // the user ACTUALLY received (delivered per-chunk receipts), never the intended
+  // but undelivered progress bubble. Regression guard for Theo's review Gap 4a.
+  it("does not record an undelivered progress bubble in the failure-path transcript (ALB-1201 J)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-deliver-J-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const progress = "阶段结果：PROGRESSMARK 第一阶段进行中。";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(progress);
+      callbacks.onAgentMessage?.(progress, { isFinal: false, followedByTool: false });
+      throw new Error("provider blew up mid turn");
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // The progress bubble (and its warning) fail; the error reply delivers.
+    bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+      const t = String(text);
+      if (t.includes("PROGRESSMARK") || t.includes("有一段回复发送失败")) {
+        throw new Error("progress bubble down");
+      }
+      return { message_id: 1 };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 5959, text: "进度失败后崩溃" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    // A bot turn WAS recorded (the delivered error reply)...
+    expect(transcript).toContain("[bot-raw]");
+    // ...but the never-delivered progress bubble must NOT be in it.
+    expect(transcript).not.toContain("PROGRESSMARK");
+    await delay(400);
+  });
+
+  // ALB-1201 K: a multi-chunk error/failure reply where the first chunk delivers
+  // but a later chunk fails. The delivered first chunk must survive in the
+  // transcript — the throw must not skip the append entirely. Regression guard for
+  // Theo's review Gap 4b.
+  it("keeps the delivered first chunk of a multi-chunk failure reply in the transcript (ALB-1201 K)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-deliver-K-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    // A long streamed body (recovered into the failure reply) forces >1 chunk.
+    const errChunkOne = "ERRCHUNKONEMARK" + "甲".repeat(3900);
+    const errChunkTwo = "ERRCHUNKTWOMARK" + "乙".repeat(300);
+    const longEmit = `${errChunkOne}\n${errChunkTwo}`;
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(longEmit);
+      throw new Error("provider died mid stream");
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // First chunk delivers; the later chunk and its warning fail.
+    bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+      const t = String(text);
+      if (t.includes("ERRCHUNKTWOMARK") || t.includes("有一段回复发送失败")) {
+        throw new Error("later failure-reply chunk down");
+      }
+      return { message_id: 1 };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 5858, text: "长内容后崩溃" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    // The delivered first chunk survives; the never-delivered second chunk does not.
+    expect(transcript).toContain("ERRCHUNKONEMARK");
+    expect(transcript).not.toContain("ERRCHUNKTWOMARK");
+    await delay(400);
+  });
+
   it("waits for queued streaming delivery before finishing a failed turn", async () => {
     const releaseDelivery = deferred<void>();
     const session = createSession(async (callbacks) => {
