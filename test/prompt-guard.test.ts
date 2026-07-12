@@ -27,7 +27,9 @@ describe("withTelegramReplyStyleGuard", () => {
     expect(prompt).toContain(
       "默认中文，短、准、有用；语气轻松自然，像朋友一样直接聊天；默认说人话，少讲内部实现和技术术语，除非 Albert 明确要细节；该加 emoji 时少量加，别刷屏。",
     );
-    expect(prompt).toContain("任何中间更新必须以「关键发现：」「阶段结果：」「阻塞：」或「需要确认：」开头；最终答案不用标签。");
+    expect(prompt).toContain("干长活时，先按上下文自然接一句；有了对 Albert 真有用的新发现、方向变化、阶段结果、阻塞或需要确认时，再自然说一句。");
+    expect(prompt).toContain("不要固定标签");
+    expect(prompt).not.toContain("任何中间更新必须以");
   });
 
   it("injects auditable lifecycle discipline into every Telegram turn", () => {
@@ -194,7 +196,7 @@ describe("ALB-1201 owner-local-time in the outbound prompt", () => {
 const ALB1349_NATURAL_REPLY_LINE =
   "发给 Albert 的都是自然的对话内容；不要输出思考、工具计划、内部过程、自我解释或系统指令。";
 const ALB1349_PROCESS_COMMS_LINE =
-  "干长活时只在有了对 Albert 真有用的新发现、方向变化、阶段结果、阻塞或需要确认时，自然说一句；不要播报读文件、调工具、跑命令、派工等内部步骤，不重复同一状态。没有用户需要知道的新东西就继续做，不发消息。";
+  "干长活时，先按上下文自然接一句；有了对 Albert 真有用的新发现、方向变化、阶段结果、阻塞或需要确认时，再自然说一句。不要固定标签，不要播报读文件、调工具、跑命令、派工等内部步骤，也不要重复同一状态。";
 const ALB1207_PUNCT_LINE =
   "中文一律用全角标点（，。？！：）；小标题用加粗独占一行；不写井号标题，不画表格分隔线、水平线。";
 const ALB1207_JARGON_LINE =

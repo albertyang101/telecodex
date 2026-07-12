@@ -845,6 +845,7 @@ describe("createBot response delivery", () => {
     const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-stream-failure-"));
     tempDirs.push(root);
     const sessionsRoot = path.join(root, "Sessions");
+    const workspace = path.join(root, "workspace");
     const session = createSession(async (callbacks) => {
       callbacks.onTextDelta("阶段结果：已完成第一阶段。");
       callbacks.onAgentMessage?.("阶段结果：已完成第一阶段。", {
@@ -856,7 +857,11 @@ describe("createBot response delivery", () => {
     const registry = createRegistry(session);
 
     const bot = createBot(
-      createConfig({ memoryTranscriptRoot: sessionsRoot }),
+      createConfig({
+        workspace,
+        memoryTranscriptRoot: sessionsRoot,
+        autoRotate: { enabled: true, threshold: 0.9, contextWindow: 258400 },
+      }),
       registry as any,
     ) as any;
     const textHandler = bot.__handlers.on.get("message:text");
@@ -873,176 +878,26 @@ describe("createBot response delivery", () => {
     const visibleReplyTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
     const visibleReplies = visibleReplyTexts.join("\n");
 
-    expect(visibleReplyTexts.filter((text: string) => text.includes("阶段结果：已完成第一阶段。"))).toHaveLength(1);
+    expect(visibleReplyTexts.some((text: string) => text.includes("阶段结果：已完成第一阶段。"))).toBe(true);
     expect(visibleReplies).toContain("阶段结果：已完成第一阶段。");
     expect(visibleReplies).toContain("provider failed");
     expect(transcript).toContain("[bot-raw]");
     expect(transcript).toContain("阶段结果：已完成第一阶段。");
     expect(transcript).toContain("provider failed");
+    const rotation = await readRotationBuffer(workspace, "42");
+    expect(rotation.some((entry) => entry.role === "assistant" && entry.text.includes("阶段结果：已完成第一阶段。"))).toBe(true);
+    expect(rotation.some((entry) => entry.role === "assistant" && entry.text.includes("provider failed"))).toBe(true);
   });
 
-  it("preserves an untagged completed partial in the failure reply without sending it as a progress bubble", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-untagged-failure-"));
+  it("delivers native completed messages and recovers only the useful unfinished failure result", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-memory-native-failure-"));
     tempDirs.push(root);
     const sessionsRoot = path.join(root, "Sessions");
     const session = createSession(async (callbacks) => {
-      callbacks.onTextDelta("已完成第一阶段，但这条没有进度标签。");
-      callbacks.onAgentMessage?.("已完成第一阶段，但这条没有进度标签。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查文件。");
-      callbacks.onAgentMessage?.("我先检查文件。", {
-        isFinal: false,
-        followedByTool: true,
-      });
-      callbacks.onTextDelta("我先检查另一份文件。");
-      callbacks.onAgentMessage?.("我先检查另一份文件。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先把文件检查一下。");
-      callbacks.onAgentMessage?.("我先把文件检查一下。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查失败日志。");
-      callbacks.onAgentMessage?.("我先检查失败日志。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查字段：失败日志。");
-      callbacks.onAgentMessage?.("我先检查字段：失败日志。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查日志，发现逻辑也要一起看。");
-      callbacks.onAgentMessage?.("我先检查日志，发现逻辑也要一起看。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查日志，发现还没有跑测试。");
-      callbacks.onAgentMessage?.("我先检查日志，发现还没有跑测试。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查日志，发现尚未跑测试。");
-      callbacks.onAgentMessage?.("我先检查日志，发现尚未跑测试。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查日志，发现还未跑测试。");
-      callbacks.onAgentMessage?.("我先检查日志，发现还未跑测试。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查日志，发现没有继续跑测试。");
-      callbacks.onAgentMessage?.("我先检查日志，发现没有继续跑测试。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查日志，发现仍未跑测试。");
-      callbacks.onAgentMessage?.("我先检查日志，发现仍未跑测试。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查日志，发现暂未跑测试。");
-      callbacks.onAgentMessage?.("我先检查日志，发现暂未跑测试。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查日志，发现迄今未跑测试。");
-      callbacks.onAgentMessage?.("我先检查日志，发现迄今未跑测试。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查了配置，生产服务依然运行旧版本。");
-      callbacks.onAgentMessage?.("我先检查了配置，生产服务依然运行旧版本。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查了配置，再继续跑测试。");
-      callbacks.onAgentMessage?.("我先检查了配置，再继续跑测试。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查了配置，随后发现服务仍在旧版本。");
-      callbacks.onAgentMessage?.("我先检查了配置，随后发现服务仍在旧版本。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后测试结果显示服务仍在旧版本。");
-      callbacks.onAgentMessage?.("随后测试结果显示服务仍在旧版本。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后检查结果显示配置未生效。");
-      callbacks.onAgentMessage?.("随后检查结果显示配置未生效。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后查看结果显示服务仍在旧版本。");
-      callbacks.onAgentMessage?.("随后查看结果显示服务仍在旧版本。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后查看报告显示服务仍在旧版本。");
-      callbacks.onAgentMessage?.("随后查看报告显示服务仍在旧版本。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后查询结果显示服务仍在旧版本。");
-      callbacks.onAgentMessage?.("随后查询结果显示服务仍在旧版本。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后查看测试报告显示服务仍在旧版本。");
-      callbacks.onAgentMessage?.("随后查看测试报告显示服务仍在旧版本。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后查询检测结果显示缓存仍未更新。");
-      callbacks.onAgentMessage?.("随后查询检测结果显示缓存仍未更新。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后查看配置是否生效。");
-      callbacks.onAgentMessage?.("随后查看配置是否生效。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后测试报告显示服务仍在旧版本。");
-      callbacks.onAgentMessage?.("随后测试报告显示服务仍在旧版本。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后测试任务已完成。");
-      callbacks.onAgentMessage?.("随后测试任务已完成。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后检查报告显示配置未生效。");
-      callbacks.onAgentMessage?.("随后检查报告显示配置未生效。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("随后检查配置是否生效。");
-      callbacks.onAgentMessage?.("随后检查配置是否生效。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先查了一下，结果是生产仍在旧版本。");
-      callbacks.onAgentMessage?.("我先查了一下，结果是生产仍在旧版本。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("我先检查完了: 发现配置没有生效。");
-      callbacks.onAgentMessage?.("我先检查完了: 发现配置没有生效。", {
-        isFinal: false,
-        followedByTool: false,
-      });
-      callbacks.onTextDelta("已完成第二阶段，这条也没有进度标签。");
-      callbacks.onAgentMessage?.("已完成第二阶段，这条也没有进度标签。", {
+      callbacks.onTextDelta("收到，这就查。");
+      callbacks.onAgentMessage?.("收到，这就查。", { isFinal: false, followedByTool: true });
+      callbacks.onTextDelta("第一阶段核对完了，生产服务仍在旧版本。");
+      callbacks.onAgentMessage?.("第一阶段核对完了，生产服务仍在旧版本。", {
         isFinal: false,
         followedByTool: false,
       });
@@ -1050,94 +905,25 @@ describe("createBot response delivery", () => {
       throw new Error("provider failed");
     });
     const registry = createRegistry(session);
-
-    const bot = createBot(
-      createConfig({ memoryTranscriptRoot: sessionsRoot }),
-      registry as any,
-    ) as any;
+    const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
     const textHandler = bot.__handlers.on.get("message:text");
 
     await textHandler({
       chat: { id: 42 },
       from: { id: 123 },
-      message: { message_id: 99, text: "无标签阶段后失败" },
+      message: { message_id: 99, text: "原生消息后失败" },
       api: bot.api,
     });
 
     const files = await readdir(sessionsRoot);
     const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
-    const visibleReplyTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
-
-    expect(visibleReplyTexts.filter((text: string) => text.includes("已完成第一阶段，但这条没有进度标签。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("已完成第二阶段，这条也没有进度标签。"))).toHaveLength(1);
-    expect(visibleReplyTexts.join("\n")).not.toContain("我先检查文件。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("我先检查另一份文件。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("我先把文件检查一下。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("失败日志。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("我先检查字段：失败日志。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("发现逻辑也要一起看。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("发现还没有跑测试。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("发现尚未跑测试。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("发现还未跑测试。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("发现没有继续跑测试。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("发现仍未跑测试。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("发现暂未跑测试。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("发现迄今未跑测试。");
-    expect(visibleReplyTexts.filter((text: string) => text.includes("生产服务依然运行旧版本。"))).toHaveLength(1);
-    expect(visibleReplyTexts.join("\n")).not.toContain("再继续跑测试。");
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后发现服务仍在旧版本。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试结果显示服务仍在旧版本。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后检查结果显示配置未生效。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查看结果显示服务仍在旧版本。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查看报告显示服务仍在旧版本。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查询结果显示服务仍在旧版本。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查看测试报告显示服务仍在旧版本。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后查询检测结果显示缓存仍未更新。"))).toHaveLength(1);
-    expect(visibleReplyTexts.join("\n")).not.toContain("随后查看配置是否生效。");
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试报告显示服务仍在旧版本。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后测试任务已完成。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("随后检查报告显示配置未生效。"))).toHaveLength(1);
-    expect(visibleReplyTexts.join("\n")).not.toContain("随后检查配置是否生效。");
-    expect(visibleReplyTexts.join("\n")).not.toContain("我先检查第三份文件。");
-    expect(visibleReplyTexts.filter((text: string) => text.includes("结果是生产仍在旧版本。"))).toHaveLength(1);
-    expect(visibleReplyTexts.filter((text: string) => text.includes("发现配置没有生效。"))).toHaveLength(1);
-    expect(visibleReplyTexts.join("\n")).toContain("第三阶段刚开始。");
-    expect(visibleReplyTexts.join("\n")).toContain("provider failed");
-    expect(transcript).toContain("已完成第一阶段，但这条没有进度标签。");
-    expect(transcript).toContain("已完成第二阶段，这条也没有进度标签。");
-    expect(transcript).not.toContain("我先检查文件。");
-    expect(transcript).not.toContain("我先检查另一份文件。");
-    expect(transcript).not.toContain("我先把文件检查一下。");
-    expect(transcript).not.toContain("失败日志。");
-    expect(transcript).not.toContain("我先检查字段：失败日志。");
-    expect(transcript).not.toContain("发现逻辑也要一起看。");
-    expect(transcript).not.toContain("发现还没有跑测试。");
-    expect(transcript).not.toContain("发现尚未跑测试。");
-    expect(transcript).not.toContain("发现还未跑测试。");
-    expect(transcript).not.toContain("发现没有继续跑测试。");
-    expect(transcript).not.toContain("发现仍未跑测试。");
-    expect(transcript).not.toContain("发现暂未跑测试。");
-    expect(transcript).not.toContain("发现迄今未跑测试。");
-    expect(transcript).toContain("生产服务依然运行旧版本。");
-    expect(transcript).not.toContain("再继续跑测试。");
-    expect(transcript).toContain("随后发现服务仍在旧版本。");
-    expect(transcript).toContain("随后测试结果显示服务仍在旧版本。");
-    expect(transcript).toContain("随后检查结果显示配置未生效。");
-    expect(transcript).toContain("随后查看结果显示服务仍在旧版本。");
-    expect(transcript).toContain("随后查看报告显示服务仍在旧版本。");
-    expect(transcript).toContain("随后查询结果显示服务仍在旧版本。");
-    expect(transcript).toContain("随后查看测试报告显示服务仍在旧版本。");
-    expect(transcript).toContain("随后查询检测结果显示缓存仍未更新。");
-    expect(transcript).not.toContain("随后查看配置是否生效。");
-    expect(transcript).toContain("随后测试报告显示服务仍在旧版本。");
-    expect(transcript).toContain("随后测试任务已完成。");
-    expect(transcript).toContain("随后检查报告显示配置未生效。");
-    expect(transcript).not.toContain("随后检查配置是否生效。");
+    const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+    for (const expected of ["收到，这就查。", "第一阶段核对完了，生产服务仍在旧版本。", "第三阶段刚开始。", "provider failed"]) {
+      expect(visible).toContain(expected);
+      expect(transcript).toContain(expected);
+    }
+    expect(visible).not.toContain("我先检查第三份文件。");
     expect(transcript).not.toContain("我先检查第三份文件。");
-    expect(transcript).toContain("结果是生产仍在旧版本。");
-    expect(transcript).toContain("发现配置没有生效。");
-    expect(transcript).toContain("第三阶段刚开始。");
-    expect(transcript).toContain("provider failed");
   });
 
   it("deduplicates the same recovered result across completed and current failure partials", async () => {
@@ -1213,8 +999,8 @@ describe("createBot response delivery", () => {
       expect(visibleReply).toContain(result);
       expect(transcript).toContain(result);
     }
-    expect(visibleReply).not.toContain("我先检查配置。");
-    expect(transcript).not.toContain("我先检查配置。");
+    expect(visibleReply).toContain("我先检查配置。");
+    expect(transcript).toContain("我先检查配置。");
   });
 
   it("records prompt failure replies as bot turns without leaking raw provider URLs", async () => {
@@ -2168,189 +1954,210 @@ describe("createBot response delivery", () => {
     expect(bot.api.sendMessage.mock.calls[1][1]).not.toContain("阶段结果：第一段进度。");
   });
 
-  it("drops obvious process narration but keeps useful milestone and final bubbles", async () => {
+  it("delivers natural acknowledgements and milestones without requiring structured prefixes", async () => {
     const session = createSession(async (callbacks) => {
-      callbacks.onTextDelta("我先去读文件、跑命令。");
-      callbacks.onAgentMessage?.("我先去读文件、跑命令。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先去做两件事：读文件、跑测试。");
-      callbacks.onAgentMessage?.("我先去做两件事：读文件、跑测试。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先去检查已有测试。");
-      callbacks.onAgentMessage?.("我先去检查已有测试。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先去看看有没有问题。");
-      callbacks.onAgentMessage?.("我先去看看有没有问题。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先看看有没有问题？");
-      callbacks.onAgentMessage?.("我先看看有没有问题？", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先看看这样可以吗？");
-      callbacks.onAgentMessage?.("我先看看这样可以吗？", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先看看你是否在线。");
-      callbacks.onAgentMessage?.("我先看看你是否在线。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先检查你要不要保留日志。");
-      callbacks.onAgentMessage?.("我先检查你要不要保留日志。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先检查需要确认哪些日志。");
-      callbacks.onAgentMessage?.("我先检查需要确认哪些日志。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先看看请确认按钮是否出现。");
-      callbacks.onAgentMessage?.("我先看看请确认按钮是否出现。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先查需要你提供哪些字段。");
-      callbacks.onAgentMessage?.("我先查需要你提供哪些字段。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我准备检查需要你提供哪些字段。");
-      callbacks.onAgentMessage?.("我准备检查需要你提供哪些字段。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("下一步请确认按钮是否出现。");
-      callbacks.onAgentMessage?.("下一步请确认按钮是否出现。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先看看：有没有问题？");
-      callbacks.onAgentMessage?.("我先看看：有没有问题？", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("Going to check whether this works?");
-      callbacks.onAgentMessage?.("Going to check whether this works?", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("Now I’ll check whether this works?");
-      callbacks.onAgentMessage?.("Now I’ll check whether this works?", { isFinal: false, followedByTool: true });
-      for (const narration of [
-        "我先看一下。",
-        "我先查一下。",
-        "收到。我先去查。",
-        "收到，我先查一下。",
-        "“我先去查一下。”",
-        "• 我先去查一下。",
-        "我先去查一下：配置文件。",
-        "Let me inspect the logs.",
-        "I’ll look into it.",
-        "I’m going to run tests.",
-        "I am checking now.",
-        "Next, I’ll run tests.",
-        "Let me run tests: npm test.",
-      ]) {
-        callbacks.onTextDelta(narration);
-        callbacks.onAgentMessage?.(narration, { isFinal: false, followedByTool: true });
-      }
-      callbacks.onTextDelta("我先去查一下。\n关键发现：旧版本仍在。");
-      callbacks.onAgentMessage?.("我先去查一下。\n关键发现：旧版本仍在。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("Let me run tests.");
-      callbacks.onAgentMessage?.("Let me run tests.", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("关键发现：消息过密来自进度策略。");
-      callbacks.onAgentMessage?.("关键发现：消息过密来自进度策略。", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先确认一下：你要不要保留这条提醒？");
-      callbacks.onAgentMessage?.("我先确认一下：你要不要保留这条提醒？", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("这样可以吗？");
-      callbacks.onAgentMessage?.("这样可以吗？", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("Should I continue?");
-      callbacks.onAgentMessage?.("Should I continue?", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("还继续吗？");
-      callbacks.onAgentMessage?.("还继续吗？", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("你希望我怎么做？");
-      callbacks.onAgentMessage?.("你希望我怎么做？", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("What should I do?");
-      callbacks.onAgentMessage?.("What should I do?", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("“这样可以吗？”");
-      callbacks.onAgentMessage?.("“这样可以吗？”", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("**这样可以吗？**");
-      callbacks.onAgentMessage?.("**这样可以吗？**", { isFinal: false, followedByTool: true });
-      callbacks.onTextDelta("我先确认过了：生产仍在跑旧版本。");
-      callbacks.onAgentMessage?.("我先确认过了：生产仍在跑旧版本。");
-      callbacks.onTextDelta("我现在部署失败，需要回滚。");
-      callbacks.onAgentMessage?.("我现在部署失败，需要回滚。");
-      callbacks.onTextDelta("现在修复完成，可以验收。");
-      callbacks.onAgentMessage?.("现在修复完成，可以验收。");
-      callbacks.onTextDelta("我先把根因确认清楚了：旧 poller 没退出。");
-      callbacks.onAgentMessage?.("我先把根因确认清楚了：旧 poller 没退出。");
-      callbacks.onTextDelta("我现在就部署失败，需要回滚。");
-      callbacks.onAgentMessage?.("我现在就部署失败，需要回滚。");
-      callbacks.onTextDelta("现在就修复完成，可以验收。");
-      callbacks.onAgentMessage?.("现在就修复完成，可以验收。");
-      callbacks.onTextDelta("我现在就查明了根因：旧版本仍在运行。");
-      callbacks.onAgentMessage?.("我现在就查明了根因：旧版本仍在运行。");
-      callbacks.onTextDelta("我先把旧 poller 状态摸清了，两个都活着。");
-      callbacks.onAgentMessage?.("我先把旧 poller 状态摸清了，两个都活着。");
-      callbacks.onTextDelta("我现在就看到了旧 poller 还活着。");
-      callbacks.onAgentMessage?.("我现在就看到了旧 poller 还活着。");
-      for (const result of [
-        "我先把服务停了。",
-        "我先把证据补齐了。",
-        "我先去核实了一遍，情况属实。",
-        "我先把线上影响止住了。",
-        "我先把 Ada 那边对齐了。",
-      ]) {
-        callbacks.onTextDelta(result);
-        callbacks.onAgentMessage?.(result);
-      }
-      callbacks.onTextDelta("已经按新口径收紧。");
-      callbacks.onAgentMessage?.("已经按新口径收紧。");
+      callbacks.onTextDelta("收到，这就查。");
+      callbacks.onAgentMessage?.("收到，这就查。", { isFinal: false, followedByTool: true });
+      callbacks.onToolStart("inspect", "tool-natural-update");
+      callbacks.onToolEnd("tool-natural-update", false);
+      callbacks.onTextDelta("第一轮核对完了，问题出在消息过滤。");
+      callbacks.onAgentMessage?.("第一轮核对完了，问题出在消息过滤。", {
+        isFinal: false,
+        followedByTool: false,
+      });
+      callbacks.onTextDelta("最终结果已经整理好。");
+      callbacks.onAgentMessage?.("最终结果已经整理好。", { isFinal: true, followedByTool: false });
       callbacks.onAgentEnd();
     });
     const registry = createRegistry(session);
-
     const bot = createBot(createConfig(), registry as any) as any;
     const textHandler = bot.__handlers.on.get("message:text");
 
     await textHandler({
       chat: { id: 42 },
       from: { id: 123 },
-      message: { message_id: 13, text: "继续处理" },
+      message: { message_id: 1399, text: "帮我把这件长活做完" },
       api: bot.api,
     });
 
-    const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
-    expect(visible).not.toContain("我先去读文件、跑命令。");
-    expect(visible).not.toContain("我先去做两件事：读文件、跑测试。");
-    expect(visible).not.toContain("我先去检查已有测试。");
-    expect(visible).not.toContain("我先去看看有没有问题。");
-    expect(visible).not.toContain("我先看看有没有问题？");
-    expect(visible).not.toContain("我先看看这样可以吗？");
-    expect(visible).not.toContain("我先看看你是否在线。");
-    expect(visible).not.toContain("我先检查你要不要保留日志。");
-    expect(visible).not.toContain("我先检查需要确认哪些日志。");
-    expect(visible).not.toContain("我先看看请确认按钮是否出现。");
-    expect(visible).not.toContain("我先查需要你提供哪些字段。");
-    expect(visible).not.toContain("我准备检查需要你提供哪些字段。");
-    expect(visible).not.toContain("下一步请确认按钮是否出现。");
-    expect(visible).not.toContain("我先看看：有没有问题？");
-    expect(visible).not.toContain("Going to check whether this works?");
-    expect(visible).not.toContain("Now I’ll check whether this works?");
-    for (const narration of [
-      "我先看一下。",
-      "我先查一下。",
-      "收到。我先去查。",
-      "收到，我先查一下。",
-      "“我先去查一下。”",
-      "• 我先去查一下。",
-      "我先去查一下：配置文件。",
-      "Let me inspect the logs.",
-      "I’ll look into it.",
-      "I’m going to run tests.",
-      "I am checking now.",
-      "Next, I’ll run tests.",
-      "Let me run tests: npm test.",
-    ]) {
-      expect(visible).not.toContain(narration);
+    const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+    expect(visible.some((text: string) => text.includes("收到，这就查。"))).toBe(true);
+    expect(visible.some((text: string) => text.includes("第一轮核对完了，问题出在消息过滤。"))).toBe(true);
+    expect(visible.some((text: string) => text.includes("最终结果已经整理好。"))).toBe(true);
+  });
+
+  it("sends low-frequency liveness after silence and records delivered truth", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-liveness-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const sessionsRoot = path.join(root, "Sessions");
+    const release = deferred<void>();
+    let turnPromise: Promise<void> | undefined;
+    try {
+      const session = createSession(async (callbacks) => {
+        await release.promise;
+        callbacks.onTextDelta("最终结果。");
+        callbacks.onAgentMessage?.("最终结果。", { isFinal: true, followedByTool: false });
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(
+        createConfig({
+          workspace,
+          memoryTranscriptRoot: sessionsRoot,
+          autoRotate: { enabled: true, threshold: 0.9, contextWindow: 258400 },
+        }),
+        registry as any,
+      ) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+      turnPromise = textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 1400, text: "做一件会超过四分钟的长活" },
+        api: bot.api,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(240_000);
+      let visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+      expect(visible.filter((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(299_999);
+      visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+      expect(visible.filter((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+      expect(visible.filter((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toHaveLength(2);
+
+      release.resolve();
+      await turnPromise;
+
+      const transcriptFiles = await readdir(sessionsRoot);
+      const transcript = await readFile(path.join(sessionsRoot, transcriptFiles[0]!), "utf8");
+      expect(transcript).toContain("我还在处理，稍后有进展就告诉你。");
+      const rotation = await readRotationBuffer(workspace, "42");
+      expect(rotation.some((entry) => entry.role === "assistant" && entry.text.includes("我还在处理，稍后有进展就告诉你。"))).toBe(true);
+    } finally {
+      release.resolve();
+      if (turnPromise) {
+        await turnPromise;
+      }
+      vi.useRealTimers();
     }
-    expect(visible).not.toContain("我先去查一下。");
-    expect(visible).toContain("关键发现：旧版本仍在。");
-    expect(visible).not.toContain("Let me run tests.");
-    expect(visible).toContain("关键发现：消息过密来自进度策略。");
-    expect(visible).toContain("我先确认一下：你要不要保留这条提醒？");
-    expect(visible).toContain("这样可以吗？");
-    expect(visible).toContain("Should I continue?");
-    expect(visible).toContain("还继续吗？");
-    expect(visible).toContain("你希望我怎么做？");
-    expect(visible).toContain("What should I do?");
-    expect(visible).toContain("“这样可以吗？”");
-    expect(visible).toContain("<b>这样可以吗？</b>");
-    expect(visible).toContain("我先确认过了：生产仍在跑旧版本。");
-    expect(visible).toContain("我现在部署失败，需要回滚。");
-    expect(visible).toContain("现在修复完成，可以验收。");
-    expect(visible).toContain("我先把根因确认清楚了：旧 poller 没退出。");
-    expect(visible).toContain("我现在就部署失败，需要回滚。");
-    expect(visible).toContain("现在就修复完成，可以验收。");
-    expect(visible).toContain("我现在就查明了根因：旧版本仍在运行。");
-    expect(visible).toContain("我先把旧 poller 状态摸清了，两个都活着。");
-    expect(visible).toContain("我现在就看到了旧 poller 还活着。");
-    for (const result of [
-      "我先把服务停了。",
-      "我先把证据补齐了。",
-      "我先去核实了一遍，情况属实。",
-      "我先把线上影响止住了。",
-      "我先把 Ada 那边对齐了。",
-    ]) {
-      expect(visible).toContain(result);
+  });
+
+  it("delivers an onTextDelta-only final after a liveness bubble without re-running the request", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-liveness-delta-final-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const release = deferred<void>();
+    let turnPromise: Promise<void> | undefined;
+    try {
+      const session = createSession(async (callbacks) => {
+        await release.promise;
+        callbacks.onTextDelta("最终结果只走原生增量。");
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(createConfig({ memoryTranscriptRoot: sessionsRoot }), registry as any) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+      turnPromise = textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 1401, text: "静默后只走增量的最终答复" },
+        api: bot.api,
+      });
+
+      await vi.advanceTimersByTimeAsync(240_000);
+      release.resolve();
+      await turnPromise;
+      await vi.advanceTimersByTimeAsync(300);
+
+      const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
+      expect(visible).toContain("我还在处理，稍后有进展就告诉你。");
+      expect(visible).toContain("最终结果只走原生增量。");
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      const transcriptFiles = await readdir(sessionsRoot);
+      const transcript = await readFile(path.join(sessionsRoot, transcriptFiles[0]!), "utf8");
+      expect(transcript).toContain("最终结果只走原生增量。");
+    } finally {
+      release.resolve();
+      if (turnPromise) {
+        await turnPromise;
+      }
+      vi.useRealTimers();
     }
-    expect(visible).toContain("已经按新口径收紧。");
+  });
+
+  it("treats visible tool status as activity and carries it into rotation truth", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-liveness-tool-visible-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const release = deferred<void>();
+    let activeCallbacks: CodexSessionCallbacks | undefined;
+    let turnPromise: Promise<void> | undefined;
+    try {
+      const session = createSession(async (callbacks) => {
+        activeCallbacks = callbacks;
+        await release.promise;
+        callbacks.onTextDelta("最终结果。");
+        callbacks.onAgentMessage?.("最终结果。", { isFinal: true, followedByTool: false });
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(
+        createConfig({
+          workspace,
+          toolVerbosity: "all",
+          autoRotate: { enabled: true, threshold: 0.9, contextWindow: 258400 },
+        }),
+        registry as any,
+      ) as any;
+      const textHandler = bot.__handlers.on.get("message:text");
+      turnPromise = textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 1402, text: "工具状态也是真实可见消息" },
+        api: bot.api,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(239_000);
+      activeCallbacks?.onToolStart("inspect", "tool-visible-activity");
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      let visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+      expect(visible.some((text: string) => text.includes("inspect"))).toBe(true);
+      expect(visible.some((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(238_999);
+      visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+      expect(visible.some((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+      expect(visible.some((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toBe(true);
+
+      release.resolve();
+      await turnPromise;
+      const rotation = await readRotationBuffer(workspace, "42");
+      expect(rotation.some((entry) => entry.role === "assistant" && entry.text.includes("inspect"))).toBe(true);
+    } finally {
+      release.resolve();
+      if (turnPromise) {
+        await turnPromise;
+      }
+      vi.useRealTimers();
+    }
   });
 
   it("keeps tool status behind the progress bubble that preceded it", async () => {
@@ -2872,6 +2679,93 @@ describe("createBot response delivery", () => {
     // Rotation never stores the failed second chunk.
     const buffer = await readRotationBuffer(workspace, "42");
     expect(buffer.some((entry) => entry.text.includes("CHUNKTWOMARKER"))).toBe(false);
+  });
+
+  it("flushes the newest todo update when it arrives during the first send (ALB-1399 review)", async () => {
+    const workspace = await createWorkspace("telecodex-alb1399-todo-race-");
+    const firstSendStarted = deferred<void>();
+    const releaseFirstSend = deferred<void>();
+    const stale = "STALE_TODO_A";
+    const newest = "LATEST_TODO_B";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTodoUpdate?.([{ text: stale, completed: false }]);
+      await firstSendStarted.promise;
+      callbacks.onTodoUpdate?.([{ text: newest, completed: false }]);
+      releaseFirstSend.resolve();
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(
+      createConfig({
+        workspace,
+        toolVerbosity: "all",
+        autoRotate: { enabled: true, threshold: 0.9, contextWindow: 258400 },
+      }),
+      registry as any,
+    ) as any;
+    bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+      if (String(text).includes(stale)) {
+        firstSendStarted.resolve();
+        await releaseFirstSend.promise;
+      }
+      return { message_id: 13991 };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 1399 },
+      from: { id: 123 },
+      message: { message_id: 13991, text: "连续更新任务清单" },
+      api: bot.api,
+    });
+
+    const visibleSends = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+    const visibleEdits = bot.api.editMessageText.mock.calls.map((call: unknown[]) => String(call[2]));
+    expect(visibleSends.some((text: string) => text.includes(stale))).toBe(true);
+    expect(visibleEdits.some((text: string) => text.includes(newest))).toBe(true);
+
+    const buffer = await readRotationBuffer(workspace, "1399");
+    const assistantTruth = buffer.filter((entry) => entry.role === "assistant").map((entry) => entry.text).join("\n");
+    expect(assistantTruth).toContain(newest);
+    expect(assistantTruth).not.toContain(stale);
+  });
+
+  it("records the visible Done completion alongside tool-only receipts (ALB-1399 review)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-alb1399-tool-done-"));
+    tempDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const sessionsRoot = path.join(root, "Sessions");
+    const session = createSession(async (callbacks) => {
+      callbacks.onToolStart("inspect", "tool-only-1399");
+      callbacks.onToolEnd("tool-only-1399", false);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(
+      createConfig({
+        workspace,
+        memoryTranscriptRoot: sessionsRoot,
+        toolVerbosity: "all",
+        autoRotate: { enabled: true, threshold: 0.9, contextWindow: 258400 },
+      }),
+      registry as any,
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 1401 },
+      from: { id: 123 },
+      message: { message_id: 14011, text: "只跑工具，不输出正文" },
+      api: bot.api,
+    });
+
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    expect(transcript).toContain("✅ Done");
+
+    const buffer = await readRotationBuffer(workspace, "1401");
+    const assistantTruth = buffer.filter((entry) => entry.role === "assistant").map((entry) => entry.text).join("\n");
+    expect(assistantTruth).toContain("✅ Done");
   });
 
   // ALB-1201 H: a VISIBLE progress bubble (isFinal:false) permanently fails, then
@@ -3696,16 +3590,15 @@ describe("createBot response delivery", () => {
     expect(allPrompts).not.toContain("欠答自查");
   });
 
-  it("pending-answer guard: a swallowed message is re-prompted once on the next finalize (ALB-1339 场景③)", async () => {
+  it("pending-answer guard: a delivered provider-error reply is answered and is not re-run", async () => {
     let promptCount = 0;
     const session = createSession(async (callbacks) => {
       promptCount += 1;
       if (promptCount === 1) {
-        // The turn for the first message dies without ever answering it.
         throw new Error("codex exploded mid-turn");
       }
-      callbacks.onTextDelta(`第${promptCount}轮回复。`);
-      callbacks.onAgentMessage?.(`第${promptCount}轮回复。`);
+      callbacks.onTextDelta("第二轮正常回复。");
+      callbacks.onAgentMessage?.("第二轮正常回复。");
       callbacks.onAgentEnd();
     });
     const registry = createRegistry(session);
@@ -3716,10 +3609,11 @@ describe("createBot response delivery", () => {
     await textHandler({
       chat: { id: 42 },
       from: { id: 123 },
-      message: { message_id: 1121, text: "这条会被吞掉，一直没人答" },
+      message: { message_id: 1121, text: "第一条触发 provider error" },
       api: bot.api,
     });
     expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(bot.api.sendMessage.mock.calls.some((call: unknown[]) => String(call[1]).includes("codex exploded mid-turn"))).toBe(true);
 
     await textHandler({
       chat: { id: 42 },
@@ -3727,48 +3621,43 @@ describe("createBot response delivery", () => {
       message: { message_id: 1122, text: "第二条正常问" },
       api: bot.api,
     });
+    await delay(300);
 
-    // Second turn answers normally, then its finalize notices the swallowed
-    // first message and feeds a re-prompt turn back into the same thread.
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
-    const repromptText = String(session.prompt.mock.calls[2][0]);
-    expect(repromptText).toContain("欠答自查");
-    expect(repromptText).toContain("这条会被吞掉，一直没人答");
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    const allPrompts = session.prompt.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(allPrompts).not.toContain("欠答自查");
   });
 
-  it("pending-answer guard: the re-prompt turn itself never spawns another re-prompt (ALB-1339 场景④)", async () => {
+  it("pending-answer guard: a fully undelivered provider failure re-prompts once and never loops", async () => {
     let promptCount = 0;
     const session = createSession(async (callbacks) => {
       promptCount += 1;
       if (promptCount === 1) {
         throw new Error("codex exploded mid-turn");
       }
-      callbacks.onTextDelta(`第${promptCount}轮回复。`);
-      callbacks.onAgentMessage?.(`第${promptCount}轮回复。`);
+      callbacks.onTextDelta("补答成功。");
+      callbacks.onAgentMessage?.("补答成功。");
       callbacks.onAgentEnd();
     });
     const registry = createRegistry(session);
     const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.sendMessage
+      .mockRejectedValueOnce(new Error("failure reply send failed"))
+      .mockRejectedValueOnce(new Error("failure reply retry failed"))
+      .mockRejectedValueOnce(new Error("warning send failed"));
     const textHandler = bot.__handlers.on.get("message:text");
     vi.spyOn(console, "error").mockImplementation(() => {});
 
     await textHandler({
       chat: { id: 42 },
       from: { id: 123 },
-      message: { message_id: 1131, text: "被吞的一条" },
+      message: { message_id: 1131, text: "失败回复也完全没送达" },
       api: bot.api,
     });
-    await textHandler({
-      chat: { id: 42 },
-      from: { id: 123 },
-      message: { message_id: 1132, text: "触发补答的一条" },
-      api: bot.api,
-    });
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
     await delay(400);
 
-    // Exactly one re-prompt across the whole exchange, and it does not loop.
-    expect(session.prompt).toHaveBeenCalledTimes(3);
+    expect(session.prompt).toHaveBeenCalledTimes(2);
     const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
       String(call[0]).includes("欠答自查"),
     );

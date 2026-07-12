@@ -55,6 +55,9 @@ import { getTranscriptionBackendStatus, transcribeAudio } from "./voice.js";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
+const FIRST_LIVENESS_DELAY_MS = 240_000;
+const REPEATED_LIVENESS_DELAY_MS = 300_000;
+const LIVENESS_TEXT = "我还在处理，稍后有进展就告诉你。";
 const QUEUED_PROMPT_BUSY_RETRY_MS = 250;
 /** Shown to the user when a completed bubble fails both delivery attempts. */
 const DELIVERY_FAILURE_WARNING = "⚠️ 有一段回复发送失败，后续结果仍会继续发送。";
@@ -76,6 +79,7 @@ type ToolState = {
   toolName: string;
   partialResult: string;
   messageId?: number;
+  deliveryIndex?: number;
   finalStatus?: RenderedText;
 };
 
@@ -915,9 +919,12 @@ export function createBot(
     // Used to record a faithful transcript when delivery does not fully succeed,
     // instead of the intended text the user never saw.
     const deliveredStreamMessages: string[] = [];
-    const undeliveredCompletedMessages: string[] = [];
     let streamDeliveryPromise: Promise<void> = Promise.resolve();
     let streamDeliveryError: unknown;
+    let livenessTimer: NodeJS.Timeout | undefined;
+    let livenessGeneration = 0;
+    let hasSentLiveness = false;
+    let livenessStopped = false;
     // ALB-1201 (Theo Important 2): POSITIVE delivery receipt for the SUBSTANTIVE
     // answer, tracked separately from the appended footer (tool summary / usage
     // line) and its delivery-failure warning. Set true ONLY when a substantive/
@@ -941,6 +948,7 @@ export function createBot(
     let flushPending = false;
     let finalized = false;
     let planMessageId: number | undefined;
+    let planDeliveryIndex: number | undefined;
     let lastRenderedPlan = "";
     let planMessageSending = false;
     let lastTurnUsage:
@@ -1214,13 +1222,10 @@ export function createBot(
       }
     };
 
-    const visibleCompletedAgentMessage = (
-      text: string,
-      metadata?: AgentMessageDeliveryMetadata,
-    ): string => {
-      const visibleText = stripVisibleSourceFooter(userVisibleText, stripVisiblePromptGuardEcho(text.trim()));
-      return metadata?.isFinal === false ? visibleIntermediateUpdate(visibleText) : visibleText;
-    };
+    const visibleCompletedAgentMessage = (text: string): string =>
+      stripVisibleSourceFooter(userVisibleText, stripVisiblePromptGuardEcho(text.trim()));
+
+    let noteVisibleDelivery = (): void => {};
 
     const deliverCompletedStreamMessage = async (visibleText: string): Promise<void> => {
       // ALB-1201 (I1): the real unit of Telegram delivery is a CHUNK, so "what
@@ -1236,10 +1241,12 @@ export function createBot(
         try {
           await sendTextMessage(bot.api, chatId, chunk.text, options);
           deliveredStreamMessages.push(chunk.sourceText);
+          noteVisibleDelivery();
         } catch (firstError) {
           try {
             await sendTextMessage(bot.api, chatId, chunk.text, options);
             deliveredStreamMessages.push(chunk.sourceText);
+            noteVisibleDelivery();
           } catch (retryError) {
             // Both attempts failed: the user gets a delivery-failure warning in
             // place of this chunk. Record the warning ONLY if it actually
@@ -1255,6 +1262,7 @@ export function createBot(
                 messageThreadId,
               });
               deliveredStreamMessages.push(DELIVERY_FAILURE_WARNING);
+              noteVisibleDelivery();
             } catch {
               // Warning also failed — the user saw nothing for this chunk.
             }
@@ -1264,19 +1272,65 @@ export function createBot(
       }
     };
 
+    const armLiveness = (delayMs: number): void => {
+      if (livenessStopped || finalized) {
+        return;
+      }
+      if (livenessTimer) {
+        clearTimeout(livenessTimer);
+      }
+      const generation = ++livenessGeneration;
+      livenessTimer = setTimeout(() => {
+        livenessTimer = undefined;
+        streamDeliveryPromise = streamDeliveryPromise
+          .then(async () => {
+            if (livenessStopped || finalized || generation !== livenessGeneration) {
+              return;
+            }
+            hasSentLiveness = true;
+            completedStreamMessages.push(LIVENESS_TEXT);
+            await deliverCompletedStreamMessage(LIVENESS_TEXT);
+            armLiveness(REPEATED_LIVENESS_DELAY_MS);
+          })
+          .catch((error) => {
+            streamDeliveryError ??= error;
+            console.error("Failed to deliver Telegram liveness message:", formatError(error));
+            armLiveness(REPEATED_LIVENESS_DELAY_MS);
+          });
+      }, delayMs);
+    };
+
+    noteVisibleDelivery = (): void => {
+      armLiveness(hasSentLiveness ? REPEATED_LIVENESS_DELAY_MS : FIRST_LIVENESS_DELAY_MS);
+    };
+
+    const stopLiveness = (): void => {
+      livenessStopped = true;
+      livenessGeneration += 1;
+      if (livenessTimer) {
+        clearTimeout(livenessTimer);
+        livenessTimer = undefined;
+      }
+    };
+
+    const recordAuxiliaryDelivery = (text: string): number => {
+      const index = deliveredStreamMessages.push(text) - 1;
+      noteVisibleDelivery();
+      return index;
+    };
+
+    const replaceAuxiliaryDelivery = (index: number | undefined, text: string): void => {
+      if (index === undefined || index < 0 || index >= deliveredStreamMessages.length) {
+        return;
+      }
+      deliveredStreamMessages[index] = text;
+      noteVisibleDelivery();
+    };
+
     const enqueueCompletedStreamMessage = (text: string, metadata?: AgentMessageDeliveryMetadata): void => {
-      const completedText = visibleCompletedAgentMessage(text);
-      const visibleText = visibleCompletedAgentMessage(text, metadata);
+      const visibleText = visibleCompletedAgentMessage(text);
       accumulatedText = "";
       if (!visibleText) {
-        const recoverableText = recoverableIntermediateUpdate(completedText);
-        if (
-          recoverableText &&
-          metadata?.isFinal === false &&
-          metadata.followedByTool === false
-        ) {
-          undeliveredCompletedMessages.push(recoverableText);
-        }
         return;
       }
 
@@ -1324,8 +1378,24 @@ export function createBot(
         }
       }
 
+      // Tool and todo deliveries share the same visible-receipt stream as model
+      // messages. Wait for that stream before choosing and settling the final
+      // response, including any compensation edit queued by an in-flight update.
+      await streamDeliveryPromise;
+
       if (completedStreamMessages.length > 0) {
-        await streamDeliveryPromise;
+        const trailingBodyText = buildFinalResponseBody(accumulatedText);
+        if (trailingBodyText) {
+          completedStreamMessages.push(trailingBodyText);
+          try {
+            await deliverCompletedStreamMessage(trailingBodyText);
+            substantiveDelivered = true;
+          } catch (error) {
+            streamDeliveryError ??= error;
+            console.error("Failed to deliver trailing Telegram response body:", formatError(error));
+          }
+          accumulatedText = "";
+        }
         const footerText = buildFinalResponseText("");
         if (footerText) {
           completedStreamMessages.push(footerText);
@@ -1361,6 +1431,10 @@ export function createBot(
         } else {
           await safeReply(ctx, html, { fallbackText: plainText });
         }
+        // The completion is visible delivery truth too. Recording it in the same
+        // receipt stream as tool/todo messages prevents settlement from dropping
+        // Done whenever auxiliary receipts already exist.
+        recordAuxiliaryDelivery(plainText);
         // ALB-1201 (Theo Important 2): the deliberate empty-turn completion IS the
         // substantive answer to an empty turn — the user was told "✅ Done", so the
         // message is struck (never re-fed). Re-feeding an empty turn would only
@@ -1453,11 +1527,13 @@ export function createBot(
             }
 
             state.messageId = message.message_id;
+            state.deliveryIndex = recordAuxiliaryDelivery(messageText.fallbackText);
             if (state.finalStatus) {
               await safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
                 parseMode: state.finalStatus.parseMode,
                 fallbackText: state.finalStatus.fallbackText,
               });
+              replaceAuxiliaryDelivery(state.deliveryIndex, state.finalStatus.fallbackText);
             }
           })
           .catch((error) => {
@@ -1492,13 +1568,18 @@ export function createBot(
             return;
           }
 
-          void sendTextMessage(bot.api, chatId, state.finalStatus.text, {
-            parseMode: state.finalStatus.parseMode,
-            fallbackText: state.finalStatus.fallbackText,
-            messageThreadId,
-          }).catch((error) => {
-            console.error(`Failed to send tool error message for ${state.toolName}`, error);
-          });
+          streamDeliveryPromise = streamDeliveryPromise
+            .then(async () => {
+              await sendTextMessage(bot.api, chatId, state.finalStatus!.text, {
+                parseMode: state.finalStatus!.parseMode,
+                fallbackText: state.finalStatus!.fallbackText,
+                messageThreadId,
+              });
+              state.deliveryIndex = recordAuxiliaryDelivery(state.finalStatus!.fallbackText);
+            })
+            .catch((error) => {
+              console.error("Failed to send tool error message for " + state.toolName, error);
+            });
           return;
         }
 
@@ -1506,12 +1587,17 @@ export function createBot(
           return;
         }
 
-        void safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
-          parseMode: state.finalStatus.parseMode,
-          fallbackText: state.finalStatus.fallbackText,
-        }).catch((error) => {
-          console.error(`Failed to update tool message for ${state.toolName}`, error);
-        });
+        streamDeliveryPromise = streamDeliveryPromise
+          .then(async () => {
+            await safeEditMessage(bot, chatId, state.messageId!, state.finalStatus!.text, {
+              parseMode: state.finalStatus!.parseMode,
+              fallbackText: state.finalStatus!.fallbackText,
+            });
+            replaceAuxiliaryDelivery(state.deliveryIndex, state.finalStatus!.fallbackText);
+          })
+          .catch((error) => {
+            console.error("Failed to update tool message for " + state.toolName, error);
+          });
       },
       onTodoUpdate: (items) => {
         if (toolVerbosity === "none") {
@@ -1527,9 +1613,20 @@ export function createBot(
         if (!planMessageId) {
           if (planMessageSending) return;
           planMessageSending = true;
-          void sendTextMessage(bot.api, chatId, rendered, { parseMode: "HTML", messageThreadId })
-            .then((msg) => {
+          streamDeliveryPromise = streamDeliveryPromise
+            .then(async () => {
+              const msg = await sendTextMessage(bot.api, chatId, rendered, { parseMode: "HTML", messageThreadId });
               planMessageId = msg.message_id;
+              planDeliveryIndex = recordAuxiliaryDelivery(rendered);
+
+              // A newer todo update may arrive while the first send is in flight.
+              // Flush the latest desired rendering before this delivery step
+              // completes so the initial version cannot silently win the race.
+              const latestRenderedPlan = lastRenderedPlan;
+              if (latestRenderedPlan !== rendered) {
+                await safeEditMessage(bot, chatId, planMessageId, latestRenderedPlan, { parseMode: "HTML" });
+                replaceAuxiliaryDelivery(planDeliveryIndex, latestRenderedPlan);
+              }
             })
             .catch((err) => {
               console.error("Failed to send plan message", err);
@@ -1538,9 +1635,14 @@ export function createBot(
               planMessageSending = false;
             });
         } else {
-          void safeEditMessage(bot, chatId, planMessageId, rendered, { parseMode: "HTML" }).catch((err) => {
-            console.error("Failed to update plan message", err);
-          });
+          streamDeliveryPromise = streamDeliveryPromise
+            .then(async () => {
+              await safeEditMessage(bot, chatId, planMessageId!, rendered, { parseMode: "HTML" });
+              replaceAuxiliaryDelivery(planDeliveryIndex, rendered);
+            })
+            .catch((err) => {
+              console.error("Failed to update plan message", err);
+            });
         }
       },
       onTurnComplete: (usage) => {
@@ -1637,10 +1739,16 @@ export function createBot(
     // reached the user (never the undelivered intended text).
     const settleFinalizedTurn = async (): Promise<void> => {
       const finalVisibleText = await ensureFinalized();
-      const deliverySucceeded = streamDeliveryError === undefined;
-      const transcriptText = deliverySucceeded ? finalVisibleText : deliveredStreamMessages.join("\n\n");
+      const transcriptText =
+        deliveredStreamMessages.length > 0
+          ? deliveredStreamMessages.join("\n\n")
+          : streamDeliveryError === undefined
+            ? finalVisibleText
+            : "";
       await settleTurn(transcriptText);
     };
+
+    armLiveness(FIRST_LIVENESS_DELAY_MS);
 
     try {
       const authStatus = await checkAuthStatus(config.codexApiKey);
@@ -1784,21 +1892,24 @@ export function createBot(
       } else {
         finalized = true;
 
-        const recoveredFailureParts = [
-          ...undeliveredCompletedMessages,
-          recoverableIntermediateUpdate(accumulatedText),
-        ];
+        const recoveredFailureParts = [recoverableIntermediateUpdate(accumulatedText)];
+        const normalizeFailurePart = (text: string): string =>
+          text
+            .replace(/\s+([，,；;。.!：:！？?])/g, (_match, punctuation) => punctuation)
+            .replace(/\s+/g, " ")
+            .replace(/[。.!！？?…]+$/g, "")
+            .trim();
+        const deliveredFailureKeys = deliveredStreamMessages.map(normalizeFailurePart);
         const seenRecoveredFailureParts = new Set<string>();
         const uniqueRecoveredFailureParts = recoveredFailureParts.filter((text) => {
           if (!text) {
             return false;
           }
-          const key = text
-            .replace(/\s+([，,；;。.!：:！？?])/g, (_match, punctuation) => punctuation)
-            .replace(/\s+/g, " ")
-            .replace(/[。.!！？?…]+$/g, "")
-            .trim();
-          if (seenRecoveredFailureParts.has(key)) {
+          const key = normalizeFailurePart(text);
+          if (
+            seenRecoveredFailureParts.has(key) ||
+            deliveredFailureKeys.some((delivered) => delivered.includes(key) || key.includes(delivered))
+          ) {
             return false;
           }
           seenRecoveredFailureParts.add(key);
@@ -1807,10 +1918,15 @@ export function createBot(
         const failureSourceText = uniqueRecoveredFailureParts.join("\n\n");
         const failureReplyText = buildFinalResponseText(renderPromptFailure(failureSourceText, error));
         const chunks = splitMarkdownForTelegram(failureReplyText);
+        let failureReplyDelivered = false;
         try {
           await deliverRenderedChunks(chunks);
+          failureReplyDelivered = true;
         } catch (telegramError) {
           console.error("Failed to send error message to Telegram:", telegramError);
+        }
+        if (failureReplyDelivered) {
+          substantiveDelivered = true;
         }
         // ALB-1201 (Theo review Gap 4): the failure/error path records the
         // transcript from what the user ACTUALLY received — the per-chunk receipts
@@ -1819,18 +1935,14 @@ export function createBot(
         // a later failure-reply chunk's failure no longer discards the delivered
         // earlier chunks (the throw is caught above; the receipts survive).
         const failureTranscriptText = deliveredStreamMessages.join("\n\n");
-        if (failureTranscriptText) {
-          await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "bot-raw", failureTranscriptText).catch(
-            (appendError) => {
-              console.error(
-                "Failed to append memory bot turn:",
-                appendError instanceof Error ? appendError.message : String(appendError),
-              );
-            },
-          );
-        }
+        // A prompt that failed after a fresh thread was opened must not consume
+        // the pending HANDOFF. Record delivered failure truth on the pre-rotation
+        // state so the next user turn retries the same handoff.
+        rotationStateAfterSuccessfulHandoff = null;
+        await settleTurn(failureTranscriptText);
       }
     } finally {
+      stopLiveness();
       stopTyping();
       clearFlushTimer();
       if (ownsProcessingFlag) {
@@ -3331,9 +3443,6 @@ function renderSessionInfoPlain(info: CodexSessionInfo): string {
     .join("\n");
 }
 
-const STRUCTURED_INTERMEDIATE_UPDATE_RE =
-  /^(?:关键发现|阶段结果|阻塞|需要确认|Progress|Result|Blocked|Need confirmation)[：:]/i;
-
 function normalizeIntermediateUpdateHead(text: string): string {
   return text
     .trim()
@@ -3390,23 +3499,6 @@ function recoverableIntermediateUpdate(text: string): string {
     }
   }
   return "";
-}
-
-function visibleIntermediateUpdate(text: string): string {
-  const lines = text.trim().split("\n");
-  const firstVisibleLine = lines.findIndex((line) => {
-    const head = normalizeIntermediateUpdateHead(line);
-    const processNarration = isProcessNarrationHead(head);
-    const directQuestionAfterNarration =
-      processNarration &&
-      /[：:]\s*(?:你要不要|你是否|您是否|需要你|请确认).*[？?]$/.test(head);
-    return (
-      STRUCTURED_INTERMEDIATE_UPDATE_RE.test(head) ||
-      directQuestionAfterNarration ||
-      (!processNarration && (/(需要你|请确认)/.test(head) || /[？?]$/.test(head)))
-    );
-  });
-  return firstVisibleLine >= 0 ? lines.slice(firstVisibleLine).join("\n").trim() : "";
 }
 
 function renderSessionInfoHTML(info: CodexSessionInfo): string {
