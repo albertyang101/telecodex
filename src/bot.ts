@@ -1136,13 +1136,15 @@ export function createBot(
       // Each delivered chunk is recorded in deliveredStreamMessages; a chunk that
       // permanently fails records its delivery-failure warning ONLY if the user
       // actually sees it, marks substantiveDeliveryError so the pending-answer
-      // strike / transcript / rotation see the truth, and aborts the remaining
-      // chunks WITHOUT throwing — so finalize's post-delivery truth logic still
-      // runs. (Was: no receipts, and a mid-bubble failure threw into the
-      // already-finalized catch, leaving no faithful transcript/rotation and an
-      // unstruck pending answer whose retry re-sent the already-delivered chunk.)
-      // The first chunk preserves edit-or-send semantics: edit the streaming
-      // preview if one exists, else send a new message and adopt its id.
+      // strike / transcript / rotation see the truth, then re-throws to abort the
+      // rest. The final-answer caller (finalizeResponse) swallows that throw so its
+      // post-delivery truth logic still runs off the recorded receipts; the
+      // error-reply caller keeps the throw (unchanged) to skip its transcript
+      // append on a fully-undelivered notice. (Was: no receipts at all, and a
+      // mid-bubble failure threw straight into the already-finalized catch, leaving
+      // no faithful transcript/rotation and an unstruck pending answer whose retry
+      // re-sent the already-delivered chunk.) The first chunk preserves edit-or-send
+      // semantics: edit the streaming preview if one exists, else send and adopt its id.
       for (const [index, chunk] of chunks.entries()) {
         const sendChunk = async (): Promise<void> => {
           if (index === 0 && responseMessageId) {
@@ -1185,7 +1187,7 @@ export function createBot(
             const error = retryError ?? firstError;
             streamDeliveryError ??= error;
             substantiveDeliveryError ??= error;
-            return;
+            throw error;
           }
         }
       }
@@ -1257,6 +1259,13 @@ export function createBot(
         return;
       }
 
+      // ALB-1201 (Theo review Gap 1): role-aware receipt. A progress bubble
+      // (isFinal === false) is an intermediate status update, NOT the substantive
+      // answer, so its delivery failure must NOT set substantiveDeliveryError —
+      // otherwise a later, successfully-delivered final answer stays unstruck and
+      // its already-answered message gets re-fed (duplicate final). Only a
+      // substantive/final bubble gates the pending-answer strike.
+      const isSubstantiveBubble = metadata?.isFinal !== false;
       completedStreamMessages.push(visibleText);
       streamDeliveryPromise = streamDeliveryPromise
         .then(() => deliverCompletedStreamMessage(visibleText))
@@ -1264,11 +1273,14 @@ export function createBot(
           // ALB-1201 (I1): per-chunk receipts are recorded inside
           // deliverCompletedStreamMessage; here we only remember that this
           // bubble did not fully deliver, so I1/I2/rotation see the truth.
-          // This is a SUBSTANTIVE answer bubble, so it also counts against the
-          // substantive delivery truth that gates the pending-answer strike
-          // (ALB-1201 Theo Important 2) — distinct from a footer-only failure.
           streamDeliveryError ??= error;
-          substantiveDeliveryError ??= error;
+          if (isSubstantiveBubble) {
+            // Only a substantive/final bubble taints the substantive delivery
+            // truth that gates the pending-answer strike (distinct from a
+            // footer-only failure — ALB-1201 Theo Important 2 — and from a
+            // progress-bubble failure — Gap 1).
+            substantiveDeliveryError ??= error;
+          }
           console.error("Failed to deliver completed Telegram agent message:", formatError(error));
         });
     };
@@ -1325,7 +1337,16 @@ export function createBot(
         return plainText;
       }
 
-      await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
+      // ALB-1201 (Theo review): deliverRenderedChunks records per-chunk receipts
+      // and marks substantiveDeliveryError before it re-throws on a permanent
+      // failure. Swallow that throw here so the post-finalize transcript / strike /
+      // rotation logic runs off the recorded delivery truth (matching the streaming
+      // path) instead of the throw bypassing it into the already-finalized catch.
+      try {
+        await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
+      } catch (error) {
+        console.error("One or more final Telegram response chunks were not delivered:", formatError(error));
+      }
       return finalText;
     };
 

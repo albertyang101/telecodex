@@ -2874,6 +2874,70 @@ describe("createBot response delivery", () => {
     expect(buffer.some((entry) => entry.text.includes("CHUNKTWOMARKER"))).toBe(false);
   });
 
+  // ALB-1201 H: a VISIBLE progress bubble (isFinal:false) permanently fails, then
+  // the final substantive answer delivers successfully. A progress bubble is not
+  // the substantive answer, so its failure must NOT set substantiveDeliveryError —
+  // the delivered final answer is struck and never re-fed. Regression guard for
+  // Theo's review Gap 1: a sticky substantiveDeliveryError from a failed progress
+  // bubble re-fed an already-answered message (duplicate final). Role-aware
+  // receipt: only the final/substantive bubble gates the pending-answer strike.
+  it("does not re-feed after the final answer delivers even if an earlier progress bubble failed (ALB-1201 H)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-deliver-H-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const workspace = await createWorkspace("telecodex-deliver-H-ws-");
+    // "阶段结果：" makes this a VISIBLE progress bubble (structured intermediate update).
+    const progress = "阶段结果：PROGRESSMARK 第一阶段进行中。";
+    const finalAnswer = "FINALMARK 这是最终答案。";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(progress);
+      callbacks.onAgentMessage?.(progress, { isFinal: false, followedByTool: false });
+      callbacks.onTextDelta(finalAnswer);
+      callbacks.onAgentMessage?.(finalAnswer);
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(
+      createConfig({
+        workspace,
+        memoryTranscriptRoot: sessionsRoot,
+        autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 },
+      }),
+      registry as any,
+    ) as any;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // The progress bubble (and its warning) permanently fail; the final delivers.
+    bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+      const t = String(text);
+      if (t.includes("PROGRESSMARK") || t.includes("有一段回复发送失败")) {
+        throw new Error("progress bubble down");
+      }
+      return { message_id: 1 };
+    });
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 42 },
+      from: { id: 123 },
+      message: { message_id: 8686, text: "先出进度再出答案" },
+      api: bot.api,
+    });
+
+    // The final answer reached the user, so the message is struck: no re-feed.
+    await delay(400);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const reprompts = session.prompt.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("欠答自查"),
+    );
+    expect(reprompts).toHaveLength(0);
+
+    // Transcript records the delivered final answer, not the failed progress bubble.
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    expect(transcript).toContain("FINALMARK");
+    expect(transcript).not.toContain("PROGRESSMARK");
+  });
+
   it("waits for queued streaming delivery before finishing a failed turn", async () => {
     const releaseDelivery = deferred<void>();
     const session = createSession(async (callbacks) => {
