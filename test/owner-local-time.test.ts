@@ -47,6 +47,26 @@ describe("resolveOwnerLocalTimeLine", () => {
     expect(line).toContain("(Sun)");
   });
 
+  it("resolves the real Codex bot personas once they are in the canonical tenant_map (ALB-1201 finding 1: albert-v3=Theo, albert-codex-e2e=Ada)", () => {
+    // Regression guard for Theo's runtime RED: before the canonical
+    // tenant_map.json carried these personas, MAILBOX_PERSONA=albert-v3 hit the
+    // persona-as-tenant fallback (no albert-v3.json) and returned null, so
+    // owner-local-time silently no-op'd on the live Theo/Ada runtimes. With the
+    // personas mapped to the owner they resolve to the owner's location.
+    const baseDir = fixtureDir({
+      "tenant_map.json": JSON.stringify({ "albert-v3": "albert", "albert-codex-e2e": "albert" }),
+      "albert.json": JSON.stringify({ lat: 39.193581, lng: 9.160067, ts: "2026-07-11T12:34:33+00:00" }),
+      "tz_cache.json": JSON.stringify({ "39.2,9.2": "Europe/Rome" }),
+    });
+
+    for (const persona of ["albert-v3", "albert-codex-e2e"]) {
+      const line = resolveOwnerLocalTimeLine({ baseDir, persona, now: NOW });
+      expect(line, persona).not.toBeNull();
+      expect(line, persona).toContain("Europe/Rome");
+      expect(line, persona).toContain("2026-07-12 10:22");
+    }
+  });
+
   it("falls back to treating the persona itself as the tenant when the map has no entry", () => {
     const baseDir = fixtureDir({
       "tenant_map.json": JSON.stringify({ someoneElse: "other" }),
