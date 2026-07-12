@@ -918,12 +918,20 @@ export function createBot(
     const undeliveredCompletedMessages: string[] = [];
     let streamDeliveryPromise: Promise<void> = Promise.resolve();
     let streamDeliveryError: unknown;
-    // ALB-1201 (Theo Important 2): delivery truth for the SUBSTANTIVE answer is
-    // tracked separately from the appended footer (tool summary / usage line)
-    // and its delivery-failure warning. The pending-answer strike keys on this —
-    // an answer the user actually received must be struck (never re-fed) even if
-    // the footer that follows it failed to send.
-    let substantiveDeliveryError: unknown;
+    // ALB-1201 (Theo Important 2): POSITIVE delivery receipt for the SUBSTANTIVE
+    // answer, tracked separately from the appended footer (tool summary / usage
+    // line) and its delivery-failure warning. Set true ONLY when a substantive/
+    // final answer body actually reaches the user — a streamed final bubble that
+    // fully delivered, the non-stream fallback body that fully delivered, or the
+    // deliberate empty "✅ Done" completion (an empty turn's substantive answer IS
+    // "Done"). A progress bubble (isFinal:false) or an appended footer alone never
+    // sets it. The pending-answer strike gates on THIS positive receipt — so an
+    // answer the user actually received is struck (never re-fed) even if the footer
+    // that follows it failed, while a progress-only / footer-only turn (no
+    // substantive body ever delivered) stays unstruck and is re-fed. (Replaces the
+    // old negative gate `substantiveDeliveryError === undefined`, which a turn that
+    // never emitted a substantive body satisfied vacuously and wrongly struck.)
+    let substantiveDelivered = false;
     let responseMessageId: number | undefined;
     let responseMessagePromise: Promise<void> | undefined;
     let lastRenderedText = "";
@@ -1148,16 +1156,17 @@ export function createBot(
       // per-chunk receipt model as the streaming path (deliverCompletedStreamMessage).
       // Each delivered chunk is recorded in deliveredStreamMessages; a chunk that
       // permanently fails records its delivery-failure warning ONLY if the user
-      // actually sees it, marks substantiveDeliveryError so the pending-answer
-      // strike / transcript / rotation see the truth, then re-throws to abort the
-      // rest. The final-answer caller (finalizeResponse) swallows that throw so its
-      // post-delivery truth logic still runs off the recorded receipts; the
-      // error-reply caller keeps the throw (unchanged) to skip its transcript
-      // append on a fully-undelivered notice. (Was: no receipts at all, and a
-      // mid-bubble failure threw straight into the already-finalized catch, leaving
-      // no faithful transcript/rotation and an unstruck pending answer whose retry
-      // re-sent the already-delivered chunk.) The first chunk preserves edit-or-send
-      // semantics: edit the streaming preview if one exists, else send and adopt its id.
+      // actually sees it, sets streamDeliveryError so transcript / rotation see the
+      // truth, then re-throws to abort the rest. The final-answer caller
+      // (finalizeResponse) swallows that throw so its post-delivery truth logic still
+      // runs off the recorded receipts AND so the positive substantiveDelivered
+      // receipt is set only when the body fully delivered (no throw); the error-reply
+      // caller keeps the throw (unchanged) to skip its transcript append on a
+      // fully-undelivered notice. (Was: no receipts at all, and a mid-bubble failure
+      // threw straight into the already-finalized catch, leaving no faithful
+      // transcript/rotation and an unstruck pending answer whose retry re-sent the
+      // already-delivered chunk.) The first chunk preserves edit-or-send semantics:
+      // edit the streaming preview if one exists, else send and adopt its id.
       for (const [index, chunk] of chunks.entries()) {
         const sendChunk = async (): Promise<void> => {
           if (index === 0 && responseMessageId) {
@@ -1199,7 +1208,6 @@ export function createBot(
             }
             const error = retryError ?? firstError;
             streamDeliveryError ??= error;
-            substantiveDeliveryError ??= error;
             throw error;
           }
         }
@@ -1274,26 +1282,30 @@ export function createBot(
 
       // ALB-1201 (Theo review Gap 1): role-aware receipt. A progress bubble
       // (isFinal === false) is an intermediate status update, NOT the substantive
-      // answer, so its delivery failure must NOT set substantiveDeliveryError —
-      // otherwise a later, successfully-delivered final answer stays unstruck and
-      // its already-answered message gets re-fed (duplicate final). Only a
-      // substantive/final bubble gates the pending-answer strike.
+      // answer, so a delivered progress bubble must NOT set the positive
+      // substantiveDelivered receipt — otherwise a turn that only ever showed
+      // progress would be wrongly struck. Only a substantive/final bubble that
+      // fully delivers gates the pending-answer strike.
       const isSubstantiveBubble = metadata?.isFinal !== false;
       completedStreamMessages.push(visibleText);
       streamDeliveryPromise = streamDeliveryPromise
-        .then(() => deliverCompletedStreamMessage(visibleText))
+        .then(async () => {
+          await deliverCompletedStreamMessage(visibleText);
+          // ALB-1201 (Theo Important 2): a substantive/final bubble that fully
+          // delivered (no throw) is the positive receipt gating the strike. A
+          // progress bubble (isSubstantiveBubble === false) never sets it.
+          if (isSubstantiveBubble) {
+            substantiveDelivered = true;
+          }
+        })
         .catch((error) => {
           // ALB-1201 (I1): per-chunk receipts are recorded inside
-          // deliverCompletedStreamMessage; here we only remember that this
-          // bubble did not fully deliver, so I1/I2/rotation see the truth.
+          // deliverCompletedStreamMessage; here we only remember that this bubble
+          // did not fully deliver (streamDeliveryError) so transcript/rotation see
+          // the truth. A substantive bubble that failed simply never reached the
+          // positive substantiveDelivered receipt above, so the message stays
+          // unstruck and is re-fed — no negative flag needed.
           streamDeliveryError ??= error;
-          if (isSubstantiveBubble) {
-            // Only a substantive/final bubble taints the substantive delivery
-            // truth that gates the pending-answer strike (distinct from a
-            // footer-only failure — ALB-1201 Theo Important 2 — and from a
-            // progress-bubble failure — Gap 1).
-            substantiveDeliveryError ??= error;
-          }
           console.error("Failed to deliver completed Telegram agent message:", formatError(error));
         });
     };
@@ -1324,8 +1336,9 @@ export function createBot(
           } catch (error) {
             // ALB-1201 (Theo Important 2): the footer is metadata appended after
             // the substantive answer. A footer-only failure taints delivery truth
-            // for the transcript, but must NOT set substantiveDeliveryError — the
-            // user still received the answer, so it stays struck (not re-fed).
+            // for the transcript (streamDeliveryError), but the substantive bubble
+            // already set substantiveDelivered above, so the answer stays struck
+            // (not re-fed).
             streamDeliveryError ??= error;
             console.error("Failed to deliver Telegram response footer:", formatError(error));
           }
@@ -1348,22 +1361,33 @@ export function createBot(
         } else {
           await safeReply(ctx, html, { fallbackText: plainText });
         }
+        // ALB-1201 (Theo Important 2): the deliberate empty-turn completion IS the
+        // substantive answer to an empty turn — the user was told "✅ Done", so the
+        // message is struck (never re-fed). Re-feeding an empty turn would only
+        // produce another empty "Done", so this is the correct strike semantics.
+        substantiveDelivered = true;
         return plainText;
       }
 
       // ALB-1201 (Theo review): the non-stream fallback mirrors the streaming path —
       // the SUBSTANTIVE body and the appended footer are delivered as separate
       // role-aware units so a footer-only failure taints transcript truth
-      // (streamDeliveryError) but never substantiveDeliveryError (Gap 3). Both
-      // record per-chunk receipts; deliverRenderedChunks marks
-      // substantiveDeliveryError + re-throws on a body failure, and the footer's
-      // deliverCompletedStreamMessage re-throws on its own failure — each throw is
-      // swallowed here so the post-finalize transcript / strike / rotation logic
-      // still runs off the recorded delivery truth. When there is only one of the
-      // two, it takes the body's edit-first slot on its own.
+      // (streamDeliveryError) but never the positive substantiveDelivered receipt
+      // (Gap 3). Both record per-chunk receipts; a fully-delivered body sets
+      // substantiveDelivered below (deliverRenderedChunks re-throws on a body
+      // failure so it is NOT set), and the footer's deliverCompletedStreamMessage
+      // re-throws on its own failure — each throw is swallowed here so the
+      // post-finalize transcript / strike / rotation logic still runs off the
+      // recorded delivery truth. When there is only one of the two, it takes the
+      // body's edit-first slot on its own.
       if (bodyText) {
         try {
           await deliverRenderedChunks(splitMarkdownForTelegram(bodyText));
+          // ALB-1201 (Theo Important 2): the substantive body fully delivered
+          // (deliverRenderedChunks re-throws if any chunk permanently failed), so
+          // record the positive receipt gating the strike. The footer branch below
+          // is metadata and never sets it.
+          substantiveDelivered = true;
         } catch (error) {
           console.error("One or more final Telegram response body chunks were not delivered:", formatError(error));
         }
@@ -1532,6 +1556,92 @@ export function createBot(
     // Hoisted so the catch can fold a mid-turn timeout abort back into the
     // rotation state (ALB-1205 最后断点) using the post-rotation state, if any.
     let rotationStateAfterSuccessfulHandoff: ChatRotationState | null = null;
+
+    // ALB-1201 (Theo Important 1 & 3): ONE idempotent settlement — transcript +
+    // rotation + pending-answer strike + overdue re-feed — driven entirely by
+    // delivered receipts. Both the normal success path and the catch's
+    // already-finalized branch await THIS same step, so a late throw after
+    // onAgentEnd began finalize can never skip settling the answer the user already
+    // received (was: the catch saw finalized=true and only console.error'd,
+    // dropping transcript/rotation/strike). The `finalized` boolean means only
+    // "finalize started" — it must never gate whether the turn settles.
+    let turnSettled = false;
+    const settleTurn = async (transcriptText: string): Promise<void> => {
+      if (turnSettled) {
+        return;
+      }
+      turnSettled = true;
+
+      // The transcript records what the user ACTUALLY received (empty text writes
+      // no bot entry — appendMemoryTranscriptTurn guards on it).
+      await appendMemoryTranscriptTurn(config, ctx, contextKey, session, "bot-raw", transcriptText).catch((error) => {
+        console.error("Failed to append memory bot turn:", error instanceof Error ? error.message : String(error));
+      });
+
+      if (rotationCfg.enabled) {
+        setRotationState(
+          contextKey,
+          recordTurn(
+            rotationStateAfterSuccessfulHandoff ?? getRotationState(contextKey),
+            {
+              userText: userVisibleText,
+              // ALB-1201 (I3): rotation carries the DELIVERED truth, not the
+              // intended text. When nothing was delivered, transcriptText is empty
+              // and recordTurn stores no assistant entry — so a never-seen reply is
+              // not marked "already answered" and later swallowed by HANDOFF.
+              assistantText: transcriptText,
+              lastInputTokens: lastTurnUsage?.inputTokens,
+              lastContextTokens: lastTurnUsage?.lastContextTokens,
+              liveContextWindow: lastTurnUsage?.liveContextWindow,
+            },
+            rotationCfg,
+          ),
+        );
+      }
+
+      // ALB-1339 欠答检查出口腿: this turn's reply went out — strike its own message,
+      // then re-prompt anything received before this turn that was never answered
+      // and is no longer queued for a turn of its own. takeOverdue removes what it
+      // returns, so each swallowed message is re-fed at most once.
+      //
+      // ALB-1201 (Theo Important 2): strike only on the POSITIVE substantiveDelivered
+      // receipt — the substantive answer genuinely reached the user. A footer-only
+      // failure still strikes (the body delivered first); a progress-only / footer-only
+      // turn (no substantive body ever delivered) leaves it false, so the message
+      // stays unstruck and the takeOverdue leg re-feeds it exactly once rather than
+      // marking it falsely answered.
+      if (substantiveDelivered) {
+        strikeOwnPendingAnswer();
+      }
+      const overdueAnswers = pendingAnswerLedger.takeOverdue(
+        contextKey,
+        pendingAnswerTurnSeq,
+        (msgId) => (pendingPromptQueues.get(contextKey) ?? []).some((item) => item.pendingMsgId === msgId),
+      );
+      if (overdueAnswers.length > 0) {
+        enqueuePrompt(contextKey, {
+          ctx,
+          chatId,
+          session,
+          status: "ready",
+          input: formatPendingAnswerReprompt(overdueAnswers),
+        });
+        scheduleDrainQueuedPrompts(contextKey);
+      }
+    };
+
+    // The finalize-based settlement shared by the success path and the catch's
+    // already-finalized branch: finalize (idempotent) yields the INTENDED visible
+    // text, but the transcript/rotation truth is the DELIVERED text — identical on
+    // full delivery, the delivered chunks on partial delivery, empty when nothing
+    // reached the user (never the undelivered intended text).
+    const settleFinalizedTurn = async (): Promise<void> => {
+      const finalVisibleText = await ensureFinalized();
+      const deliverySucceeded = streamDeliveryError === undefined;
+      const transcriptText = deliverySucceeded ? finalVisibleText : deliveredStreamMessages.join("\n\n");
+      await settleTurn(transcriptText);
+    };
+
     try {
       const authStatus = await checkAuthStatus(config.codexApiKey);
       if (!authStatus.authenticated) {
@@ -1641,84 +1751,9 @@ export function createBot(
         callbacks,
       );
       updateSessionMetadata(contextKey, session);
-      const finalVisibleText = await ensureFinalized();
-      // ALB-1201 (I1/I2): finalize returns the INTENDED text, but a completed
-      // bubble may have permanently failed to deliver. streamDeliveryError (set
-      // by the delivery chain) is the truth of delivery once finalize resolves.
-      const deliverySucceeded = streamDeliveryError === undefined;
-      // The transcript must record what the user actually received, not the
-      // undelivered intended text. On full delivery the two are identical; on
-      // partial delivery it is exactly the delivered chunks + delivered warnings,
-      // in order; when nothing reached the user it is empty (ALB-1201 I1) — never
-      // the undelivered intended text, and never a warning the user never saw.
-      const transcriptText = deliverySucceeded
-        ? finalVisibleText
-        : deliveredStreamMessages.join("\n\n");
-      await appendMemoryTranscriptTurn(
-        config,
-        ctx,
-        contextKey,
-        session,
-        "bot-raw",
-        transcriptText,
-      ).catch((error) => {
-        console.error("Failed to append memory bot turn:", error instanceof Error ? error.message : String(error));
-      });
-      if (rotationCfg.enabled) {
-        setRotationState(
-          contextKey,
-          recordTurn(
-            rotationStateAfterSuccessfulHandoff ?? getRotationState(contextKey),
-            {
-              userText: userVisibleText,
-              // ALB-1201 (I3): rotation carries the DELIVERED truth, not the
-              // intended text. When nothing was delivered, transcriptText is
-              // empty and recordTurn stores no assistant entry — so a never-seen
-              // reply is not marked "already answered" and later swallowed by
-              // HANDOFF.
-              assistantText: transcriptText,
-              lastInputTokens: lastTurnUsage?.inputTokens,
-              lastContextTokens: lastTurnUsage?.lastContextTokens,
-              liveContextWindow: lastTurnUsage?.liveContextWindow,
-            },
-            rotationCfg,
-          ),
-        );
-      }
-
-      // ALB-1339 欠答检查出口腿: this turn's reply went out — strike its own
-      // message, then re-prompt anything received before this turn that was
-      // never answered and is no longer queued for a turn of its own
-      // (swallowed by a queue drop / abort / usage-cap). takeOverdue removes
-      // what it returns, so each swallowed message is re-fed at most once.
-      //
-      // ALB-1201 (I2 + Theo Important 2): only strike when the SUBSTANTIVE answer
-      // genuinely reached the user. Keying on substantiveDeliveryError (not the
-      // turn-wide streamDeliveryError) means a footer-only failure — the answer
-      // delivered but the trailing tool/usage line did not — still strikes the
-      // message, so the already-seen answer is never re-fed. When the answer
-      // itself permanently failed, leave the message unstruck so the takeOverdue
-      // leg below re-feeds it exactly once (bounded one-time retry; takeOverdue
-      // removes what it returns and the re-fed prompt is not re-recorded, so it
-      // cannot loop) rather than marking it falsely answered.
-      if (substantiveDeliveryError === undefined) {
-        strikeOwnPendingAnswer();
-      }
-      const overdueAnswers = pendingAnswerLedger.takeOverdue(
-        contextKey,
-        pendingAnswerTurnSeq,
-        (msgId) => (pendingPromptQueues.get(contextKey) ?? []).some((item) => item.pendingMsgId === msgId),
-      );
-      if (overdueAnswers.length > 0) {
-        enqueuePrompt(contextKey, {
-          ctx,
-          chatId,
-          session,
-          status: "ready",
-          input: formatPendingAnswerReprompt(overdueAnswers),
-        });
-        scheduleDrainQueuedPrompts(contextKey);
-      }
+      // ALB-1201 (Theo Important 1 & 3): the normal success path settles through
+      // the SAME idempotent step the catch's already-finalized branch reuses.
+      await settleFinalizedTurn();
     } catch (error) {
       clearFlushTimer();
       await streamDeliveryPromise;
@@ -1739,7 +1774,13 @@ export function createBot(
       }
 
       if (finalized) {
+        // ALB-1201 (Theo Important 3): onAgentEnd already BEGAN finalize (and may
+        // have already delivered the answer) before the provider/iterator threw.
+        // Converge the SAME settlement the success path uses instead of skipping on
+        // the finalized boolean — otherwise the delivered answer's transcript,
+        // rotation, and pending-answer strike silently never settle.
         console.error("Codex prompt error after finalization:", formatError(error));
+        await settleFinalizedTurn();
       } else {
         finalized = true;
 

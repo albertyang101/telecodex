@@ -3067,6 +3067,157 @@ describe("createBot response delivery", () => {
     await delay(400);
   });
 
+  // ALB-1201 L (Theo Important 1): a progress bubble delivers, the turn is
+  // context-heavy, onAgentEnd BEGINS finalize (finalized=true), then the provider
+  // throws. The delivered progress must still enter rotation — a pending rotation
+  // armed from the heavy usage AND the progress stored as the assistant turn — so
+  // the next page's HANDOFF carries what the user already saw. On 137283a the
+  // catch saw finalized=true and only console.error'd, skipping recordTurn /
+  // setRotationState entirely, so NOTHING was persisted and rotation lost the
+  // progress.
+  it("carries delivered progress into rotation when a heavy turn throws after finalize begins (ALB-1201 L)", async () => {
+    const workspace = await createWorkspace("telecodex-alb1201-L-ws-");
+    const progress = "阶段结果：已完成第一阶段。";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(progress);
+      callbacks.onAgentMessage?.(progress, { isFinal: false, followedByTool: false });
+      callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 10 });
+      callbacks.onAgentEnd();
+      throw new Error("provider failed after finalize L");
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(
+      createConfig({ workspace, autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 } }),
+      registry as any,
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 4343 },
+      from: { id: 123 },
+      message: { message_id: 1, text: "第一条：重活收尾后抛错" },
+      api: bot.api,
+    });
+
+    // Read the persisted rotation state immediately (before the 250ms overdue
+    // re-feed timer fires). On 137283a settlement was skipped, so no file exists.
+    const stateDir = path.join(workspace, ".telecodex");
+    const files = await readdir(stateDir).catch(() => [] as string[]);
+    expect(files).toContain("handoff-4343.json");
+    const raw = JSON.parse(await readFile(path.join(stateDir, "handoff-4343.json"), "utf8")) as {
+      pendingRotation?: boolean;
+      buffer?: Array<{ role: string; text: string }>;
+    };
+    // A pending rotation is armed from the heavy usage...
+    expect(raw.pendingRotation).toBe(true);
+    // ...and the delivered progress is stored as the assistant turn, so the next
+    // page's HANDOFF carries it.
+    expect((raw.buffer ?? []).some((e) => e.role === "assistant" && e.text.includes(progress))).toBe(true);
+
+    // Drain the bounded overdue re-feed so no async work dangles into teardown.
+    await delay(400);
+  });
+
+  // ALB-1201 M (Theo Important 2): a turn that delivers ONLY a progress bubble
+  // (isFinal:false) and never a substantive/final body must NOT be struck as
+  // answered — the real answer never reached the user. On 137283a the strike gated
+  // on `substantiveDeliveryError === undefined`, which a progress-only turn never
+  // sets, so the message was wrongly struck and never re-fed. The fix gates the
+  // strike on a POSITIVE substantiveDelivered receipt that a progress bubble does
+  // not satisfy, so the message stays pending and the overdue leg re-feeds it once.
+  it("does not strike a progress-only turn and re-feeds it once when no substantive body ever delivers (ALB-1201 M)", async () => {
+    const progress = "阶段结果：已完成第一阶段。";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(progress);
+      callbacks.onAgentMessage?.(progress, { isFinal: false, followedByTool: false });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 4545 },
+      from: { id: 123 },
+      message: { message_id: 3131, text: "只出进度不出答案" },
+      api: bot.api,
+    });
+
+    // Not struck → the overdue leg re-feeds the message exactly once.
+    await delay(400);
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    const repromptText = String(session.prompt.mock.calls[1][0]);
+    expect(repromptText).toContain("欠答自查");
+    expect(repromptText).toContain("只出进度不出答案");
+
+    // Bounded: exactly one re-feed across the whole exchange (no loop).
+    await delay(400);
+    const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("欠答自查"),
+    );
+    expect(repromptCalls).toHaveLength(1);
+  });
+
+  // ALB-1201 N (Theo Important 3): onAgentEnd BEGINS finalize (finalized=true) and
+  // the final substantive answer delivers; THEN the provider/iterator throws. The
+  // delivered answer must still settle — transcript (bot-raw), rotation
+  // (recordTurn), and the pending-answer strike. On 137283a the catch saw
+  // finalized=true and only console.error'd, so the transcript held only user-raw,
+  // rotation never recorded, and the strike never ran. The fix converges settlement
+  // into one idempotent awaited step the catch reuses instead of skipping on the
+  // finalized boolean.
+  it("settles transcript, rotation, and strike when finalize has delivered before a late throw (ALB-1201 N)", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-alb1201-N-"));
+    tempDirs.push(root);
+    const sessionsRoot = path.join(root, "Sessions");
+    const workspace = await createWorkspace("telecodex-alb1201-N-ws-");
+    const finalAnswer = "这是最终实质答复N。";
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta(finalAnswer);
+      callbacks.onAgentMessage?.(finalAnswer, { isFinal: true, followedByTool: false });
+      callbacks.onAgentEnd();
+      throw new Error("provider threw after final delivery N");
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(
+      createConfig({
+        workspace,
+        memoryTranscriptRoot: sessionsRoot,
+        autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 },
+      }),
+      registry as any,
+    ) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await textHandler({
+      chat: { id: 4646 },
+      from: { id: 123 },
+      message: { message_id: 2626, text: "给我最终答复后崩溃" },
+      api: bot.api,
+    });
+
+    // The delivered final answer is recorded as the bot turn (missing on 137283a).
+    const files = await readdir(sessionsRoot);
+    const transcript = await readFile(path.join(sessionsRoot, files[0]!), "utf8");
+    expect(transcript).toContain("[bot-raw]");
+    expect(transcript).toContain(finalAnswer);
+
+    // Rotation recorded the delivered final answer as the assistant turn.
+    const buffer = await readRotationBuffer(workspace, "4646");
+    expect(buffer.some((e) => e.role === "assistant" && e.text.includes(finalAnswer))).toBe(true);
+
+    // Struck: the delivered answer is not re-fed.
+    await delay(400);
+    const reprompts = session.prompt.mock.calls.filter((call: unknown[]) =>
+      String(call[0]).includes("欠答自查"),
+    );
+    expect(reprompts).toHaveLength(0);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
   it("waits for queued streaming delivery before finishing a failed turn", async () => {
     const releaseDelivery = deferred<void>();
     const session = createSession(async (callbacks) => {
