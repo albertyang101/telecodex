@@ -1986,9 +1986,9 @@ describe("createBot response delivery", () => {
     expect(visible.some((text: string) => text.includes("最终结果已经整理好。"))).toBe(true);
   });
 
-  it("sends low-frequency liveness after silence and records delivered truth", async () => {
+  it("never generates fixed progress text from a dispatcher timer", async () => {
     vi.useFakeTimers();
-    const root = await mkdtemp(path.join(tmpdir(), "telecodex-liveness-"));
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-no-dispatcher-liveness-"));
     tempDirs.push(root);
     const workspace = path.join(root, "workspace");
     const sessionsRoot = path.join(root, "Sessions");
@@ -2021,26 +2021,19 @@ describe("createBot response delivery", () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      await vi.advanceTimersByTimeAsync(240_000);
-      let visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
-      expect(visible.filter((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toHaveLength(1);
-
-      await vi.advanceTimersByTimeAsync(299_999);
-      visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
-      expect(visible.filter((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toHaveLength(1);
-
-      await vi.advanceTimersByTimeAsync(1);
-      visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
-      expect(visible.filter((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(540_000);
+      expect(bot.api.sendMessage).not.toHaveBeenCalled();
 
       release.resolve();
       await turnPromise;
 
+      const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
+      expect(visible).toEqual(["最终结果。"]);
       const transcriptFiles = await readdir(sessionsRoot);
       const transcript = await readFile(path.join(sessionsRoot, transcriptFiles[0]!), "utf8");
-      expect(transcript).toContain("我还在处理，稍后有进展就告诉你。");
+      expect(transcript).not.toContain("我还在处理");
       const rotation = await readRotationBuffer(workspace, "42");
-      expect(rotation.some((entry) => entry.role === "assistant" && entry.text.includes("我还在处理，稍后有进展就告诉你。"))).toBe(true);
+      expect(rotation.some((entry) => entry.role === "assistant" && entry.text.includes("我还在处理"))).toBe(false);
     } finally {
       release.resolve();
       if (turnPromise) {
@@ -2050,9 +2043,9 @@ describe("createBot response delivery", () => {
     }
   });
 
-  it("delivers an onTextDelta-only final after a liveness bubble without re-running the request", async () => {
+  it("delivers an onTextDelta-only final after a long silent wait without re-running the request", async () => {
     vi.useFakeTimers();
-    const root = await mkdtemp(path.join(tmpdir(), "telecodex-liveness-delta-final-"));
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-silent-delta-final-"));
     tempDirs.push(root);
     const sessionsRoot = path.join(root, "Sessions");
     const release = deferred<void>();
@@ -2079,7 +2072,7 @@ describe("createBot response delivery", () => {
       await vi.advanceTimersByTimeAsync(300);
 
       const visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1])).join("\n");
-      expect(visible).toContain("我还在处理，稍后有进展就告诉你。");
+      expect(visible).not.toContain("我还在处理");
       expect(visible).toContain("最终结果只走原生增量。");
       expect(session.prompt).toHaveBeenCalledTimes(1);
       const transcriptFiles = await readdir(sessionsRoot);
@@ -2096,7 +2089,7 @@ describe("createBot response delivery", () => {
 
   it("treats visible tool status as activity and carries it into rotation truth", async () => {
     vi.useFakeTimers();
-    const root = await mkdtemp(path.join(tmpdir(), "telecodex-liveness-tool-visible-"));
+    const root = await mkdtemp(path.join(tmpdir(), "telecodex-tool-visible-"));
     tempDirs.push(root);
     const workspace = path.join(root, "workspace");
     const release = deferred<void>();
@@ -2145,7 +2138,7 @@ describe("createBot response delivery", () => {
       expect(visible.some((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       visible = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
-      expect(visible.some((text: string) => text.includes("我还在处理，稍后有进展就告诉你。"))).toBe(true);
+      expect(visible.some((text: string) => text.includes("我还在处理"))).toBe(false);
 
       release.resolve();
       await turnPromise;

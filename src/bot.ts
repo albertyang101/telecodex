@@ -55,9 +55,6 @@ import { getTranscriptionBackendStatus, transcribeAudio } from "./voice.js";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
-const FIRST_LIVENESS_DELAY_MS = 240_000;
-const REPEATED_LIVENESS_DELAY_MS = 300_000;
-const LIVENESS_TEXT = "我还在处理，稍后有进展就告诉你。";
 const QUEUED_PROMPT_BUSY_RETRY_MS = 250;
 /** Shown to the user when a completed bubble fails both delivery attempts. */
 const DELIVERY_FAILURE_WARNING = "⚠️ 有一段回复发送失败，后续结果仍会继续发送。";
@@ -921,10 +918,6 @@ export function createBot(
     const deliveredStreamMessages: string[] = [];
     let streamDeliveryPromise: Promise<void> = Promise.resolve();
     let streamDeliveryError: unknown;
-    let livenessTimer: NodeJS.Timeout | undefined;
-    let livenessGeneration = 0;
-    let hasSentLiveness = false;
-    let livenessStopped = false;
     // ALB-1201 (Theo Important 2): POSITIVE delivery receipt for the SUBSTANTIVE
     // answer, tracked separately from the appended footer (tool summary / usage
     // line) and its delivery-failure warning. Set true ONLY when a substantive/
@@ -1225,8 +1218,6 @@ export function createBot(
     const visibleCompletedAgentMessage = (text: string): string =>
       stripVisibleSourceFooter(userVisibleText, stripVisiblePromptGuardEcho(text.trim()));
 
-    let noteVisibleDelivery = (): void => {};
-
     const deliverCompletedStreamMessage = async (visibleText: string): Promise<void> => {
       // ALB-1201 (I1): the real unit of Telegram delivery is a CHUNK, so "what
       // the user actually received" is recorded here at CHUNK granularity, in
@@ -1241,12 +1232,10 @@ export function createBot(
         try {
           await sendTextMessage(bot.api, chatId, chunk.text, options);
           deliveredStreamMessages.push(chunk.sourceText);
-          noteVisibleDelivery();
         } catch (firstError) {
           try {
             await sendTextMessage(bot.api, chatId, chunk.text, options);
             deliveredStreamMessages.push(chunk.sourceText);
-            noteVisibleDelivery();
           } catch (retryError) {
             // Both attempts failed: the user gets a delivery-failure warning in
             // place of this chunk. Record the warning ONLY if it actually
@@ -1262,7 +1251,6 @@ export function createBot(
                 messageThreadId,
               });
               deliveredStreamMessages.push(DELIVERY_FAILURE_WARNING);
-              noteVisibleDelivery();
             } catch {
               // Warning also failed — the user saw nothing for this chunk.
             }
@@ -1272,50 +1260,8 @@ export function createBot(
       }
     };
 
-    const armLiveness = (delayMs: number): void => {
-      if (livenessStopped || finalized) {
-        return;
-      }
-      if (livenessTimer) {
-        clearTimeout(livenessTimer);
-      }
-      const generation = ++livenessGeneration;
-      livenessTimer = setTimeout(() => {
-        livenessTimer = undefined;
-        streamDeliveryPromise = streamDeliveryPromise
-          .then(async () => {
-            if (livenessStopped || finalized || generation !== livenessGeneration) {
-              return;
-            }
-            hasSentLiveness = true;
-            completedStreamMessages.push(LIVENESS_TEXT);
-            await deliverCompletedStreamMessage(LIVENESS_TEXT);
-            armLiveness(REPEATED_LIVENESS_DELAY_MS);
-          })
-          .catch((error) => {
-            streamDeliveryError ??= error;
-            console.error("Failed to deliver Telegram liveness message:", formatError(error));
-            armLiveness(REPEATED_LIVENESS_DELAY_MS);
-          });
-      }, delayMs);
-    };
-
-    noteVisibleDelivery = (): void => {
-      armLiveness(hasSentLiveness ? REPEATED_LIVENESS_DELAY_MS : FIRST_LIVENESS_DELAY_MS);
-    };
-
-    const stopLiveness = (): void => {
-      livenessStopped = true;
-      livenessGeneration += 1;
-      if (livenessTimer) {
-        clearTimeout(livenessTimer);
-        livenessTimer = undefined;
-      }
-    };
-
     const recordAuxiliaryDelivery = (text: string): number => {
       const index = deliveredStreamMessages.push(text) - 1;
-      noteVisibleDelivery();
       return index;
     };
 
@@ -1324,7 +1270,6 @@ export function createBot(
         return;
       }
       deliveredStreamMessages[index] = text;
-      noteVisibleDelivery();
     };
 
     const enqueueCompletedStreamMessage = (text: string, metadata?: AgentMessageDeliveryMetadata): void => {
@@ -1748,8 +1693,6 @@ export function createBot(
       await settleTurn(transcriptText);
     };
 
-    armLiveness(FIRST_LIVENESS_DELAY_MS);
-
     try {
       const authStatus = await checkAuthStatus(config.codexApiKey);
       if (!authStatus.authenticated) {
@@ -1942,7 +1885,6 @@ export function createBot(
         await settleTurn(failureTranscriptText);
       }
     } finally {
-      stopLiveness();
       stopTyping();
       clearFlushTimer();
       if (ownsProcessingFlag) {
