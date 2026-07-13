@@ -7,6 +7,7 @@ import { afterEach, vi } from "vitest";
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
 import type { CodexSessionCallbacks } from "../src/codex-session.js";
 import type { TeleCodexConfig } from "../src/config.js";
+import { DeliveryDebtStore } from "../src/delivery-debt-store.js";
 
 const mockGrammy = vi.hoisted(() => {
   const bots: any[] = [];
@@ -2517,7 +2518,7 @@ describe("createBot response delivery", () => {
     expect(sentTexts[2]).toBe(sentTexts[1]);
     expect(sentTexts.filter((text: string) => text.includes("最终结果。"))).toHaveLength(1);
   });
-  it("continues with later streaming messages after both delivery attempts fail", async () => {
+  it("queues later substantive messages behind an earlier permanent delivery failure", async () => {
     const session = createSession(async (callbacks) => {
       callbacks.onTextDelta("第一段永久失败。");
       callbacks.onAgentMessage?.("第一段永久失败。");
@@ -2541,15 +2542,19 @@ describe("createBot response delivery", () => {
     });
 
     const sentTexts = bot.api.sendMessage.mock.calls.map((call: unknown[]) => String(call[1]));
-    // Within the turn, delivery continues past the permanently-failed bubble:
-    // both attempts for the first bubble are made, the failure warning is shown,
-    // and the later bubble still reaches the user.
-    // ALB-1201 (I2): a permanently-failed delivery now also leaves the message
-    // unstruck, so the overdue leg re-feeds it once (the fixed harness callback
-    // re-runs and re-sends) — hence >= rather than exact counts here.
-    expect(sentTexts.filter((text: string) => text.includes("第一段永久失败。")).length).toBeGreaterThanOrEqual(2);
+    // Both attempts for the first substantive bubble are made and the failure
+    // warning is shown. The later substantive bubble never overtakes it: both
+    // exact outputs remain durable FIFO debt and Codex is not rerun.
+    expect(sentTexts.filter((text: string) => text.includes("第一段永久失败。"))).toHaveLength(2);
     expect(sentTexts.some((text: string) => text.includes("有一段回复发送失败"))).toBe(true);
-    expect(sentTexts.filter((text: string) => text.includes("后续结果仍要送达。")).length).toBeGreaterThanOrEqual(1);
+    expect(sentTexts.filter((text: string) => text.includes("后续结果仍要送达。"))).toHaveLength(0);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const debts = await readDeliveryDebts(defaultWorkspace);
+    expect(debts.map((debt) => debt.chunks.join("\n"))).toEqual([
+      "第一段永久失败。",
+      "后续结果仍要送达。",
+    ]);
+    registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
   });
 
   // ALB-1201 C: chunk fails x2 AND the warning also fails → the user received
@@ -2603,11 +2608,11 @@ describe("createBot response delivery", () => {
     expect(buffer.some((entry) => entry.role === "assistant")).toBe(false);
     expect(buffer.some((entry) => entry.text.includes(intended))).toBe(false);
 
-    // Drain the bounded overdue re-feed so no async work dangles into teardown.
+    // Let the transport-only retry timer settle so no async work dangles into teardown.
     await delay(400);
   });
 
-  it("does not strike a permanently-undelivered message as answered and re-feeds it once (ALB-1201 I2)", async () => {
+  it("persists a permanently-undelivered answer for transport-only retry without re-running Codex (ALB-1201 I2)", async () => {
     let promptCount = 0;
     const session = createSession(async (callbacks) => {
       promptCount += 1;
@@ -2629,19 +2634,15 @@ describe("createBot response delivery", () => {
       api: bot.api,
     });
 
-    // Delivery failed, so the message is NOT struck as answered — the overdue
-    // leg re-feeds it exactly once so it can be re-answered.
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    const repromptText = String(session.prompt.mock.calls[1][0]);
-    expect(repromptText).toContain("欠答自查");
-    expect(repromptText).toContain("这条回复没送达");
-
-    // Bounded: exactly one re-feed across the whole exchange (no infinite loop).
+    // Delivery debt is retried at the Telegram transport layer. The expensive
+    // Codex request is never re-run and the exact generated answer remains durable.
     await delay(400);
-    const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
-      String(call[0]).includes("欠答自查"),
-    );
-    expect(repromptCalls).toHaveLength(1);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const debts = await readDeliveryDebts(defaultWorkspace);
+    expect(debts).toHaveLength(1);
+    expect(debts[0]?.pendingAnswerMsgId).toBe(5252);
+    expect(debts[0]?.chunks.join("\n")).toContain("第1段。");
+    registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
   });
 
   // ALB-1201 A: single chunk, intended text delivered → the transcript records
@@ -2697,9 +2698,9 @@ describe("createBot response delivery", () => {
 
   // ALB-1201 B: single chunk, intended text fails both attempts, but the
   // delivery-failure warning delivers → transcript records the warning (what the
-  // user saw) NOT the intended text; the message is NOT struck and is re-fed
-  // exactly once (bounded); rotation does NOT record the intended text.
-  it("records the delivered warning (not the intended text), stays unstruck/re-fed once, and keeps the intended text out of rotation when the chunk fails but the warning delivers (ALB-1201 B)", async () => {
+  // user saw) NOT the intended text; the exact answer remains transport debt and
+  // Codex is never rerun; rotation does not record the intended text until delivery.
+  it("records the delivered warning, persists the exact answer debt, and never re-runs Codex (ALB-1201 B)", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "telecodex-deliver-B-"));
     tempDirs.push(root);
     const sessionsRoot = path.join(root, "Sessions");
@@ -2742,15 +2743,14 @@ describe("createBot response delivery", () => {
     expect(transcript).toContain("有一段回复发送失败");
     expect(transcript).not.toContain(intended);
 
-    // Not struck → overdue leg re-feeds it exactly once (bounded).
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    const repromptText = String(session.prompt.mock.calls[1][0]);
-    expect(repromptText).toContain("欠答自查");
+    // The exact intended text is kept as transport debt; Codex is not asked to
+    // regenerate it, so an already-delivered neighbour can never duplicate.
     await delay(400);
-    const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
-      String(call[0]).includes("欠答自查"),
-    );
-    expect(repromptCalls).toHaveLength(1);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const debts = await readDeliveryDebts(workspace);
+    expect(debts).toHaveLength(1);
+    expect(debts[0]?.chunks.join("\n")).toContain(intended);
+    registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
 
     // Rotation never stores the undelivered intended text.
     const buffer = await readRotationBuffer(workspace, "42");
@@ -2897,11 +2897,11 @@ describe("createBot response delivery", () => {
   // no completed onAgentMessage, so finalize delivers via deliverRenderedChunks.
   // A multi-chunk final where the first chunk delivers but a later chunk fails
   // must record ONLY the delivered chunk in transcript/rotation (never the failed
-  // chunk) and bound the pending re-feed to exactly once — the same per-chunk
-  // receipt truth as the streaming path. Regression guard for Theo's review: this
+  // chunk) and persist only the missing suffix for transport retry — the same
+  // per-chunk receipt truth as the streaming path. Regression guard for Theo's review: this
   // fallback previously bypassed receipt truth (no receipts, threw into the
   // already-finalized catch, no transcript/strike, retry could duplicate chunk 1).
-  it("records only the delivered chunk and bounds the re-feed when a later fallback chunk fails (onTextDelta only, ALB-1201 G)", async () => {
+  it("records only the delivered chunk and persists only the missing remainder (onTextDelta only, ALB-1201 G)", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "telecodex-deliver-G-"));
     tempDirs.push(root);
     const sessionsRoot = path.join(root, "Sessions");
@@ -2948,18 +2948,332 @@ describe("createBot response delivery", () => {
     expect(transcript).toContain("CHUNKONEMARKER");
     expect(transcript).not.toContain("CHUNKTWOMARKER");
 
-    // Not fully delivered → the pending message is re-fed exactly once (bounded).
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
-    expect(String(session.prompt.mock.calls[1][0])).toContain("欠答自查");
+    // Only the failed second chunk is durable debt. The original Codex request is
+    // not re-run, so the delivered first chunk cannot be duplicated.
     await delay(400);
-    const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
-      String(call[0]).includes("欠答自查"),
-    );
-    expect(repromptCalls).toHaveLength(1);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    const debts = await readDeliveryDebts(workspace);
+    expect(debts).toHaveLength(1);
+    expect(debts[0]?.chunks.join("\n")).toContain("CHUNKTWOMARKER");
+    expect(debts[0]?.chunks.join("\n")).not.toContain("CHUNKONEMARKER");
+    registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
 
     // Rotation never stores the failed second chunk.
     const buffer = await readRotationBuffer(workspace, "42");
     expect(buffer.some((entry) => entry.text.includes("CHUNKTWOMARKER"))).toBe(false);
+  });
+
+  it("keeps an older failed chunk and every later chunk/debt strictly FIFO", async () => {
+    vi.useFakeTimers();
+    try {
+      const workspace = await createWorkspace("telecodex-delivery-debt-fifo-");
+      const store = new DeliveryDebtStore(path.join(workspace, ".telecodex"));
+      store.enqueue({
+        contextKey: "42",
+        chatId: 42,
+        chunks: ["FIFO_OLD_A", "FIFO_OLD_B"],
+      });
+      store.enqueue({
+        contextKey: "42",
+        chatId: 42,
+        chunks: ["FIFO_NEW_C"],
+      });
+      const session = createSession(async () => {});
+      const registry = createRegistry(session);
+      const bot = createBot(createConfig({ workspace }), registry as any) as any;
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const delivered: string[] = [];
+      bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+        const value = String(text);
+        if (value.includes("FIFO_OLD_A")) {
+          throw new Error("oldest chunk still unavailable");
+        }
+        delivered.push(value);
+        return { message_id: bot.api.sendMessage.mock.calls.length };
+      });
+
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(delivered).not.toContain("FIFO_OLD_B");
+      expect(delivered).not.toContain("FIFO_NEW_C");
+      const persisted = new DeliveryDebtStore(path.join(workspace, ".telecodex")).list("42");
+      expect(persisted).toHaveLength(2);
+      expect(persisted[0]?.chunks).toEqual(["FIFO_OLD_A", "FIFO_OLD_B"]);
+      registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts an active debt send as in-flight and drains it before graceful shutdown", async () => {
+    vi.useFakeTimers();
+    try {
+      const workspace = await createWorkspace("telecodex-delivery-debt-active-shutdown-");
+      const store = new DeliveryDebtStore(path.join(workspace, ".telecodex"));
+      store.enqueue({
+        contextKey: "42",
+        chatId: 42,
+        chunks: ["ACTIVE_RETRY"],
+      });
+      const session = createSession(async () => {});
+      const registry = createRegistry(session);
+      const bot = createBot(createConfig({ workspace }), registry as any) as any;
+      const releaseSend = deferred<{ message_id: number }>();
+      bot.api.sendMessage.mockImplementation(async () => await releaseSend.promise);
+
+      vi.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(typeof bot.prepareForShutdown).toBe("function");
+      expect(bot.getInFlightCount()).toBe(1);
+      bot.prepareForShutdown();
+      let idleResolved = false;
+      const idle = bot.waitForIdle().then(() => {
+        idleResolved = true;
+      });
+      await Promise.resolve();
+      expect(idleResolved).toBe(false);
+
+      releaseSend.resolve({ message_id: 120203 });
+      await idle;
+      expect(bot.getInFlightCount()).toBe(0);
+      expect(new DeliveryDebtStore(path.join(workspace, ".telecodex")).list()).toEqual([]);
+      registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("persists a new turn result behind older debt so shutdown cannot lose the owner message", async () => {
+    vi.useFakeTimers();
+    try {
+      const workspace = await createWorkspace("telecodex-delivery-debt-turn-order-");
+      const stateDir = path.join(workspace, ".telecodex");
+      const store = new DeliveryDebtStore(stateDir);
+      store.enqueue({
+        contextKey: "42",
+        chatId: 42,
+        pendingAnswerMsgId: 120203,
+        chunks: ["OLDER_DEBT_REPLY"],
+      });
+      await writeFile(
+        path.join(stateDir, "handoff-42.json"),
+        JSON.stringify({
+          buffer: [{ role: "user", text: "OLDER_USER_TURN", turnId: 120203 }],
+          pendingRotation: false,
+        }),
+        "utf8",
+      );
+      const events: string[] = [];
+      const session = createSession(async (callbacks) => {
+        events.push("codex");
+        callbacks.onAgentMessage?.("NEW_TURN_PROGRESS", {
+          isFinal: false,
+          followedByTool: false,
+        });
+        callbacks.onTextDelta("NEW_TURN_REPLY");
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(
+        createConfig({
+          workspace,
+          autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 },
+        }),
+        registry as any,
+      ) as any;
+      bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+        const value = String(text);
+        events.push(
+          value.includes("OLDER_DEBT_REPLY")
+            ? "old-debt"
+            : value.includes("NEW_TURN_PROGRESS")
+              ? "new-progress"
+              : "new-reply",
+        );
+        return { message_id: bot.api.sendMessage.mock.calls.length };
+      });
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 120204, text: "这条必须排在旧回复后面" },
+        api: bot.api,
+      });
+
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      expect(events).toContain("codex");
+      expect(events).not.toContain("new-progress");
+      expect(events).not.toContain("new-reply");
+      const beforeRetry = new DeliveryDebtStore(path.join(workspace, ".telecodex")).list("42");
+      expect(beforeRetry.map((debt) => debt.chunks.join("\n"))).toEqual([
+        "OLDER_DEBT_REPLY",
+        "NEW_TURN_REPLY",
+      ]);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(events.indexOf("old-debt")).toBeGreaterThan(events.indexOf("codex"));
+      expect(events.indexOf("old-debt")).toBeLessThan(events.indexOf("new-reply"));
+      const rotation = await readRotationBuffer(workspace, "42");
+      expect(rotation.map((entry) => entry.text)).toEqual([
+        "OLDER_USER_TURN",
+        "OLDER_DEBT_REPLY",
+        "这条必须排在旧回复后面",
+        "NEW_TURN_REPLY",
+      ]);
+      registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("durable delivery backoff never blocks graceful shutdown (ALB-1201 review I2)", async () => {
+    vi.useFakeTimers();
+    try {
+      const workspace = await createWorkspace("telecodex-delivery-debt-shutdown-");
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("需要稍后续送的准确回复。");
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(createConfig({ workspace }), registry as any) as any;
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      bot.api.sendMessage.mockRejectedValue(new Error("transport remains unavailable"));
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 120200, text: "生成一条需要续送的回复" },
+        api: bot.api,
+      });
+
+      const sendsBeforeShutdown = bot.api.sendMessage.mock.calls.length;
+      bot.prepareForShutdown();
+      let idleResolved = false;
+      const idle = bot.waitForIdle().then(() => {
+        idleResolved = true;
+      });
+      try {
+        await vi.advanceTimersByTimeAsync(1_000);
+
+        expect(await readDeliveryDebts(workspace)).toHaveLength(1);
+        expect(bot.getInFlightCount()).toBe(0);
+        expect(idleResolved).toBe(true);
+        expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsBeforeShutdown);
+      } finally {
+        registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
+        await idle;
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("retries only undelivered chunks without re-running the Codex request (ALB-1201 review I2)", async () => {
+    vi.useFakeTimers();
+    try {
+      const workspace = await createWorkspace("telecodex-delivery-debt-");
+      const chunkOne = "DEBT_CHUNK_ONE_" + "甲".repeat(2900);
+      const chunkTwo = "DEBT_CHUNK_TWO_" + "乙".repeat(400);
+      const finalText = chunkOne + "\n" + chunkTwo;
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta(finalText);
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(
+        createConfig({
+          workspace,
+          autoRotate: { enabled: true, threshold: 0.45, contextWindow: 258400 },
+        }),
+        registry as any,
+      ) as any;
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      let chunkTwoFailures = 0;
+      const deliveredTexts: string[] = [];
+      bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+        const value = String(text);
+        if (value.includes("DEBT_CHUNK_TWO_") && chunkTwoFailures < 2) {
+          chunkTwoFailures += 1;
+          throw new Error("transient second-chunk failure");
+        }
+        deliveredTexts.push(value);
+        return { message_id: bot.api.sendMessage.mock.calls.length };
+      });
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 120201, text: "生成一个分两段的结果" },
+        api: bot.api,
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      expect(deliveredTexts.filter((text) => text.includes("DEBT_CHUNK_ONE_"))).toHaveLength(1);
+      expect(deliveredTexts.filter((text) => text.includes("DEBT_CHUNK_TWO_"))).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resumes only the missing chunks from durable debt after a dispatcher restart (ALB-1201 review I2)", async () => {
+    vi.useFakeTimers();
+    try {
+      const workspace = await createWorkspace("telecodex-delivery-debt-restart-");
+      const chunkOne = "RESTART_CHUNK_ONE_" + "甲".repeat(2900);
+      const chunkTwo = "RESTART_CHUNK_TWO_" + "乙".repeat(400);
+      const finalText = chunkOne + "\n" + chunkTwo;
+      const firstSession = createSession(async (callbacks) => {
+        callbacks.onTextDelta(finalText);
+        callbacks.onAgentEnd();
+      });
+      const firstRegistry = createRegistry(firstSession);
+      const firstBot = createBot(createConfig({ workspace }), firstRegistry as any) as any;
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      firstBot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+        const value = String(text);
+        if (value.includes("RESTART_CHUNK_TWO_")) {
+          throw new Error("transport remains down before restart");
+        }
+        return { message_id: firstBot.api.sendMessage.mock.calls.length };
+      });
+      const firstTextHandler = firstBot.__handlers.on.get("message:text");
+
+      await firstTextHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: { message_id: 120202, text: "生成重启后续送的两段结果" },
+        api: firstBot.api,
+      });
+      expect((await readDeliveryDebts(workspace))[0]?.chunks.join("\n")).toContain("RESTART_CHUNK_TWO_");
+      firstRegistry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
+
+      const secondSession = createSession(async () => {
+        throw new Error("restart recovery must not call Codex");
+      });
+      const secondRegistry = createRegistry(secondSession);
+      const secondBot = createBot(createConfig({ workspace }), secondRegistry as any) as any;
+      const deliveredAfterRestart: string[] = [];
+      secondBot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+        deliveredAfterRestart.push(String(text));
+        return { message_id: 120202 };
+      });
+
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(secondSession.prompt).not.toHaveBeenCalled();
+      expect(deliveredAfterRestart.filter((text) => text.includes("RESTART_CHUNK_ONE_"))).toHaveLength(0);
+      expect(deliveredAfterRestart.filter((text) => text.includes("RESTART_CHUNK_TWO_"))).toHaveLength(1);
+      expect(await readDeliveryDebts(workspace)).toEqual([]);
+      secondRegistry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("flushes the newest todo update when it arrives during the first send (ALB-1399 review)", async () => {
@@ -3909,7 +4223,7 @@ describe("createBot response delivery", () => {
     expect(allPrompts).not.toContain("欠答自查");
   });
 
-  it("pending-answer guard: a fully undelivered provider failure re-prompts once and never loops", async () => {
+  it("pending-answer guard: retries an undelivered provider-failure reply without re-running Codex", async () => {
     let promptCount = 0;
     const session = createSession(async (callbacks) => {
       promptCount += 1;
@@ -3935,14 +4249,12 @@ describe("createBot response delivery", () => {
       message: { message_id: 1131, text: "失败回复也完全没送达" },
       api: bot.api,
     });
-    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
     await delay(400);
 
-    expect(session.prompt).toHaveBeenCalledTimes(2);
-    const repromptCalls = session.prompt.mock.calls.filter((call: unknown[]) =>
-      String(call[0]).includes("欠答自查"),
-    );
-    expect(repromptCalls).toHaveLength(1);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(await readDeliveryDebts(defaultWorkspace)).toEqual([]);
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(4);
+    registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("42"));
   });
 
   it("pending-answer guard: a message arriving mid-turn is not treated as owed (ALB-1339 场景⑤)", async () => {
@@ -4059,6 +4371,17 @@ function delay(ms: number): Promise<void> {
  * can assert exactly what recordTurn stored as the assistant text for a turn.
  * The bot persists state to <workspace>/.telecodex/handoff-<contextKey>.json.
  */
+
+async function readDeliveryDebts(
+  workspace: string,
+): Promise<Array<{ pendingAnswerMsgId?: number; chunks: string[] }>> {
+  const file = path.join(workspace, ".telecodex", "delivery-debts.json");
+  return JSON.parse(await readFile(file, "utf8")) as Array<{
+    pendingAnswerMsgId?: number;
+    chunks: string[];
+  }>;
+}
+
 async function readRotationBuffer(
   workspace: string,
   contextKey: string,

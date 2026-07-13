@@ -86,6 +86,7 @@ const shutdownGracefully = async (signal: NodeJS.Signals): Promise<void> => {
 
   console.log(`Received ${signal}, shutting down TeleCodex...`);
   stopMailboxBridge?.();
+  bot?.prepareForShutdown();
 
   try {
     await stopPollingWithTimeout(pollingHandle, GRACEFUL_POLLING_STOP_TIMEOUT_MS);

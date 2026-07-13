@@ -4,6 +4,7 @@ import { HANDOFF_MARKER } from "../src/handoff-buffer.js";
 import {
   type RotationConfig,
   emptyChatState,
+  recordAssistantDelivery,
   recordInterruptedTurn,
   recordTurn,
   takeRotationHandoff,
@@ -92,6 +93,49 @@ describe("thread-rotation", () => {
       const s = recordTurn(pending, { userText: "x", assistantText: "y", lastInputTokens: LIGHT }, cfg);
       expect(s.pendingRotation).toBe(true);
     });
+  });
+
+  describe("recordAssistantDelivery", () => {
+    it("appends a late Telegram delivery without repeating the user turn or changing rotation pressure", () => {
+      const before = recordTurn(
+        emptyChatState(),
+        { userText: "生成两段结果", assistantText: "第一段已送达", lastInputTokens: HEAVY },
+        cfg,
+      );
+
+      const after = recordAssistantDelivery(before, "第二段稍后送达", cfg);
+
+      expect(after.buffer).toEqual([
+        { role: "user", text: "生成两段结果" },
+        { role: "assistant", text: "第一段已送达" },
+        { role: "assistant", text: "第二段稍后送达" },
+      ]);
+      expect(after.pendingRotation).toBe(before.pendingRotation);
+      expect(after.lastKnownRatio).toBe(before.lastKnownRatio);
+    });
+  });
+
+  it("keeps late deliveries beside their originating user when a newer turn already settled", () => {
+    let state = recordTurn(
+      emptyChatState(),
+      { turnId: 101, userText: "旧问题", assistantText: "" },
+      cfg,
+    );
+    state = recordTurn(
+      state,
+      { turnId: 102, userText: "新问题", assistantText: "" },
+      cfg,
+    );
+
+    state = recordAssistantDelivery(state, "旧回答", cfg, 101);
+    state = recordAssistantDelivery(state, "新回答", cfg, 102);
+
+    expect(state.buffer).toEqual([
+      { role: "user", text: "旧问题", turnId: 101 },
+      { role: "assistant", text: "旧回答", turnId: 101 },
+      { role: "user", text: "新问题", turnId: 102 },
+      { role: "assistant", text: "新回答", turnId: 102 },
+    ]);
   });
 
   describe("takeRotationHandoff", () => {

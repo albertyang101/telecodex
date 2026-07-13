@@ -58,6 +58,8 @@ export interface RotationConfig {
 }
 
 export interface CompletedTurn {
+  /** Stable Telegram message id used to keep deferred assistant delivery beside its user turn. */
+  turnId?: number;
   userText: string;
   assistantText?: string;
   /** Input tokens of the just-completed turn (≈ current context fill). */
@@ -82,9 +84,10 @@ export function recordTurn(
   turn: CompletedTurn,
   cfg: RotationConfig,
 ): ChatRotationState {
-  let buffer = appendEntry(state.buffer, { role: "user", text: turn.userText }, cfg.maxEntries);
+  const identity = turn.turnId === undefined ? {} : { turnId: turn.turnId };
+  let buffer = appendEntry(state.buffer, { role: "user", text: turn.userText, ...identity }, cfg.maxEntries);
   if (turn.assistantText) {
-    buffer = appendEntry(buffer, { role: "assistant", text: turn.assistantText }, cfg.maxEntries);
+    buffer = appendEntry(buffer, { role: "assistant", text: turn.assistantText, ...identity }, cfg.maxEntries);
   }
 
   const hasValidContextSnapshot =
@@ -125,6 +128,54 @@ export function recordTurn(
     next.lastKnownRatio = lastKnownRatio;
   }
   return next;
+}
+
+
+/**
+ * Append content that was generated in an earlier turn but reached Telegram
+ * later through the durable delivery-debt outbox. This must not repeat the user
+ * entry or recalculate rotation pressure.
+ */
+export function recordAssistantDelivery(
+  state: ChatRotationState,
+  assistantText: string,
+  cfg: RotationConfig,
+  turnId?: number,
+): ChatRotationState {
+  const text = assistantText.trim();
+  if (!text) {
+    return state;
+  }
+  if (turnId === undefined) {
+    return {
+      ...state,
+      buffer: appendEntry(state.buffer, { role: "assistant", text }, cfg.maxEntries),
+    };
+  }
+
+  let insertAt = -1;
+  for (const [index, entry] of state.buffer.entries()) {
+    if (entry.turnId === turnId) {
+      insertAt = index + 1;
+    }
+  }
+  if (insertAt < 0) {
+    return {
+      ...state,
+      buffer: appendEntry(state.buffer, { role: "assistant", text, turnId }, cfg.maxEntries),
+    };
+  }
+
+  const buffer = [...state.buffer];
+  buffer.splice(insertAt, 0, { role: "assistant", text, turnId });
+  const maxEntries = cfg.maxEntries;
+  return {
+    ...state,
+    buffer:
+      typeof maxEntries === "number" && maxEntries > 0 && buffer.length > maxEntries
+        ? buffer.slice(buffer.length - maxEntries)
+        : buffer,
+  };
 }
 
 /**

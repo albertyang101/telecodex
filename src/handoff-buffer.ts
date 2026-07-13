@@ -17,6 +17,8 @@ export type HandoffRole = "user" | "assistant";
 export interface HandoffEntry {
   role: HandoffRole;
   text: string;
+  /** Telegram message id that owns this turn, when available. */
+  turnId?: number;
 }
 
 /** Opens every rendered preamble; stable so the wiring/tests can detect it. */
@@ -45,7 +47,7 @@ export function appendEntry(
   if (!text) {
     return buffer.slice();
   }
-  const next = [...buffer, { role: entry.role, text }];
+  const next = [...buffer, { ...entry, text }];
   if (maxEntries > 0 && next.length > maxEntries) {
     return next.slice(next.length - maxEntries);
   }

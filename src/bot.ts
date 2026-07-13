@@ -36,6 +36,7 @@ import {
 } from "./codex-launch.js";
 import { getThread } from "./codex-state.js";
 import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
+import { DeliveryDebtStore } from "./delivery-debt-store.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
@@ -47,6 +48,7 @@ import { clearChatState, loadChatState, saveChatState } from "./handoff-store.js
 import {
   type ChatRotationState,
   type RotationConfig,
+  recordAssistantDelivery,
   recordTurn,
   takeRotationHandoff,
 } from "./thread-rotation.js";
@@ -57,6 +59,8 @@ const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
 const QUEUED_PROMPT_BUSY_RETRY_MS = 250;
+const DELIVERY_DEBT_RETRY_BASE_MS = 250;
+const DELIVERY_DEBT_RETRY_MAX_MS = 30_000;
 /** Shown to the user when a completed bubble fails both delivery attempts. */
 const DELIVERY_FAILURE_WARNING = "⚠️ 有一段回复发送失败，后续结果仍会继续发送。";
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
@@ -119,6 +123,7 @@ type QueuedPrompt = {
 };
 
 export type TeleCodexBot = Bot<Context> & {
+  prepareForShutdown: () => void;
   waitForIdle: () => Promise<void>;
   getInFlightCount: () => number;
 };
@@ -414,6 +419,9 @@ export function createBot(
     TelegramContextKey,
     { timer: ReturnType<typeof setTimeout>; endInFlight: () => void }
   >();
+  const deliveryDebtRetryTimers = new Map<TelegramContextKey, ReturnType<typeof setTimeout>>();
+  const drainingDeliveryDebts = new Set<TelegramContextKey>();
+  let deliveryRetriesEnabled = true;
   let inFlightCount = 0;
   const idleWaiters = new Set<() => void>();
   const textInFlightEnds = new WeakMap<Context, () => void>();
@@ -491,6 +499,13 @@ export function createBot(
   };
 
   bot.getInFlightCount = () => inFlightCount;
+  bot.prepareForShutdown = (): void => {
+    deliveryRetriesEnabled = false;
+    for (const timer of deliveryDebtRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    deliveryDebtRetryTimers.clear();
+  };
   bot.waitForIdle = async (): Promise<void> => {
     if (inFlightCount === 0) {
       return;
@@ -522,6 +537,11 @@ export function createBot(
       clearTimeout(retryTimer.timer);
       retryTimer.endInFlight();
       queuedPromptRetryTimers.delete(key);
+    }
+    const deliveryTimer = deliveryDebtRetryTimers.get(key);
+    if (deliveryTimer) {
+      clearTimeout(deliveryTimer);
+      deliveryDebtRetryTimers.delete(key);
     }
   });
 
@@ -787,6 +807,7 @@ export function createBot(
     const pendingAnswerMsgId = ctx.message?.message_id;
     rememberPromptInput(contextKey, input, pendingAnswerMsgId);
     pendingAnswerLedger.record(contextKey, pendingAnswerMsgId, visibleUserText(input));
+    scheduleDeliveryDebtRetry(contextKey);
     const receiptReaction = options.receiptReaction ?? setReaction(ctx, "👀");
     const hasQueuedPrompts = (pendingPromptQueues.get(contextKey)?.length ?? 0) > 0;
     if (isBusy(contextKey) || hasQueuedPrompts) {
@@ -841,6 +862,7 @@ export function createBot(
 
   const rotationStates = new Map<string, ChatRotationState>();
   const rotationStateDir = path.join(config.workspace, ".telecodex");
+  const deliveryDebtStore = new DeliveryDebtStore(rotationStateDir);
   const rotationCfg: RotationConfig = {
     enabled: config.autoRotate.enabled,
     threshold: config.autoRotate.threshold,
@@ -887,6 +909,133 @@ export function createBot(
       clearChatState(rotationStateDir, key);
     } catch (error) {
       console.error("Failed to clear rotation state:", formatError(error));
+    }
+  };
+
+  const drainDeliveryDebts = async (contextKey: TelegramContextKey): Promise<void> => {
+    if (drainingDeliveryDebts.has(contextKey)) {
+      return;
+    }
+    if (isBusy(contextKey) || drainingPromptQueues.has(contextKey)) {
+      scheduleDeliveryDebtRetry(contextKey);
+      return;
+    }
+    const debts = deliveryDebtStore.list(contextKey);
+    if (debts.length === 0) {
+      scheduleDrainQueuedPrompts(contextKey);
+      return;
+    }
+
+    drainingDeliveryDebts.add(contextKey);
+    try {
+      for (const debt of debts) {
+        const stopTyping = acquireTyping(contextKey, debt.chatId);
+        const delivered: string[] = [];
+        let remaining: string[] = [];
+        try {
+          for (const [index, chunk] of debt.chunks.entries()) {
+            const rendered = renderMarkdownChunkWithinLimit(chunk);
+            try {
+              await sendTextMessage(bot.api, debt.chatId, rendered.text, {
+                parseMode: rendered.parseMode,
+                fallbackText: rendered.fallbackText,
+                messageThreadId: debt.messageThreadId,
+              });
+              delivered.push(chunk);
+            } catch {
+              remaining = debt.chunks.slice(index);
+              break;
+            }
+          }
+        } finally {
+          stopTyping();
+        }
+
+        if (delivered.length > 0) {
+          setRotationState(
+            contextKey,
+            recordAssistantDelivery(
+              getRotationState(contextKey),
+              delivered.join("\n\n"),
+              rotationCfg,
+              debt.pendingAnswerMsgId,
+            ),
+          );
+        }
+
+        if (remaining.length > 0) {
+          deliveryDebtStore.update(debt.id, remaining, debt.attempts + 1);
+          break;
+        }
+
+        deliveryDebtStore.remove(debt.id);
+        if (
+          debt.pendingAnswerMsgId !== undefined &&
+          !deliveryDebtStore.hasPendingAnswer(contextKey, debt.pendingAnswerMsgId)
+        ) {
+          pendingAnswerLedger.markAnswered(contextKey, debt.pendingAnswerMsgId);
+        }
+      }
+    } finally {
+      drainingDeliveryDebts.delete(contextKey);
+    }
+
+    if (deliveryDebtStore.list(contextKey).length > 0) {
+      scheduleDeliveryDebtRetry(contextKey);
+    } else {
+      scheduleDrainQueuedPrompts(contextKey);
+    }
+  };
+
+  const scheduleDeliveryDebtRetry = (contextKey: TelegramContextKey): void => {
+    if (
+      !deliveryRetriesEnabled ||
+      deliveryDebtRetryTimers.has(contextKey) ||
+      drainingDeliveryDebts.has(contextKey)
+    ) {
+      return;
+    }
+    const debts = deliveryDebtStore.list(contextKey);
+    if (debts.length === 0) {
+      return;
+    }
+    const maxAttempts = Math.max(...debts.map((debt) => debt.attempts));
+    const delay = Math.min(
+      DELIVERY_DEBT_RETRY_MAX_MS,
+      DELIVERY_DEBT_RETRY_BASE_MS * 2 ** Math.min(maxAttempts, 7),
+    );
+    const timer = setTimeout(() => {
+      deliveryDebtRetryTimers.delete(contextKey);
+      const endInFlight = beginInFlight();
+      void drainDeliveryDebts(contextKey)
+        .catch((error) => {
+          console.error("Failed to drain Telegram delivery debt:", formatError(error));
+        })
+        .finally(endInFlight);
+    }, delay);
+    deliveryDebtRetryTimers.set(contextKey, timer);
+  };
+
+  const queueDeliveryDebt = (
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    pendingAnswerMsgId: number | undefined,
+    chunks: string[],
+  ): boolean => {
+    try {
+      deliveryDebtStore.enqueue({
+        contextKey,
+        chatId,
+        messageThreadId,
+        pendingAnswerMsgId,
+        chunks,
+      });
+      scheduleDeliveryDebtRetry(contextKey);
+      return true;
+    } catch (error) {
+      console.error("Failed to persist Telegram delivery debt:", formatError(error));
+      return false;
     }
   };
 
@@ -1178,6 +1327,20 @@ export function createBot(
       if (chunks.length === 0) {
         return;
       }
+      if (
+        deliveryDebtStore.list(contextKey).length > 0 &&
+        queueDeliveryDebt(
+          contextKey,
+          chatId,
+          messageThreadId,
+          ownPendingAnswerMsgId,
+          chunks.map((chunk) => chunk.sourceText),
+        )
+      ) {
+        const error = new Error("Telegram delivery deferred behind older undelivered output");
+        streamDeliveryError ??= error;
+        throw error;
+      }
 
       // ALB-1201 (Theo review): the non-stream fallback delivers through the SAME
       // per-chunk receipt model as the streaming path (deliverCompletedStreamMessage).
@@ -1235,6 +1398,13 @@ export function createBot(
             }
             const error = retryError ?? firstError;
             streamDeliveryError ??= error;
+            queueDeliveryDebt(
+              contextKey,
+              chatId,
+              messageThreadId,
+              ownPendingAnswerMsgId,
+              chunks.slice(index).map((remainingChunk) => remainingChunk.sourceText),
+            );
             throw error;
           }
         }
@@ -1244,12 +1414,28 @@ export function createBot(
     const visibleCompletedAgentMessage = (text: string): string =>
       stripVisibleSourceFooter(userVisibleText, stripVisiblePromptGuardEcho(text.trim()));
 
-    const deliverCompletedStreamMessage = async (visibleText: string): Promise<void> => {
+    const deliverCompletedStreamMessage = async (
+      visibleText: string,
+      persistOnFailure = true,
+    ): Promise<void> => {
       // ALB-1201 (I1): the real unit of Telegram delivery is a CHUNK, so "what
       // the user actually received" is recorded here at CHUNK granularity, in
       // order. Earlier-delivered chunks are kept even when a later chunk fails;
       // undelivered chunks are never recorded.
-      for (const chunk of splitMarkdownForTelegram(visibleText)) {
+      const chunks = splitMarkdownForTelegram(visibleText);
+      if (deliveryDebtStore.list(contextKey).length > 0) {
+        if (persistOnFailure) {
+          queueDeliveryDebt(
+            contextKey,
+            chatId,
+            messageThreadId,
+            ownPendingAnswerMsgId,
+            chunks.map((chunk) => chunk.sourceText),
+          );
+        }
+        throw new Error("Telegram delivery deferred behind older undelivered output");
+      }
+      for (const [index, chunk] of chunks.entries()) {
         const options = {
           parseMode: chunk.parseMode,
           fallbackText: chunk.fallbackText,
@@ -1279,6 +1465,15 @@ export function createBot(
               deliveredStreamMessages.push(DELIVERY_FAILURE_WARNING);
             } catch {
               // Warning also failed — the user saw nothing for this chunk.
+            }
+            if (persistOnFailure) {
+              queueDeliveryDebt(
+                contextKey,
+                chatId,
+                messageThreadId,
+                ownPendingAnswerMsgId,
+                chunks.slice(index).map((remainingChunk) => remainingChunk.sourceText),
+              );
             }
             throw retryError ?? firstError;
           }
@@ -1315,7 +1510,7 @@ export function createBot(
       completedStreamMessages.push(visibleText);
       streamDeliveryPromise = streamDeliveryPromise
         .then(async () => {
-          await deliverCompletedStreamMessage(visibleText);
+          await deliverCompletedStreamMessage(visibleText, isSubstantiveBubble);
           // ALB-1201 (Theo Important 2): a substantive/final bubble that fully
           // delivered (no throw) is the positive receipt gating the strike. A
           // progress bubble (isSubstantiveBubble === false) never sets it.
@@ -1395,6 +1590,20 @@ export function createBot(
       if (!bodyText && !footerText) {
         const html = "<b>✅ Done</b>";
         const plainText = "✅ Done";
+
+        if (
+          deliveryDebtStore.list(contextKey).length > 0 &&
+          queueDeliveryDebt(
+            contextKey,
+            chatId,
+            messageThreadId,
+            ownPendingAnswerMsgId,
+            [plainText],
+          )
+        ) {
+          streamDeliveryError ??= new Error("Telegram delivery deferred behind older undelivered output");
+          return plainText;
+        }
 
         if (responseMessageId) {
           await safeEditMessage(bot, chatId, responseMessageId, html, { fallbackText: plainText });
@@ -1657,6 +1866,7 @@ export function createBot(
           recordTurn(
             rotationStateAfterSuccessfulHandoff ?? getRotationState(contextKey),
             {
+              turnId: ownPendingAnswerMsgId,
               userText: userVisibleText,
               // ALB-1201 (I3): rotation carries the DELIVERED truth, not the
               // intended text. When nothing was delivered, transcriptText is empty
@@ -1689,7 +1899,9 @@ export function createBot(
       const overdueAnswers = pendingAnswerLedger.takeOverdue(
         contextKey,
         pendingAnswerTurnSeq,
-        (msgId) => (pendingPromptQueues.get(contextKey) ?? []).some((item) => item.pendingMsgId === msgId),
+        (msgId) =>
+          (pendingPromptQueues.get(contextKey) ?? []).some((item) => item.pendingMsgId === msgId) ||
+          deliveryDebtStore.hasPendingAnswer(contextKey, msgId),
       );
       if (overdueAnswers.length > 0) {
         enqueuePrompt(contextKey, {
@@ -3367,6 +3579,10 @@ export function createBot(
     const message = error.error instanceof Error ? error.error.message : String(error.error);
     console.error("Telegram bot error:", message);
   });
+
+  for (const contextKey of deliveryDebtStore.contextKeys()) {
+    scheduleDeliveryDebtRetry(contextKey);
+  }
 
   return bot;
 }
