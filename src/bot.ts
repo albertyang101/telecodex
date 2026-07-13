@@ -40,6 +40,7 @@ import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramCon
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { PendingAnswerLedger, formatPendingAnswerReprompt } from "./pending-answer-guard.js";
+import { settleQueuedPromptCleanup } from "./queued-prompt-cleanup.js";
 import { stripVisiblePromptGuardEcho, withRotationHandoff, withTelegramReplyStyleGuard } from "./prompt-guard.js";
 import { resolveOwnerLocalTimeLine } from "./owner-local-time.js";
 import { clearChatState, loadChatState, saveChatState } from "./handoff-store.js";
@@ -68,7 +69,6 @@ const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
 
 type TelegramChatId = number | string;
-type TelegramChatAction = "typing" | "upload_photo" | "upload_document";
 type TelegramParseMode = "HTML";
 type KeyboardItem = { label: string; callbackData: string };
 
@@ -114,6 +114,8 @@ type QueuedPrompt = {
   receiptReaction?: Promise<void>;
   afterSuccess?: () => Promise<void>;
   afterPrompt?: () => Promise<void>;
+  /** Release the shared typing lifecycle when this accepted prompt is fully settled. */
+  stopTyping?: () => void;
 };
 
 export type TeleCodexBot = Bot<Context> & {
@@ -415,6 +417,56 @@ export function createBot(
   let inFlightCount = 0;
   const idleWaiters = new Set<() => void>();
   const textInFlightEnds = new WeakMap<Context, () => void>();
+  const typingHeartbeats = new Map<
+    TelegramContextKey,
+    {
+      refs: number;
+      interval: ReturnType<typeof setInterval>;
+      chatId: TelegramChatId;
+      messageThreadId?: number;
+    }
+  >();
+
+  const acquireTyping = (contextKey: TelegramContextKey, chatId: TelegramChatId): (() => void) => {
+    let heartbeat = typingHeartbeats.get(contextKey);
+    if (!heartbeat) {
+      const messageThreadId = parseContextKey(contextKey).messageThreadId;
+      const send = (): void => {
+        void bot.api
+          .sendChatAction(chatId, "typing", {
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          })
+          .catch(() => {});
+      };
+      heartbeat = {
+        refs: 0,
+        interval: setInterval(send, TYPING_INTERVAL_MS),
+        chatId,
+        messageThreadId,
+      };
+      typingHeartbeats.set(contextKey, heartbeat);
+      send();
+    }
+    heartbeat.refs += 1;
+    const ownedHeartbeat = heartbeat;
+
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      const current = typingHeartbeats.get(contextKey);
+      if (current !== ownedHeartbeat) {
+        return;
+      }
+      current.refs -= 1;
+      if (current.refs <= 0) {
+        clearInterval(current.interval);
+        typingHeartbeats.delete(contextKey);
+      }
+    };
+  };
 
   const notifyIdleWaiters = (): void => {
     if (inFlightCount !== 0) {
@@ -454,7 +506,15 @@ export function createBot(
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
     lastPromptInput.delete(key);
+    for (const queued of pendingPromptQueues.get(key) ?? []) {
+      queued.stopTyping?.();
+    }
     pendingPromptQueues.delete(key);
+    const heartbeat = typingHeartbeats.get(key);
+    if (heartbeat) {
+      clearInterval(heartbeat.interval);
+      typingHeartbeats.delete(key);
+    }
     pendingAnswerLedger.clear(key);
     drainingPromptQueues.delete(key);
     const retryTimer = queuedPromptRetryTimers.get(key);
@@ -630,6 +690,7 @@ export function createBot(
     contextKey: TelegramContextKey,
     item: QueuedPrompt,
   ): QueuedPrompt => {
+    item.stopTyping ??= acquireTyping(contextKey, item.chatId);
     const queue = pendingPromptQueues.get(contextKey) ?? [];
     queue.push(item);
     pendingPromptQueues.set(contextKey, queue);
@@ -702,9 +763,9 @@ export function createBot(
             if (queue.length === 0) {
               pendingPromptQueues.delete(contextKey);
             }
-            if (next.afterPrompt) {
-              await next.afterPrompt();
-            }
+            await settleQueuedPromptCleanup(next.afterPrompt, next.stopTyping, (error) => {
+              console.error("Failed to clean up queued Telegram prompt:", formatError(error));
+            });
           }
         }
       }
@@ -775,26 +836,6 @@ export function createBot(
         await options.afterPrompt();
       }
       await drainQueuedPrompts(contextKey);
-    }
-  };
-
-  const sendRepeatingChatAction = async <T>(
-    chatId: TelegramChatId,
-    action: TelegramChatAction,
-    task: () => Promise<T>,
-    messageThreadId?: number,
-  ): Promise<T> => {
-    const options = messageThreadId ? { message_thread_id: messageThreadId } : {};
-    const interval = setInterval(() => {
-      void bot.api.sendChatAction(chatId, action, options).catch(() => {});
-    }, TYPING_INTERVAL_MS);
-
-    void bot.api.sendChatAction(chatId, action, options).catch(() => {});
-
-    try {
-      return await task();
-    } finally {
-      clearInterval(interval);
     }
   };
 
@@ -956,22 +997,7 @@ export function createBot(
     let finalizePromise: Promise<string> | undefined;
     const userVisibleText = visibleUserText(userInput);
 
-    const typingInterval = setInterval(() => {
-      void bot.api
-        .sendChatAction(chatId, "typing", {
-          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-        })
-        .catch(() => {});
-    }, TYPING_INTERVAL_MS);
-    void bot.api
-      .sendChatAction(chatId, "typing", {
-        ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-      })
-      .catch(() => {});
-
-    const stopTyping = (): void => {
-      clearInterval(typingInterval);
-    };
+    const stopTyping = acquireTyping(contextKey, chatId);
 
     const clearFlushTimer = (): void => {
       if (flushTimer) {
@@ -1942,18 +1968,32 @@ export function createBot(
       return;
     }
 
+    const contextKey = contextKeyFromCtx(ctx);
     const userText = ctx.message?.text?.trim();
-    const shouldTrackTextTurn = Boolean(userText && !userText.startsWith("/") && contextKeyFromCtx(ctx));
-    const endInFlight = shouldTrackTextTurn ? beginInFlight() : undefined;
-    if (endInFlight) {
+    const isPromptMessage = Boolean(
+      contextKey &&
+        ctx.message &&
+        ((userText && !userText.startsWith("/")) ||
+          ctx.message.voice ||
+          ctx.message.audio ||
+          ctx.message.photo ||
+          ctx.message.document),
+    );
+    const stopAcceptedTyping = isPromptMessage ? acquireTyping(contextKey!, ctx.chat!.id) : undefined;
+    const shouldTrackTextTurn = Boolean(userText && !userText.startsWith("/") && contextKey);
+    const endInFlight = isPromptMessage ? beginInFlight() : undefined;
+    if (endInFlight && shouldTrackTextTurn) {
       textInFlightEnds.set(ctx, endInFlight);
     }
 
     try {
       await next();
     } finally {
-      if (endInFlight && textInFlightEnds.get(ctx) === endInFlight) {
+      stopAcceptedTyping?.();
+      if (endInFlight && shouldTrackTextTurn && textInFlightEnds.get(ctx) === endInFlight) {
         textInFlightEnds.delete(ctx);
+        endInFlight();
+      } else if (endInFlight && !shouldTrackTextTurn) {
         endInFlight();
       }
     }
@@ -3144,18 +3184,14 @@ export function createBot(
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
     let transcript = "";
-    const messageThreadId = parseContextKey(contextKey).messageThreadId;
-
     try {
-      const result = await sendRepeatingChatAction(chatId, "typing", async () => {
-        tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, fileId);
-        return await transcribeAudio(tempFilePath);
-      }, messageThreadId);
+      tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, fileId);
+      const result = await transcribeAudio(tempFilePath);
 
       transcript = result.text.trim();
       if (!transcript) {
         queuedPrompt.status = "skipped";
-        void safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
+        await safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
           fallbackText: "Transcription was empty. Please try again or send text instead.",
         }).catch(() => {});
         return;
@@ -3165,7 +3201,7 @@ export function createBot(
     } catch (error) {
       queuedPrompt.status = "skipped";
       const note = "Note: voice transcription is separate from CODEX_API_KEY.";
-      void safeReply(ctx, "<b>Transcription failed:</b>\n" + escapeHTML(friendlyErrorText(error)) + "\n\n<i>" + escapeHTML(note) + "</i>", {
+      await safeReply(ctx, "<b>Transcription failed:</b>\n" + escapeHTML(friendlyErrorText(error)) + "\n\n<i>" + escapeHTML(note) + "</i>", {
         fallbackText: "Transcription failed:\n" + friendlyErrorText(error) + "\n\n" + note,
       }).catch(() => {});
       return;
@@ -3202,7 +3238,7 @@ export function createBot(
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, photo.file_id, 20 * 1024 * 1024);
     } catch (error) {
       queuedPrompt.status = "skipped";
-      void safeReply(ctx, "<b>Failed to download photo:</b> " + escapeHTML(friendlyErrorText(error)), {
+      await safeReply(ctx, "<b>Failed to download photo:</b> " + escapeHTML(friendlyErrorText(error)), {
         fallbackText: "Failed to download photo: " + friendlyErrorText(error),
       }).catch(() => {});
       return;
@@ -3254,11 +3290,10 @@ export function createBot(
     let tempFilePath: string | undefined;
 
     try {
-      await ctx.api.sendChatAction(chatId, "typing");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, doc.file_id, config.maxFileSize);
     } catch (error) {
       queuedPrompt.status = "skipped";
-      void safeReply(ctx, "<b>Failed to download file:</b> " + escapeHTML(friendlyErrorText(error)), {
+      await safeReply(ctx, "<b>Failed to download file:</b> " + escapeHTML(friendlyErrorText(error)), {
         fallbackText: "Failed to download file: " + friendlyErrorText(error),
       }).catch(() => {});
       return;
@@ -3282,7 +3317,7 @@ export function createBot(
       });
     } catch (error) {
       queuedPrompt.status = "skipped";
-      void safeReply(ctx, "<b>Failed to stage file:</b> " + escapeHTML(friendlyErrorText(error)), {
+      await safeReply(ctx, "<b>Failed to stage file:</b> " + escapeHTML(friendlyErrorText(error)), {
         fallbackText: "Failed to stage file: " + friendlyErrorText(error),
       }).catch(() => {});
       await drainQueuedPrompts(contextKey);
@@ -3297,14 +3332,12 @@ export function createBot(
       fallbackText: "📎 Received: " + stagedFile.safeName,
     }).catch(() => {});
 
-    await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
-
     const outDir = outboxPath(workspace, turnId);
     try {
       await ensureOutDir(outDir);
     } catch (error) {
       queuedPrompt.status = "skipped";
-      void safeReply(ctx, "<b>Failed to prepare output folder:</b> " + escapeHTML(friendlyErrorText(error)), {
+      await safeReply(ctx, "<b>Failed to prepare output folder:</b> " + escapeHTML(friendlyErrorText(error)), {
         fallbackText: "Failed to prepare output folder: " + friendlyErrorText(error),
       }).catch(() => {});
       await cleanupInbox(workspace, turnId).catch(() => {});

@@ -1775,6 +1775,294 @@ describe("createBot response delivery", () => {
     expect(input.text).toContain("看一下这张图");
   });
 
+  it("keeps typing active until a document-download failure reply is delivered (ALB-1201 review I1)", async () => {
+    vi.useFakeTimers();
+    try {
+      const failureDeliveryStarted = deferred<void>();
+      const failureDelivery = deferred<void>();
+      const session = createSession(async () => {
+        throw new Error("prompt must not run");
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(createConfig(), registry as any) as any;
+      bot.api.getFile = vi.fn().mockRejectedValue(new Error("download unavailable"));
+      bot.api.sendMessage.mockImplementation(async () => {
+        failureDeliveryStarted.resolve();
+        await failureDelivery.promise;
+        return { message_id: 120103 };
+      });
+      const documentHandler = bot.__handlers.on.get("message:document");
+
+      const turnPromise = documentHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: {
+          message_id: 120103,
+          document: {
+            file_id: "broken-doc",
+            file_name: "broken.txt",
+            mime_type: "text/plain",
+            file_size: 5,
+          },
+        },
+        api: bot.api,
+      });
+      await failureDeliveryStarted.promise;
+      const typingCallsBeforeFailureWait = bot.api.sendChatAction.mock.calls.filter(
+        (call: unknown[]) => call[1] === "typing",
+      ).length;
+      await vi.advanceTimersByTimeAsync(9_000);
+
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBeGreaterThanOrEqual(typingCallsBeforeFailureWait + 2);
+
+      failureDelivery.resolve();
+      await turnPromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("tracks media ingress as in-flight until document handling fully settles (ALB-1201 review I1)", async () => {
+    const download = deferred<ArrayBuffer>();
+    const session = createSession(async (callbacks) => {
+      callbacks.onTextDelta("文件处理完成。");
+      callbacks.onAgentMessage?.("文件处理完成。");
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig(), registry as any) as any;
+    bot.api.getFile = vi.fn().mockResolvedValue({
+      file_path: "documents/in-flight.txt",
+      file_size: 5,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => await download.promise,
+      })),
+    );
+    const middleware = bot.__handlers.use[0];
+    const documentHandler = bot.__handlers.on.get("message:document");
+    const ctx = {
+      update: { update_id: 120104 },
+      chat: { id: 42, type: "private" },
+      from: { id: 123 },
+      message: {
+        message_id: 120104,
+        document: {
+          file_id: "in-flight-doc",
+          file_name: "in-flight.txt",
+          mime_type: "text/plain",
+          file_size: 5,
+        },
+      },
+      api: bot.api,
+    };
+    let idleSettled = false;
+
+    const turnPromise = middleware(ctx, async () => await documentHandler(ctx));
+    await Promise.resolve();
+    await Promise.resolve();
+    void bot.waitForIdle().then(() => {
+      idleSettled = true;
+    });
+    await Promise.resolve();
+
+    expect(bot.getInFlightCount()).toBe(1);
+    expect(idleSettled).toBe(false);
+
+    download.resolve(new TextEncoder().encode("hello").buffer);
+    await turnPromise;
+    await bot.waitForIdle();
+    expect(bot.getInFlightCount()).toBe(0);
+    expect(idleSettled).toBe(true);
+  });
+
+  it("uses one shared typing heartbeat instead of duplicate document typing sends (ALB-1201 review M1)", async () => {
+    vi.useFakeTimers();
+    try {
+      const download = deferred<ArrayBuffer>();
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("文件处理完成。");
+        callbacks.onAgentMessage?.("文件处理完成。");
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(createConfig(), registry as any) as any;
+      bot.api.getFile = vi.fn().mockResolvedValue({
+        file_path: "documents/one-heartbeat.txt",
+        file_size: 5,
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({
+          ok: true,
+          arrayBuffer: async () => await download.promise,
+        })),
+      );
+      const documentHandler = bot.__handlers.on.get("message:document");
+
+      const turnPromise = documentHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: {
+          message_id: 120105,
+          document: {
+            file_id: "one-heartbeat-doc",
+            file_name: "one-heartbeat.txt",
+            mime_type: "text/plain",
+            file_size: 5,
+          },
+        },
+        api: bot.api,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBe(1);
+
+      download.resolve(new TextEncoder().encode("hello").buffer);
+      await turnPromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps refreshing typing while a document is still downloading (ALB-1201 review I1)", async () => {
+    vi.useFakeTimers();
+    try {
+      const download = deferred<ArrayBuffer>();
+      const session = createSession(async (callbacks) => {
+        callbacks.onTextDelta("文件收到了。");
+        callbacks.onAgentMessage?.("文件收到了。");
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(createConfig(), registry as any) as any;
+      bot.api.getFile = vi.fn().mockResolvedValue({
+        file_path: "documents/slow-report.txt",
+        file_size: 5,
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({
+          ok: true,
+          arrayBuffer: async () => await download.promise,
+        })),
+      );
+      const documentHandler = bot.__handlers.on.get("message:document");
+
+      const turnPromise = documentHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: {
+          message_id: 120101,
+          document: {
+            file_id: "slow-doc",
+            file_name: "slow-report.txt",
+            mime_type: "text/plain",
+            file_size: 5,
+          },
+          caption: "下载期间也要持续显示正在处理",
+        },
+        api: bot.api,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(9_000);
+
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBeGreaterThanOrEqual(3);
+
+      download.resolve(new TextEncoder().encode("hello").buffer);
+      await turnPromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps refreshing typing until generated artifacts finish uploading (ALB-1201 review I1)", async () => {
+    vi.useFakeTimers();
+    try {
+      const workspace = await createWorkspace("telecodex-bot-artifact-typing-");
+      const artifactUploadStarted = deferred<void>();
+      const artifactUpload = deferred<void>();
+      const session = createSession(async (callbacks, input) => {
+        const instructions = String((input as { stagedFileInstructions?: string }).stagedFileInstructions ?? "");
+        const outputDir = instructions.match(/Write any output files to: (.+)/)?.[1]?.trim();
+        if (!outputDir) throw new Error("missing output directory");
+        await mkdir(outputDir, { recursive: true });
+        await writeFile(path.join(outputDir, "result.txt"), "finished");
+        callbacks.onTextDelta("结果已经生成。");
+        callbacks.onAgentMessage?.("结果已经生成。");
+        callbacks.onAgentEnd();
+      });
+      session.getCurrentWorkspace.mockReturnValue(workspace);
+      const registry = createRegistry(session);
+      const bot = createBot(createConfig({ workspace }), registry as any) as any;
+      bot.api.getFile = vi.fn().mockResolvedValue({
+        file_path: "documents/report.txt",
+        file_size: 5,
+      });
+      bot.api.sendDocument = vi.fn(async () => {
+        artifactUploadStarted.resolve();
+        await artifactUpload.promise;
+        return { message_id: 120102 };
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({
+          ok: true,
+          arrayBuffer: async () => new TextEncoder().encode("hello").buffer,
+        })),
+      );
+      const documentHandler = bot.__handlers.on.get("message:document");
+
+      const turnPromise = documentHandler({
+        chat: { id: 42 },
+        from: { id: 123 },
+        message: {
+          message_id: 120102,
+          document: {
+            file_id: "doc-file",
+            file_name: "report.txt",
+            mime_type: "text/plain",
+            file_size: 5,
+          },
+          caption: "生成文件给我",
+        },
+        api: bot.api,
+      });
+      await artifactUploadStarted.promise;
+      const typingCallsBeforeUploadWait = bot.api.sendChatAction.mock.calls.filter(
+        (call: unknown[]) => call[1] === "typing",
+      ).length;
+      await vi.advanceTimersByTimeAsync(9_000);
+
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBeGreaterThanOrEqual(typingCallsBeforeUploadWait + 2);
+
+      artifactUpload.resolve();
+      await turnPromise;
+      const typingCallsAfterDelivery = bot.api.sendChatAction.mock.calls.filter(
+        (call: unknown[]) => call[1] === "typing",
+      ).length;
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(
+        bot.api.sendChatAction.mock.calls.filter((call: unknown[]) => call[1] === "typing").length,
+      ).toBe(typingCallsAfterDelivery);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps refreshing typing after a streaming preview until the whole turn finishes (ALB-1361)", async () => {
     vi.useFakeTimers();
     try {
