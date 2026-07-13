@@ -325,6 +325,30 @@ describe("thread-rotation", () => {
     });
   });
 
+  describe("pending output pass-through (ALB-1404)", () => {
+    it("renders exact durable output debt and extracts its Linear refs", () => {
+      const s = recordTurn(emptyChatState(), { userText: "重活", assistantText: "", lastInputTokens: HEAVY }, cfg);
+      const out = takeRotationHandoff(s, cfg, {
+        pendingOutputs: [{ messageId: 44, text: "待送达 ALB-1404 精确结果" }],
+      });
+      expect(out.handoff).toContain("待送达 ALB-1404 精确结果");
+      expect(out.handoff).toContain("message_id=44");
+      expect(out.handoff).toContain("ALB-1404");
+    });
+  });
+
+  describe("queued-message awareness (ALB-1404 review I4)", () => {
+    it("marks future queued messages as Dispatcher-owned and current-turn no-answer", () => {
+      const s = recordTurn(emptyChatState(), { userText: "重活", assistantText: "ok", lastInputTokens: HEAVY }, cfg);
+      const out = takeRotationHandoff(s, cfg, {
+        queuedMessages: [{ messageId: 55, text: "未来单独执行" }],
+      });
+      expect(out.handoff).toContain("后续排队消息");
+      expect(out.handoff).toContain("当前回合勿答");
+      expect(out.handoff).toContain("message_id=55");
+    });
+  });
+
   describe("unanswered snapshot pass-through (ALB-1205)", () => {
     it("renders caller-provided unanswered messages into the handoff", () => {
       const s = recordTurn(emptyChatState(), { userText: "重活", assistantText: "ok", lastInputTokens: HEAVY }, cfg);

@@ -7,6 +7,7 @@ import {
   HANDOFF_MARKER,
   type HandoffContext,
   type HandoffEntry,
+  type HandoffMessage,
   appendEntry,
   renderHandoff,
 } from "../src/handoff-buffer.js";
@@ -165,7 +166,7 @@ describe("handoff-buffer", () => {
       expect(out).toContain("Linear");
     });
 
-    it("renders explicit deduplicated Linear control-plane refs before unfinished work", () => {
+    it("renders explicit deduplicated Linear control-plane refs after protected owner work", () => {
       const out = renderHandoff([], {
         reason: "threshold",
         linearIssues: ["ALB-1201", "alb-958", "ALB-1201"],
@@ -176,7 +177,63 @@ describe("handoff-buffer", () => {
       expect(out).toContain("ALB-958");
       expect(out.match(/ALB-1201/g)).toHaveLength(1);
       expect(out).toContain("issue/comments/status/close criteria");
-      expect(out.indexOf("Linear 在途控制面")).toBeLessThan(out.indexOf("未答消息"));
+      expect(out.indexOf("Linear 在途控制面")).toBeGreaterThan(out.indexOf("未答消息"));
+    });
+
+    it("mechanically pins responsibility, priority, and unknown boundaries for a fresh thread (ALB-1404)", () => {
+      const out = renderHandoff([], { reason: "threshold" });
+      expect(out).toContain("当前责任：未内联");
+      expect(out).toContain("当前优先级：未内联");
+      expect(out).toContain("当前未知：未内联");
+      expect(out).toContain("CURRENT_HANDOFF.md");
+      expect(out).toContain("Linear（唯一真相）");
+      expect(out).toContain("不脑补");
+      expect(out.indexOf("当前责任")).toBeLessThan(out.indexOf("--- 交接结束"));
+    });
+
+    it("renders stable message ids for duplicate-text unanswered messages (ALB-1404)", () => {
+      const out = renderHandoff([], {
+        reason: "threshold",
+        unanswered: [
+          { messageId: 22, text: "同一句话" },
+          { messageId: 23, text: "同一句话" },
+        ],
+      });
+      expect(out).toContain("message_id=22");
+      expect(out).toContain("message_id=23");
+      expect(out.match(/同一句话/g)).toHaveLength(2);
+    });
+
+    it("protects exact undelivered output and forbids regeneration across rotation (ALB-1404)", () => {
+      const exact = "**最终结果**\n\n只差这一段尚未送达。";
+      const out = renderHandoff([], {
+        reason: "threshold",
+        pendingOutputs: [{ messageId: 31, text: exact }],
+      });
+      expect(out).toContain("待送达回复");
+      expect(out).toContain("message_id=31");
+      expect(out).toContain(exact);
+      expect(out).toContain("不要重跑");
+      expect(out).toContain("不要重复生成");
+    });
+
+    it("references the durable exact source when a pending-output preview is truncated (ALB-1404 review I1)", () => {
+      const longExact = "LONG_PENDING_EXACT_" + "甲".repeat(3000);
+      const sha = "a".repeat(64);
+      const out = renderHandoff([], {
+        reason: "threshold",
+        pendingOutputs: [{
+          messageId: 41,
+          debtId: "debt-long-41",
+          contentSha256: sha,
+          text: longExact,
+        }],
+      });
+      expect(out).toContain(".telecodex/delivery-debts.json");
+      expect(out).toContain("debt-long-41");
+      expect(out).toContain(sha);
+      expect(out).toContain("预览");
+      expect(out).not.toContain(longExact);
     });
 
     it("renders each unanswered message verbatim under a 未答消息 section", () => {
@@ -214,21 +271,24 @@ describe("handoff-buffer", () => {
       expect(out).not.toContain("最后断点");
     });
 
-    it("orders sections: reason → recovery → unanswered → interrupted → recent conversation", () => {
+    it("orders sections: reason → recovery → unanswered → pending output → interrupted → recent conversation", () => {
       const out = renderHandoff(sample, {
         reason: "hard-cap",
         unanswered: ["queued-question"],
+        pendingOutputs: [{ messageId: 9, text: "pending-output" }],
         interruptedTurn: "interrupted-question",
       });
       const reasonAt = out.indexOf("翻页原因");
       const recoveryAt = out.indexOf("恢复指引");
       const unansweredAt = out.indexOf("未答消息");
+      const pendingAt = out.indexOf("--- 待送达回复");
       const interruptedAt = out.indexOf("最后断点");
       const recentAt = out.indexOf("旧 thread 最近对话");
       expect(reasonAt).toBeGreaterThanOrEqual(0);
       expect(recoveryAt).toBeGreaterThan(reasonAt);
       expect(unansweredAt).toBeGreaterThan(recoveryAt);
-      expect(interruptedAt).toBeGreaterThan(unansweredAt);
+      expect(pendingAt).toBeGreaterThan(unansweredAt);
+      expect(interruptedAt).toBeGreaterThan(pendingAt);
       expect(recentAt).toBeGreaterThan(interruptedAt);
     });
 
@@ -253,6 +313,88 @@ describe("handoff-buffer", () => {
       expect(out).toContain("interrupted-gamma");
       expect(out).toContain("entry-99"); // newest conversation still first to survive
       expect(out).not.toContain("entry-0-"); // oldest conversation sheds first
+    });
+
+    it("keeps the total cap when pending output and unanswered work compete for budget (ALB-1404)", () => {
+      const pendingOutputs = Array.from({ length: 10 }, (_, index) => ({
+        messageId: 100 + index,
+        text: "pending-" + index + "-" + "p".repeat(1800),
+      }));
+      const unanswered = Array.from({ length: 4 }, (_, index) => ({
+        messageId: 200 + index,
+        text: "unanswered-" + index + "-" + "u".repeat(1800),
+      }));
+      const out = renderHandoff(
+        sample,
+        {
+          reason: "hard-cap",
+          pendingOutputs,
+          unanswered,
+          interruptedTurn: "interrupted-" + "i".repeat(1800),
+        },
+        { maxTotalChars: 4000 },
+      );
+      expect(out.length).toBeLessThanOrEqual(4000);
+      expect(out).toContain("未答消息");
+      expect(out).not.toContain("待送达回复");
+      expect(out).not.toContain("最后断点");
+    });
+
+    it("finishes all higher-priority owner messages before admitting pending or interrupted work (ALB-1404 review I5)", () => {
+      const context: HandoffContext = {
+        reason: "hard-cap",
+        unanswered: [
+          { messageId: 1, text: "OWNER_ONE_" + "a".repeat(1000) },
+          { messageId: 2, text: "OWNER_TWO_" + "b".repeat(1000) },
+        ],
+        pendingOutputs: [{ messageId: 3, text: "PENDING_LOWER_" + "p".repeat(1000) }],
+        interruptedTurn: "INTERRUPTED_LOWER_" + "i".repeat(1000),
+      };
+      const tight = renderHandoff([], context, { maxTotalChars: 2000 });
+      expect(tight).toContain("OWNER_ONE_");
+      expect(tight).not.toContain("PENDING_LOWER_");
+      expect(tight).not.toContain("INTERRUPTED_LOWER_");
+
+      const larger = renderHandoff([], context, { maxTotalChars: 3000 });
+      expect(larger).toContain("OWNER_ONE_");
+      expect(larger).toContain("OWNER_TWO_");
+    });
+
+    it("keeps the oldest-first FIFO prefix inside owner, pending, and queued layers (ALB-1404 review I6)", () => {
+      const assertPrefixOnly = (context: HandoffContext, prefix: string): void => {
+        const out = renderHandoff([], context, { maxTotalChars: 1600 });
+        expect(out).toContain(prefix + "_ONE_");
+        expect(out).not.toContain(prefix + "_TWO_");
+        expect(out).not.toContain(prefix + "_THREE_TINY");
+      };
+      const items = (prefix: string): HandoffMessage[] => [
+        { messageId: 1, text: prefix + "_ONE_" + "a".repeat(600) },
+        { messageId: 2, text: prefix + "_TWO_" + "b".repeat(1200) },
+        { messageId: 3, text: prefix + "_THREE_TINY" },
+      ];
+      assertPrefixOnly({ reason: "hard-cap", unanswered: items("OWNER") }, "OWNER");
+      assertPrefixOnly({ reason: "hard-cap", pendingOutputs: items("PENDING") }, "PENDING");
+      assertPrefixOnly({ reason: "hard-cap", queuedMessages: items("QUEUED") }, "QUEUED");
+    });
+
+    it("treats maxTotalChars as a strict hard bound under combined pressure (ALB-1404 review I2)", () => {
+      const out = renderHandoff(
+        sample,
+        {
+          reason: "hard-cap",
+          pendingOutputs: [{
+            messageId: 1, debtId: "debt-1", contentSha256: "b".repeat(64),
+            text: "p".repeat(3000),
+          }],
+          unanswered: [{ messageId: 2, text: "OWNER_UNANSWERED_" + "u".repeat(3000) }],
+          queuedMessages: [{ messageId: 3, text: "QUEUED_FUTURE_" + "q".repeat(3000) }],
+          interruptedTurn: "INTERRUPTED_" + "i".repeat(3000),
+        },
+        { maxTotalChars: 1000 },
+      );
+      expect(out.length).toBeLessThanOrEqual(1000);
+      expect(out).toContain(HANDOFF_MARKER);
+      expect(out).toContain("OWNER_UNANSWERED_");
     });
 
     it("still fits the default 6000-char budget with a full context attached", () => {

@@ -229,7 +229,11 @@ export interface RotationHandoff {
 /** Extra caller-supplied context rendered into the handoff (ALB-1205). */
 export interface TakeRotationHandoffExtras {
   /** Verbatim queued-but-unanswered user messages, oldest first. */
-  unanswered?: string[];
+  unanswered?: HandoffContext["unanswered"];
+  /** Future prompts still owned and executed individually by Dispatcher. */
+  queuedMessages?: HandoffContext["queuedMessages"];
+  /** Exact durable Telegram output still pending delivery, oldest first. */
+  pendingOutputs?: HandoffContext["pendingOutputs"];
 }
 
 /**
@@ -243,9 +247,13 @@ const LINEAR_ISSUE_RE = /\bALB-\d+\b/gi;
 const MAX_LINEAR_ISSUES = 20;
 
 function collectLinearIssues(state: ChatRotationState, extras: TakeRotationHandoffExtras): string[] {
+  const extraText = (value: string | { text: string }): string =>
+    typeof value === "string" ? value : value.text;
   const texts = [
     ...state.buffer.map((entry) => entry.text),
-    ...(extras.unanswered ?? []),
+    ...(extras.unanswered ?? []).map(extraText),
+    ...(extras.queuedMessages ?? []).map(extraText),
+    ...(extras.pendingOutputs ?? []).map(extraText),
     state.interruptedTurn ?? "",
   ];
   const issues: string[] = [];
@@ -281,6 +289,8 @@ export function takeRotationHandoff(
     ratio: state.lastKnownRatio,
     linearIssues: collectLinearIssues(state, extras),
     unanswered: extras.unanswered,
+    queuedMessages: extras.queuedMessages,
+    pendingOutputs: extras.pendingOutputs,
     interruptedTurn,
   };
   const handoff = renderHandoff(state.buffer, context);

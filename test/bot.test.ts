@@ -559,7 +559,9 @@ describe("createBot response delivery", () => {
     expect(session.newThread).toHaveBeenCalledTimes(1);
     const rotatedInput = JSON.stringify(session.prompt.mock.calls[1][0]);
     expect(rotatedInput).toContain(HANDOFF_MARKER);
-    expect(rotatedInput).toContain("未答消息");
+    expect(rotatedInput).toContain("后续排队消息");
+    expect(rotatedInput).toContain("当前回合勿答");
+    expect(rotatedInput).toContain("message_id=3");
     expect(rotatedInput).toContain("第三条：也在排队");
     // ALB-1205: the message currently being handled (第二条) is delivered as this
     // very turn's live prompt — it must NOT also be listed as unanswered backlog in
@@ -568,6 +570,106 @@ describe("createBot response delivery", () => {
     // right now. It must appear exactly once (the live prompt), never twice.
     const currentMsgOccurrences = (rotatedInput.match(/第二条：排队中/g) ?? []).length;
     expect(currentMsgOccurrences).toBe(1);
+  });
+
+  it("keeps one of two identical queued messages in HANDOFF by Telegram id (ALB-1404)", async () => {
+    let releaseTurn1!: () => void;
+    const turn1Gate = new Promise<void>((resolve) => { releaseTurn1 = resolve; });
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        await turn1Gate;
+        callbacks.onAgentMessage?.("第一条答完");
+        callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 5 });
+        callbacks.onAgentEnd();
+        return;
+      }
+      callbacks.onAgentMessage?.("ok");
+      callbacks.onTurnComplete?.({ inputTokens: 40000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const workspace = await createWorkspace("telecodex-rotation-identical-unanswered-");
+    const bot = createBot(createConfig({
+      workspace,
+      autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 },
+    } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    const first = textHandler({ chat: { id: 9393 }, from: { id: 123 }, message: { message_id: 1, text: "第一条：慢活" }, api: bot.api });
+    await textHandler({ chat: { id: 9393 }, from: { id: 123 }, message: { message_id: 2, text: "完全相同的排队消息" }, api: bot.api });
+    await textHandler({ chat: { id: 9393 }, from: { id: 123 }, message: { message_id: 3, text: "完全相同的排队消息" }, api: bot.api });
+
+    releaseTurn1();
+    await first;
+
+    const rotatedInput = JSON.stringify(session.prompt.mock.calls[1][0]);
+    expect(rotatedInput).toContain(HANDOFF_MARKER);
+    expect(rotatedInput).toContain("message_id=3");
+    expect(rotatedInput).not.toContain("message_id=2");
+    expect(rotatedInput.match(/完全相同的排队消息/g)).toHaveLength(2);
+  });
+
+  it("carries exact durable output debt into the fresh HANDOFF before retry (ALB-1404)", async () => {
+    vi.useFakeTimers();
+    try {
+      const workspace = await createWorkspace("telecodex-rotation-pending-output-");
+      const pendingOutput = "**OLD_PENDING_OUTPUT_ALB_1404** 精确待送达结果。";
+      let promptCount = 0;
+      const session = createSession(async (callbacks) => {
+        promptCount += 1;
+        callbacks.onAgentMessage?.(promptCount === 1 ? pendingOutput : "NEW_TURN_RESULT");
+        callbacks.onTurnComplete?.({
+          inputTokens: promptCount === 1 ? 130000 : 40000,
+          cachedInputTokens: 0,
+          outputTokens: 5,
+        });
+        callbacks.onAgentEnd();
+      });
+      const registry = createRegistry(session);
+      const bot = createBot(createConfig({
+        workspace,
+        autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 },
+      } as any), registry as any) as any;
+      let pendingAttempts = 0;
+      bot.api.sendMessage.mockImplementation(async (_chatId: unknown, text: unknown) => {
+        const value = String(text);
+        if (value.includes("OLD_PENDING_OUTPUT_ALB_1404") && pendingAttempts < 2) {
+          pendingAttempts += 1;
+          throw new Error("Telegram unavailable");
+        }
+        if (value.includes("有一段回复发送失败")) {
+          throw new Error("warning unavailable");
+        }
+        return { message_id: 1404 };
+      });
+      const textHandler = bot.__handlers.on.get("message:text");
+
+      await textHandler({
+        chat: { id: 1404 }, from: { id: 123 },
+        message: { message_id: 31, text: "先生成旧结果" }, api: bot.api,
+      });
+      expect((await readDeliveryDebts(workspace))[0]?.chunks.join("\n")).toContain("OLD_PENDING_OUTPUT_ALB_1404");
+
+      await textHandler({
+        chat: { id: 1404 }, from: { id: 123 },
+        message: { message_id: 32, text: "新线程继续" }, api: bot.api,
+      });
+
+      const rotatedInput = JSON.stringify(session.prompt.mock.calls[1][0]);
+      expect(rotatedInput).toContain(HANDOFF_MARKER);
+      expect(rotatedInput).toContain("待送达回复预览");
+      expect(rotatedInput).toContain("delivery-debts.json");
+      expect(rotatedInput).toContain("message_id=31");
+      expect(rotatedInput).toContain(pendingOutput);
+      expect(rotatedInput).toContain("不要重跑");
+      expect(rotatedInput).toContain("不要重复生成");
+      bot.prepareForShutdown();
+      registry.__removeCallbacks.forEach((callback: (key: string) => void) => callback("1404"));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ALB-1205 SENTINEL: the canonical "interrupted turn (最后断点) on a Telegram
@@ -3647,6 +3749,44 @@ describe("createBot response delivery", () => {
       String(call[0]).includes("欠答自查"),
     );
     expect(repromptCalls).toHaveLength(1);
+  });
+
+  it("does not list a rotating synthesized overdue reprompt as future no-answer queue work (ALB-1404 review I7)", async () => {
+    const workspace = await createWorkspace("telecodex-overdue-rotation-current-token-");
+    let promptCount = 0;
+    const session = createSession(async (callbacks) => {
+      promptCount += 1;
+      if (promptCount === 1) {
+        callbacks.onTextDelta("阶段结果：还没有最终答案。");
+        callbacks.onAgentMessage?.("阶段结果：还没有最终答案。", { isFinal: false, followedByTool: false });
+        callbacks.onTurnComplete?.({ inputTokens: 130000, cachedInputTokens: 0, outputTokens: 5 });
+        callbacks.onAgentEnd();
+        return;
+      }
+      callbacks.onTextDelta("补答完成。");
+      callbacks.onAgentMessage?.("补答完成。", { isFinal: true, followedByTool: false });
+      callbacks.onTurnComplete?.({ inputTokens: 40000, cachedInputTokens: 0, outputTokens: 5 });
+      callbacks.onAgentEnd();
+    });
+    const registry = createRegistry(session);
+    const bot = createBot(createConfig({
+      workspace,
+      autoRotate: { enabled: true, threshold: 0.45, hardCap: 0.6, contextWindow: 258400 },
+    } as any), registry as any) as any;
+    const textHandler = bot.__handlers.on.get("message:text");
+
+    await textHandler({
+      chat: { id: 14047 },
+      from: { id: 123 },
+      message: { message_id: 14047, text: "先出进度，随后自动补答并翻页" },
+      api: bot.api,
+    });
+
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2), { timeout: 2000 });
+    const rotatedReprompt = JSON.stringify(session.prompt.mock.calls[1][0]);
+    expect(rotatedReprompt).toContain(HANDOFF_MARKER);
+    expect(rotatedReprompt).not.toContain("后续排队消息");
+    expect(rotatedReprompt.match(/欠答自查/g)).toHaveLength(1);
   });
 
   // ALB-1201 N (Theo Important 3): onAgentEnd BEGINS finalize (finalized=true) and

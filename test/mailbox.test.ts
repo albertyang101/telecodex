@@ -1700,8 +1700,10 @@ describe("mailbox bridge", () => {
     expect(session.newThread).toHaveBeenCalledTimes(1);
     const rotatedInput = JSON.stringify(session.prompt.mock.calls[1]![0]);
     expect(rotatedInput).toContain(HANDOFF_MARKER);
-    expect(rotatedInput).toContain("未答消息");
-    // Message C is still queued behind B at the instant B rotates.
+    expect(rotatedInput).toContain("后续排队消息");
+    expect(rotatedInput).toContain("当前回合勿答");
+    expect(rotatedInput).not.toContain("未答消息");
+    // Message C is still queued behind B at the instant B rotates, but this turn must not answer it.
     expect(rotatedInput).toContain("排队C");
     // ALB-1205 A7: the mailbox rotation must be OBSERVABLE. The Telegram path logs
     // "Auto-rotated ..." but the mailbox path (where worker bots spend most turns)

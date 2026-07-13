@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -112,8 +112,10 @@ type QueuedPrompt = {
   chatId: TelegramChatId;
   session: CodexSessionService;
   status: "pending" | "ready" | "skipped";
+  /** Stable internal identity for every queued item, including synthesized prompts. */
+  queueToken?: string;
   input?: CodexPromptInput;
-  /** Telegram message id backing this queued prompt (ALB-1339 欠答账本 exclusion). */
+  /** Telegram message id for ledger/HANDOFF identity when the queued item came from Telegram. */
   pendingMsgId?: number;
   receiptReaction?: Promise<void>;
   afterSuccess?: () => Promise<void>;
@@ -710,6 +712,7 @@ export function createBot(
     contextKey: TelegramContextKey,
     item: QueuedPrompt,
   ): QueuedPrompt => {
+    item.queueToken ??= randomUUID();
     item.stopTyping ??= acquireTyping(contextKey, item.chatId);
     const queue = pendingPromptQueues.get(contextKey) ?? [];
     queue.push(item);
@@ -760,7 +763,10 @@ export function createBot(
         try {
           if (next.status === "ready" && next.input !== undefined) {
             rememberPromptInput(contextKey, next.input, next.pendingMsgId);
-            await handleUserPrompt(next.ctx, contextKey, next.chatId, next.session, next.input);
+            await handleUserPrompt(next.ctx, contextKey, next.chatId, next.session, next.input, {
+              pendingAnswerMsgId: next.pendingMsgId,
+              currentQueueToken: next.queueToken,
+            });
             consumed = true;
             await completeReaction(next.ctx, next.receiptReaction);
             if (next.afterSuccess) {
@@ -828,7 +834,7 @@ export function createBot(
 
     let consumed = false;
     try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, input);
+      await handleUserPrompt(ctx, contextKey, chatId, session, input, { pendingAnswerMsgId });
       consumed = true;
       await completeReaction(ctx, receiptReaction);
       if (options.afterSuccess) {
@@ -870,22 +876,34 @@ export function createBot(
     contextWindow: config.autoRotate.contextWindow,
   };
   /**
-   * Snapshot the still-queued (unanswered) user messages for the rotation HANDOFF
-   * (ALB-1205). On the drain path the message currently being handled is still at
+   * Snapshot future queued user messages for rotation awareness. They remain owned
+   * by Dispatcher and must not be answered by the current model turn. On the drain
+   * path the message currently being handled is still at
    * the head of the queue — it is only shifted off in the drain loop's `finally`,
    * after the turn — so without excluding it, this very turn's message would be
    * listed as unanswered backlog even though the turn is answering it right now
-   * (and it is already injected as the live prompt). Exclude it by identity:
-   * `currentInput` is the exact input object handed to handleUserPrompt. On the
-   * direct (non-queued) path the current input is not in the queue, so the filter
-   * is a no-op there.
+   * (and it is already injected as the live prompt). Exclude it by the stable
+   * internal queue token, never by prompt value or optional Telegram id: synthesized
+   * reprompts and media turns need the same identity guarantee. On the direct path
+   * there is no current queue token, so the filter is a no-op.
    */
-  const snapshotUnansweredPrompts = (key: string, currentInput?: CodexPromptInput): string[] => {
+  const snapshotQueuedPrompts = (
+    key: string,
+    currentQueueToken?: string,
+  ): Array<{ messageId?: number; text: string }> => {
     const queue = pendingPromptQueues.get(key) ?? [];
     return queue
-      .filter((item) => item.status !== "skipped" && item.input !== undefined && item.input !== currentInput)
-      .map((item) => visibleUserText(item.input!).trim())
-      .filter((text) => text.length > 0);
+      .filter(
+        (item) =>
+          item.status !== "skipped" &&
+          item.input !== undefined &&
+          (currentQueueToken === undefined || item.queueToken !== currentQueueToken),
+      )
+      .map((item) => ({
+        ...(typeof item.pendingMsgId === "number" ? { messageId: item.pendingMsgId } : {}),
+        text: visibleUserText(item.input!).trim(),
+      }))
+      .filter((item) => item.text.length > 0);
   };
   const getRotationState = (key: string): ChatRotationState => {
     let state = rotationStates.get(key);
@@ -1070,7 +1088,7 @@ export function createBot(
     chatId: TelegramChatId,
     session: CodexSessionService,
     userInput: CodexPromptInput,
-    turnOptions: { pendingAnswerMsgId?: number } = {},
+    turnOptions: { pendingAnswerMsgId?: number; currentQueueToken?: string } = {},
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
@@ -1085,6 +1103,7 @@ export function createBot(
     // /retry turns answer a message OTHER than ctx's own (the cached original),
     // so callers may override which message this turn settles.
     const ownPendingAnswerMsgId = turnOptions.pendingAnswerMsgId ?? ctx.message?.message_id;
+    const currentQueueToken = turnOptions.currentQueueToken;
     const strikeOwnPendingAnswer = (): void => {
       pendingAnswerLedger.markAnswered(contextKey, ownPendingAnswerMsgId);
     };
@@ -1960,8 +1979,19 @@ export function createBot(
       let rotationHandoff: string | null = null;
       if (rotationCfg.enabled) {
         const rotationStateBeforeRotation = getRotationState(contextKey);
-        const unanswered = snapshotUnansweredPrompts(contextKey, userInput);
-        const takenRotation = takeRotationHandoff(rotationStateBeforeRotation, rotationCfg, { unanswered });
+        const queuedMessages = snapshotQueuedPrompts(contextKey, currentQueueToken);
+        const pendingOutputs = deliveryDebtStore.list(contextKey).map((debt) => ({
+          ...(typeof debt.pendingAnswerMsgId === "number" ? { messageId: debt.pendingAnswerMsgId } : {}),
+          debtId: debt.id,
+          contentSha256: createHash("sha256")
+            .update(JSON.stringify(debt.chunks))
+            .digest("hex"),
+          text: debt.chunks.join("\n\n"),
+        }));
+        const takenRotation = takeRotationHandoff(rotationStateBeforeRotation, rotationCfg, {
+          queuedMessages,
+          pendingOutputs,
+        });
         if (takenRotation.handoff) {
           // A mandatory (hard-cap) rotation must not fall back to the over-cap
           // thread: try to open a fresh thread once more before giving up (ALB-1205).
@@ -3392,7 +3422,11 @@ export function createBot(
     }
 
     const receiptReaction = setReaction(ctx, "👀");
-    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
+    const queuedPrompt = enqueuePrompt(contextKey, {
+      ctx, chatId, session, status: "pending",
+      pendingMsgId: ctx.message?.message_id,
+      receiptReaction,
+    });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
     let transcript = "";
@@ -3441,7 +3475,11 @@ export function createBot(
     }
 
     const receiptReaction = setReaction(ctx, "👀");
-    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
+    const queuedPrompt = enqueuePrompt(contextKey, {
+      ctx, chatId, session, status: "pending",
+      pendingMsgId: ctx.message?.message_id,
+      receiptReaction,
+    });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 
@@ -3497,7 +3535,11 @@ export function createBot(
     }
 
     const receiptReaction = setReaction(ctx, "👀");
-    const queuedPrompt = enqueuePrompt(contextKey, { ctx, chatId, session, status: "pending", receiptReaction });
+    const queuedPrompt = enqueuePrompt(contextKey, {
+      ctx, chatId, session, status: "pending",
+      pendingMsgId: ctx.message?.message_id,
+      receiptReaction,
+    });
     const stopTranscribing = startTranscribing(contextKey);
     let tempFilePath: string | undefined;
 

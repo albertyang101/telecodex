@@ -157,8 +157,8 @@ export async function runMailboxDeliveryOnce(
       // keep the existing thread (opening one only if none is active yet).
       let rotationHandoff: string | null = null;
       if (rotationCfg.enabled) {
-        const unanswered = messages.slice(index + 1).map(mailboxTurnDescriptor);
-        const taken = takeRotationHandoff(rotationState, rotationCfg, { unanswered });
+        const queuedMessages = messages.slice(index + 1).map((queued) => ({ text: mailboxTurnDescriptor(queued) }));
+        const taken = takeRotationHandoff(rotationState, rotationCfg, { queuedMessages });
         if (taken.handoff) {
           // A mandatory (hard-cap) rotation must not fall back to the over-cap thread:
           // try once more before giving up, and if it still fails, refuse this turn and
